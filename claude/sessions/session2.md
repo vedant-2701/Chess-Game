@@ -1,3 +1,135 @@
+## Session Summary — Migrations, Store Layer, Auth Layer
+
+### What Was Built
+
+**ARCHITECTURE.md correction:**
+Added `GET /games/:id` to the Phase 1 endpoint list in `internal/api`, positioned between `POST /games/:id/join` and `GET /health`. This prevents ARCHITECTURE.md from drifting from the PHASE_1.md spec at Step 12.
+
+**Step 2 — Database Migrations (6 files):**
+- `000001_create_users.up/down.sql`: `users` table with UUID primary key (no DEFAULT — client supplies the ID)
+- `000002_create_games.up/down.sql`: `games` table with status CHECK constraint, two FK references to users, partial index on `status IN ('WAITING_FOR_PLAYER', 'ACTIVE')`
+- `000003_create_moves.up/down.sql`: `moves` table with UNIQUE index on `(game_id, move_number)` and explicit `idx_moves_game_id`
+- All verified by user: `make migrate-up`, three `make migrate-down` runs, `make migrate-up` again (idempotency confirmed)
+
+**Step 3 — Store Layer (10 files):**
+- `internal/store/errors.go`: `ErrGameNotFound`, `ErrUserNotFound` sentinels
+- `internal/store/models.go`: All domain types — `GameStatus`, `Color`, `Outcome`, `OutcomeReason`, `GameOutcome`, `User`, `Game`, `Move`, `StartingFEN` constant
+- `internal/store/postgres.go`: `NewPool` with ping verification
+- `internal/store/user_store.go`: `CreateOrGetUser` (upsert via ON CONFLICT DO UPDATE), `GetUser`
+- `internal/store/game_store.go`: `CreateGame`, `GetGame`, `UpdateGameStatus`, `UpdateCurrentFEN`, `UpdatePlayerBlack`, `GetActiveGames`, `UpdateClocks`
+- `internal/store/move_store.go`: `SaveMove` (with RETURNING id, played_at), `GetMovesForGame` (ordered by move_number ASC)
+- 4 test files: `testmain_test.go`, `user_store_test.go`, `game_store_test.go`, `move_store_test.go` — integration tag, real PostgreSQL, all tests passing with `-race`
+
+**Step 4 — Auth Layer (2 files):**
+- `internal/auth/token.go`: `PlayerClaims` struct, `SignPlayerToken` (HS256), `VerifyPlayerToken` with algorithm confusion attack prevention in keyFunc, `ErrTokenExpired` / `ErrTokenInvalid` sentinels
+- `internal/auth/token_test.go`: 6 table-driven cases — valid token, expired, wrong secret, tampered signature, malformed string, empty string. No build tag, no database.
+
+### Decisions Made
+
+**`UpdateGameStatus` takes `*GameOutcome` instead of `*Outcome`** — PHASE_1.md spec suggested `*Outcome` but the DB schema enforces that `outcome` and `outcome_reason` are always set together (both NULL or both non-NULL via application convention). A single `*GameOutcome` struct carrying both fields makes the invariant enforced at the type level rather than by convention. No ADR required — this is a function signature correction, not an architectural decision.
+
+**App-generated UUIDs for games** — the game layer will generate the UUID before calling `CreateGame`, so it can sign the JWT with the known gameID immediately. The DB `DEFAULT gen_random_uuid()` remains as a safety fallback but is never relied on. This avoids a RETURNING scan in `CreateGame` and removes the need for a round-trip before signing the JWT.
+
+**`scanGame` uses `func(dest ...any) error` parameter** — both `pgx.Row.Scan` and `pgx.Rows.Scan` satisfy this signature. One helper handles both single-row (`QueryRow`) and multi-row (`Query`) paths without duplicating the column scan order. Column order must exactly match the SELECT list; two copies is a maintenance hazard.
+
+**Store test package is `package store` (internal), not `package store_test` (external)** — addressed as a bug fix mid-session. With this many internal types referenced in tests, the external package would require either a dot-import or prefixing every symbol. No architectural significance.
+
+**`Color` is `string` in `auth.PlayerClaims`** — keeps `internal/auth` free of `internal/store` dependency per the architecture's dependency graph. The game layer validates the color string value after token verification.
+
+**Algorithm confusion prevention in `VerifyPlayerToken`** — keyFunc explicitly rejects any signing method that is not `*jwt.SigningMethodHMAC`. Without this, `alg: none` tokens bypass signature verification entirely.
+
+### Tradeoffs Considered
+
+**`GetMovesForGame` and `GetActiveGames`: nil vs non-nil empty slice** — `var x []*T` is nil, `make([]*T, 0)` is non-nil. Both have zero length but serialize differently in JSON (`null` vs `[]`). The game layer sends move history in `GAME_STATE` messages; a game with no moves yet must send `[]` not `null`. `make([]*Move, 0)` / `make([]*Game, 0)` is required. This was caught as a test failure in `GetActiveGames` after initially using `var games []*Game`.
+
+**Nullable column scanning via `*string` intermediates** — scanning `*Outcome` or `*GameStatus` directly into pgx/v5's reflection path is technically possible but relies on behavior that isn't guaranteed across minor versions for user-defined string types. Scanning as `*string` then converting is two extra lines per nullable field but zero ambiguity. Chosen for correctness over brevity.
+
+**External vs internal test package for store tests** — `package store_test` would have required the `store.` prefix on every type reference, which is verbose but architecturally cleaner (black-box testing). For integration tests of this depth that touch every field of every struct, `package store` is the pragmatic choice. The test binary is still compiled separately; no production binary impact.
+
+### Lessons Learned
+
+**Nil vs empty slice is a test-catching-a-real-bug situation** — `GetActiveGames` returned `nil` when no active games existed. The test asserted `games != nil`. This would have caused the reconnection flow in `RestoreActiveGames` (Step 10) to behave correctly by coincidence (ranging over a nil slice is valid in Go), but the JSON serialization on any endpoint returning a game list would have produced `null` instead of `[]`. The test caught a genuine wire format bug.
+
+**The spec's suggested function signatures are not always complete** — `UpdateGameStatus(ctx, id string, status GameStatus, outcome *Outcome) error` from PHASE_1.md is missing `outcome_reason`. The DB schema makes it obvious both fields must move together, but only because we read the schema carefully. Implementation time is the right time to fix this, as the spec explicitly defers signatures.
+
+**`package store_test` (external) vs `package store` (internal) needs to be a conscious choice made before writing the first test file** — not after a compile error. For packages with many exported domain types used heavily in tests, decide internal vs external upfront.
+
+### Problems Encountered
+
+**Build error: `package store_test` referencing unqualified store types** — all four test files declared `package store_test` but referenced `UserStore`, `Game`, `StartingFEN` etc. without the `store.` prefix. Fixed by changing all four files to `package store`. Root cause: the external test package convention was applied without accounting for how many store types the tests reference directly.
+
+**`GetActiveGames` returning nil empty slice** — `var games []*Game` initializes to nil. Test `expected non-nil empty slice, got nil` caught this. Fixed by user to `games := []*Game{}`. Correct fix is `make([]*Game, 0)` for consistency with `GetMovesForGame`.
+
+**Module path placeholder** — resolved by user (`github.com/vedant-2701/chess`). No longer a sharp edge.
+
+### Checklist Progress
+
+**Step 2: Database Migrations**
+- ✅ Migration 001 up/down: `users` table
+- ✅ Migration 002 up/down: `games` table with CHECK constraint, two FK refs, partial index
+- ✅ Migration 003 up/down: `moves` table with UNIQUE index on (game_id, move_number)
+- ✅ `make migrate-up` applies all three cleanly
+- ✅ `make migrate-down` rolls back one at a time
+- ✅ `make migrate-up` is idempotent
+
+**Step 3: Store Layer**
+- ✅ `internal/store/postgres.go`: `NewPool`
+- ✅ `internal/store/game_store.go`: all 7 methods
+- ✅ `internal/store/move_store.go`: `SaveMove`, `GetMovesForGame`
+- ✅ `internal/store/user_store.go`: `CreateOrGetUser`, `GetUser`
+- ✅ Integration tests for all store methods passing with `-race`
+- ✅ Error wrapping verified: all errors include function name and relevant IDs
+
+**Step 4: Auth Layer**
+- ✅ `PlayerClaims` struct: `{ GameID, UserID, Color, RegisteredClaims }`
+- ✅ `SignPlayerToken(claims PlayerClaims, secret string) (string, error)`
+- ✅ `VerifyPlayerToken(token string, secret string) (*PlayerClaims, error)`
+- ✅ Unit test: valid token signs and verifies correctly
+- ✅ Unit test: expired token returns `ErrTokenExpired`
+- ✅ Unit test: wrong secret returns `ErrTokenInvalid`
+- ✅ Unit test: tampered signature returns `ErrTokenInvalid`
+- ✅ Unit test: malformed token returns `ErrTokenInvalid`
+- ✅ Unit test: empty token returns `ErrTokenInvalid`
+
+### Technical Debt Introduced
+
+None. All three steps are complete with tests passing and no known shortcuts.
+
+### Files Modified
+
+**Created:**
+- `migrations/000001_create_users.up.sql`
+- `migrations/000001_create_users.down.sql`
+- `migrations/000002_create_games.up.sql`
+- `migrations/000002_create_games.down.sql`
+- `migrations/000003_create_moves.up.sql`
+- `migrations/000003_create_moves.down.sql`
+- `internal/store/errors.go`
+- `internal/store/models.go`
+- `internal/store/postgres.go`
+- `internal/store/user_store.go`
+- `internal/store/game_store.go`
+- `internal/store/move_store.go`
+- `internal/store/testmain_test.go`
+- `internal/store/user_store_test.go`
+- `internal/store/game_store_test.go`
+- `internal/store/move_store_test.go`
+- `internal/auth/token.go`
+- `internal/auth/token_test.go`
+
+**Modified:**
+- `ARCHITECTURE.md` — `GET /games/:id` added to Phase 1 endpoint list (user action)
+- `CLAUDE.md` — `turn` field casing corrected to uppercase (user action, session start)
+
+### Recommended Next Step
+
+**Step 5: Chess Layer** — implement `internal/chess/validator.go` wrapping `notnil/chess`. Four operations: `ValidateAndApply`, `DetectOutcome`, `CurrentFEN`, `MoveHistory`. Plus `GameFromFEN` and `GameFromMoves` for state reconstruction. Unit tests must cover: valid move application, illegal move rejection, Scholar's mate (checkmate detection), stalemate detection, en passant, castling, FEN round-trip. No database, no integration tag. Estimated 1–2 hours. This is the last foundational layer before the game session and move pipeline (Steps 6–8), which depend on it.
+
+---
+
+## PART 2 — UPDATED CLAUDE.md
+
+```markdown
 # CLAUDE.md — Session Context Document
 
 This file is the authoritative context document for AI-assisted development sessions on this project.
@@ -341,3 +473,4 @@ Unit tests required (no build tag, no database):
 | 2 | 2025-01-XX | Documentation corrections only: removed CONNECT from WS protocol; fixed time fields to whiteTimeMs/blackTimeMs; replaced chess.Validator Go interface with behavioral descriptions; added UserStore to Step 3 checklist; replaced DetectOutcome signature with behavioral description; removed prometheus from Phase 1 deps |
 | 3 | 2025-01-XX | Step 1 scaffold complete: go.mod (module path github.com/vedant-2701/chess), docker-compose.yml, .env.example, Makefile (15 targets), all 8 package directories |
 | 4 | 2025-01-XX | turn field casing corrected to uppercase in CLAUDE.md. ARCHITECTURE.md updated with GET /games/:id. Step 2 (migrations) complete: 6 files, all verified. Step 3 (store layer) complete: 6 implementation files + 4 integration test files, all tests passing with -race. Fixed nil-vs-empty-slice bug in GetActiveGames. Fixed package store_test → package store build error. Step 4 (auth layer) complete: token.go + token_test.go, 6 unit tests passing with -race. |
+```
