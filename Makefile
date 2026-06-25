@@ -80,7 +80,10 @@ docker-up: ## Start PostgreSQL in Docker (detached)
 docker-down: ## Stop and remove Docker containers (data volume preserved)
 	docker compose down
 
-docker-stop: ## Stop Docker containers (data volume preserved)
+docker-start: ## Start docker containers
+	docker compose start
+
+docker-stop: ## Stop Docker containers (data volume and container preserved)
 	docker compose stop
 
 docker-reset: ## Stop containers AND remove the data volume — DESTRUCTIVE
