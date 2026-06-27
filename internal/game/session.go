@@ -1,0 +1,247 @@
+package game
+
+import (
+	"fmt"
+	"log/slog"
+	"sync"
+
+	notnil "github.com/notnil/chess"
+	internalchess "github.com/vedant-2701/chess/internal/chess"
+	"github.com/vedant-2701/chess/internal/store"
+	"github.com/vedant-2701/chess/internal/ws"
+)
+
+// InitialTimeMs is the starting clock for each player: 10 minutes in milliseconds.
+// Phase 1 supports a single time control only (10+0). See PHASE_1.md scope.
+const InitialTimeMs int64 = 600_000
+
+// validTransitions defines the legal state machine edges.
+// COMPLETED and ABANDONED are terminal — they have no outgoing edges.
+var validTransitions = map[store.GameStatus]map[store.GameStatus]bool{
+	store.GameStatusWaiting: {
+		store.GameStatusActive: true,
+	},
+	store.GameStatusActive: {
+		store.GameStatusCompleted: true,
+		store.GameStatusAbandoned: true,
+	},
+}
+
+// GameStateSnapshot is a point-in-time read of a GameSession's full state.
+// Used to construct GAME_STATE WebSocket messages and for reconnection state delivery.
+type GameStateSnapshot struct {
+	ID            string
+	Status        store.GameStatus
+	PlayerWhiteID string
+	PlayerBlackID string // empty string when no black player has joined
+	CurrentFEN    string
+	Turn          store.Color
+	Moves         []string // annotated SAN from chess.MoveHistory (e.g. "Qxf7#")
+	WhiteTimeMs   int64
+	BlackTimeMs   int64
+	Outcome       *store.Outcome
+	OutcomeReason *store.OutcomeReason
+}
+
+// GameSession holds all runtime state for a single in-progress game.
+// It is the single authoritative in-memory source of truth for a game's state.
+type GameSession struct {
+	ID string
+
+	// mu protects: status, playerWhiteID, playerBlackID, playerWhite,
+	// playerBlack, board, whiteTimeMs, blackTimeMs, outcome, outcomeReason.
+	mu            sync.RWMutex
+	status        store.GameStatus
+	playerWhiteID string
+	playerBlackID string        // empty string until SetPlayerBlack is called
+	playerWhite   *ws.Connection // nil when White is disconnected
+	playerBlack   *ws.Connection // nil when Black is disconnected
+	board         *notnil.Game
+	whiteTimeMs   int64
+	blackTimeMs   int64
+	outcome       *store.Outcome       // nil until game reaches a terminal state
+	outcomeReason *store.OutcomeReason // nil until game reaches a terminal state
+}
+
+// NewGameSession constructs a GameSession for a newly created game. The board
+// is at the standard starting position and the clock is initialised to InitialTimeMs
+// for both players. Status is WAITING_FOR_PLAYER until the second player connects.
+func NewGameSession(id string, whiteID string) *GameSession {
+	return &GameSession{
+		ID:            id,
+		status:        store.GameStatusWaiting,
+		playerWhiteID: whiteID,
+		board:         internalchess.NewGame(),
+		whiteTimeMs:   InitialTimeMs,
+		blackTimeMs:   InitialTimeMs,
+	}
+}
+
+// SetPlayerBlack records the userID of the player who joined as Black.
+// Called by Manager.JoinGame after the database record is updated.
+func (s *GameSession) SetPlayerBlack(userID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.playerBlackID = userID
+}
+
+// RegisterConnection sets the *ws.Connection for the given color. Returns
+// ErrConnectionOccupied if the slot is already held by a live connection.
+// Use ReplaceConnection for reconnection flows.
+func (s *GameSession) RegisterConnection(color store.Color, conn *ws.Connection) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch color {
+	case store.ColorWhite:
+		if s.playerWhite != nil {
+			return fmt.Errorf("GameSession.RegisterConnection color=%s: %w", color, ErrConnectionOccupied)
+		}
+		s.playerWhite = conn
+	case store.ColorBlack:
+		if s.playerBlack != nil {
+			return fmt.Errorf("GameSession.RegisterConnection color=%s: %w", color, ErrConnectionOccupied)
+		}
+		s.playerBlack = conn
+	}
+	return nil
+}
+
+// ReplaceConnection unconditionally replaces the *ws.Connection for the given
+// color. Used during reconnection when the old connection pointer is stale.
+func (s *GameSession) ReplaceConnection(color store.Color, conn *ws.Connection) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch color {
+	case store.ColorWhite:
+		s.playerWhite = conn
+	case store.ColorBlack:
+		s.playerBlack = conn
+	}
+}
+
+// ClearConnection sets the connection pointer for the given color to nil.
+// Called when a player's WebSocket connection drops.
+func (s *GameSession) ClearConnection(color store.Color) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch color {
+	case store.ColorWhite:
+		s.playerWhite = nil
+	case store.ColorBlack:
+		s.playerBlack = nil
+	}
+}
+
+// BothPlayersConnected reports whether both players currently have live
+// WebSocket connections. Used to determine when to transition WAITING → ACTIVE.
+func (s *GameSession) BothPlayersConnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.playerWhite != nil && s.playerBlack != nil
+}
+
+// Transition advances the game state machine to newStatus. Returns
+// ErrInvalidTransition for any edge not defined in validTransitions.
+// This is the only place game status changes; no external code sets
+// status directly.
+func (s *GameSession) Transition(newStatus store.GameStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	allowed, ok := validTransitions[s.status]
+	if !ok || !allowed[newStatus] {
+		return fmt.Errorf("GameSession.Transition gameID=%s %s→%s: %w",
+			s.ID, s.status, newStatus, ErrInvalidTransition)
+	}
+	s.status = newStatus
+	return nil
+}
+
+// SetOutcome records the game result. Must be called after Transition(COMPLETED)
+// or Transition(ABANDONED). The move pipeline and manager are responsible for
+// calling these in the correct order.
+func (s *GameSession) SetOutcome(outcome store.Outcome, reason store.OutcomeReason) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.outcome = &outcome
+	s.outcomeReason = &reason
+}
+
+// UpdateClocks updates the persisted clock state for both players. Called by
+// the Clock (Step 9) after each move and on disconnect.
+func (s *GameSession) UpdateClocks(whiteMs, blackMs int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.whiteTimeMs = whiteMs
+	s.blackTimeMs = blackMs
+}
+
+// CurrentStateSnapshot returns a consistent point-in-time read of the full
+// session state. All fields are read under the session read lock to prevent
+// torn reads. Used to construct GAME_STATE WebSocket messages.
+func (s *GameSession) CurrentStateSnapshot() GameStateSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return GameStateSnapshot{
+		ID:            s.ID,
+		Status:        s.status,
+		PlayerWhiteID: s.playerWhiteID,
+		PlayerBlackID: s.playerBlackID,
+		CurrentFEN:    internalchess.CurrentFEN(s.board),
+		Turn:          boardTurn(s.board),
+		Moves:         internalchess.MoveHistory(s.board),
+		WhiteTimeMs:   s.whiteTimeMs,
+		BlackTimeMs:   s.blackTimeMs,
+		Outcome:       s.outcome,
+		OutcomeReason: s.outcomeReason,
+	}
+}
+
+// SendToPlayer sends msg to the player of the given color if they have an
+// active connection. Returns an error if the player is not connected or
+// if the connection's outbound queue is full.
+func (s *GameSession) SendToPlayer(color store.Color, msg []byte) error {
+	s.mu.RLock()
+	var conn *ws.Connection
+	switch color {
+	case store.ColorWhite:
+		conn = s.playerWhite
+	case store.ColorBlack:
+		conn = s.playerBlack
+	}
+	s.mu.RUnlock()
+
+	if conn == nil {
+		return fmt.Errorf("GameSession.SendToPlayer gameID=%s color=%s: player not connected", s.ID, color)
+	}
+	return conn.Send(msg)
+}
+
+// SendToBothPlayers sends msg to both players. Per-player failures are logged
+// at Warn level but do not abort delivery to the other player — a disconnected
+// or slow client must never block message delivery to their opponent.
+func (s *GameSession) SendToBothPlayers(msg []byte) {
+	s.mu.RLock()
+	white := s.playerWhite
+	black := s.playerBlack
+	s.mu.RUnlock()
+
+	if white != nil {
+		if err := white.Send(msg); err != nil {
+			slog.Warn("failed to send to white player", "gameID", s.ID, "error", err)
+		}
+	}
+	if black != nil {
+		if err := black.Send(msg); err != nil {
+			slog.Warn("failed to send to black player", "gameID", s.ID, "error", err)
+		}
+	}
+}
+
+// boardTurn maps the notnil/chess position turn to a store.Color.
+// Called under the session read lock — g must not be mutated concurrently.
+func boardTurn(g *notnil.Game) store.Color {
+	if g.Position().Turn() == notnil.White {
+		return store.ColorWhite
+	}
+	return store.ColorBlack
+}
