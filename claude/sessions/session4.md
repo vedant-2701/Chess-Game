@@ -1,3 +1,141 @@
+## Session Summary — WebSocket Port, Game Session, EventBus
+
+### What Was Built
+
+**`internal/ws/connection.go` — 2 targeted changes:**
+- `Send()`: `websocket.BinaryMessage` → `websocket.TextMessage` (chess server sends JSON)
+- `ReadLoop(registry *Registry)` → `ReadLoop(onMessage func([]byte), onClose func())` — ws layer is now fully ignorant of the game layer. Full doc comment added flagging the context lifetime decision at Step 11.
+
+**`internal/ws/registry.go` — 3 targeted changes:**
+- `"log"` → `"log/slog"`, both `log.Printf` calls replaced with `slog.Warn` using structured `"connID"` / `"error"` fields
+- `registryMu` now has the mutex documentation comment per CODING_GUIDELINES
+
+**`internal/ws/errors.go`:** Pre-existing, no changes needed.
+
+**`internal/game/errors.go`** — New file. Three sentinel errors:
+- `ErrGameNotFound` — missing in-memory session (distinct from `store.ErrGameNotFound` which is a DB miss)
+- `ErrConnectionOccupied` — `RegisterConnection` called on a slot already holding a live connection
+- `ErrInvalidTransition` — illegal state machine edge attempted
+
+**`internal/game/session.go`** — New file. Full `GameSession` implementation:
+- Struct with `sync.RWMutex` protecting 10 fields (documented per CODING_GUIDELINES)
+- `NewGameSession(id, whiteID string) *GameSession` — initialises board via `internalchess.NewGame()`, both clocks to `InitialTimeMs` (600,000 ms), status to `WAITING_FOR_PLAYER`
+- `SetPlayerBlack`, `RegisterConnection` (errors on occupied slot), `ReplaceConnection` (unconditional overwrite for reconnection), `ClearConnection`
+- `BothPlayersConnected() bool` — read-lock snapshot
+- `Transition(newStatus store.GameStatus) error` — driven by `validTransitions` map, returns `ErrInvalidTransition` for all illegal edges; COMPLETED and ABANDONED are terminal
+- `SetOutcome(outcome, reason)` — called after `Transition(COMPLETED)` by the move pipeline
+- `UpdateClocks(whiteMs, blackMs int64)` — called by Clock (Step 9)
+- `CurrentStateSnapshot() GameStateSnapshot` — full consistent read under RLock; derives turn via `boardTurn()` helper mapping `notnil.Color` → `store.Color`
+- `SendToPlayer(color, msg) error` — snapshots connection pointer under RLock, sends outside lock
+- `SendToBothPlayers(msg)` — same pattern; per-player failures logged at Warn, never abort the other send
+
+**`internal/game/registry.go`** — New file. `GameRegistry` with `sync.RWMutex`:
+- `Register`, `Get` (returns `ErrGameNotFound`), `Unregister` (no-op if missing), `AllActive` (snapshot-then-release, always non-nil slice)
+
+**`internal/game/messages.go`** — New file. Single source of truth for all WebSocket protocol strings:
+- Client→Server message types: `MsgTypeMove`, `MsgTypeResign`, `MsgTypePing`
+- Server→Client message types: `MsgTypePong`, `MsgTypeGameState`, `MsgTypeMoveApplied`, `MsgTypeMoveRejected`, `MsgTypeGameOver`, `MsgTypeOpponentConnected`, `MsgTypeOpponentDisconnected`, `MsgTypeOpponentReconnected`, `MsgTypeError`
+- Rejection reasons: `RejectReasonNotYourTurn`, `RejectReasonIllegalMove`, `RejectReasonGameNotActive`
+- Error codes: `ErrCodeInvalidToken`, `ErrCodeGameNotFound`, `ErrCodeGameFull`, `ErrCodeInternalError`
+
+**`internal/game/eventbus.go`** — New file. `EventBus` interface + `LocalEventBus` implementation:
+- `GameEvent{GameID, Type, Payload}` — Type reuses `MsgType*` constants; Payload is pre-serialised JSON forwarded directly to `ws.Connection.Send`
+- `EventBus` interface: `Publish(ctx, GameEvent) error` + `Subscribe(ctx, gameID) (<-chan GameEvent, func(), error)`
+- `LocalEventBus`: `subscribers map[string]map[chan GameEvent]struct{}`; buffer size 8 per subscriber
+- `Publish` holds `mu.RLock()` for the entire non-blocking send loop — the only synchronisation that prevents a race between Publish and channel close on unsubscribe. Drops events to full channels with `slog.Warn`, never blocks.
+- `unsubscribe` closes the channel under `mu.Lock()` — safe because Publish cannot be mid-send while the write lock is held
+- Compile-time interface check: `var _ EventBus = (*LocalEventBus)(nil)`
+
+**Tests — all passing with `-race`:**
+- `internal/game/session_test.go`: 10 tests covering all valid transitions, all invalid transitions (7 illegal edges), `RegisterConnection` success/occupied, `ReplaceConnection`, `ClearConnection`, `BothPlayersConnected` lifecycle, `CurrentStateSnapshot` initial state and `SetPlayerBlack` reflection
+- `internal/game/registry_test.go`: `Register`+`Get`, `Get` missing → `ErrGameNotFound`, `Unregister`, `Unregister` missing is no-op, `AllActive` empty→non-nil, `AllActive` count, concurrent `Register`+`Get`+`Unregister` under `-race`
+- `internal/game/eventbus_test.go`: no-subscriber publish, single subscriber receives event, unsubscribe stops delivery, two subscribers same game both receive, cross-game isolation, full channel drops without panic or block
+
+### Decisions Made
+
+**`SendToPlayer` and `SendToBothPlayers` added to `GameSession` (not in PHASE_1.md checklist).** The move pipeline (Step 8) has no other way to push messages to players without exposing `*ws.Connection` outside the session. Adding these methods is the correct encapsulation — `*ws.Connection` stays fully contained inside `GameSession`. Not a new ADR; follows directly from the two-registry architecture in ADR-009.
+
+**`UpdateClocks` added to `GameSession` (not in PHASE_1.md checklist).** The Clock (Step 9) needs to persist remaining time back to the session before the store write. Added now to avoid an awkward retrofit at Step 9.
+
+**`messages.go` as the single source of truth for WebSocket protocol strings.** All magic strings (message types, rejection reasons, error codes) live in `internal/game/messages.go`. The `ws` layer is byte-transparent and needs none of these. Error codes used by `ws.Handler` at Step 11 (e.g. `ErrCodeInvalidToken`) are also defined here — the handler will import `internal/game` for them. No separate `internal/proto` package: there is no overlap between what `ws` and `game` need from the protocol, so a shared package would be indirection with no payoff.
+
+**`Publish` holds `mu.RLock()` for the full send loop.** This is the critical correctness decision for `LocalEventBus`. The alternative — snapshot the subscriber map under RLock, release, then send — creates a window where a subscriber can be deleted and its channel closed between the snapshot and the send, causing a send-on-closed-channel panic. Holding RLock during the non-blocking sends prevents this at zero cost (sends are O(1) channel ops). No ADR needed; documented in code comment.
+
+**"Player-to-connection bridge for reconnection" checklist item is already complete.** Confirmed this session: the bridge is `GameSession.playerWhite`/`playerBlack` (the pointer slots) + `ReplaceConnection()` + `CurrentStateSnapshot()`. The Manager (Step 10) is the caller, not a new data structure. Item closed.
+
+### Tradeoffs Considered
+
+**Shared `internal/proto` package for WebSocket protocol strings vs. `internal/game/messages.go`.** A shared package was initially raised by Vedant. On analysis: `internal/ws` is byte-transparent — it never inspects message content. Only `internal/game` constructs and parses messages. A shared package would add a new node to the dependency graph with no consumer outside `internal/game`. Rejected. `messages.go` is the right home.
+
+**`Publish` snapshot-then-send vs. Publish holds RLock.** Snapshot-then-send looks cleaner but has a correctness bug: unsubscribe can close a channel between snapshot and send. Holding RLock is the correct solution. The cost is that unsubscribers block during in-flight publishes — but publishes are O(1) non-blocking channel selects, so the block duration is negligible.
+
+**`ReadLoop` accepting a `ws.Sender` interface vs. accepting `func([]byte)` callback.** An interface would be cleaner if there were multiple implementations. There is exactly one implementation (`game.Manager.HandleMessage`). A function callback is simpler and sufficient. If a second consumer ever appears, the callback can be wrapped in an adapter without changing `ReadLoop`'s signature.
+
+### Lessons Learned
+
+**`notnil/chess` package-level vs. method API split matters at the call site.** `NewGame()`, `CurrentFEN()`, `MoveHistory()` are package-level functions. `ValidateMove`, `ApplyMove`, `DetectOutcome` are methods on `*Validator`. `GameSession` only needs the package-level functions — no `*Validator` field on the session struct. The `*Validator` belongs in the move pipeline (Step 8), not in the session.
+
+### Problems Encountered
+
+No problems encountered
+
+### Checklist Progress
+
+**Step 6: Game Session and Registry**
+- ✅ `GameSession` struct with documented mutex scope
+- ✅ `NewGameSession(id, whiteID string) *GameSession`
+- ✅ `SetPlayerBlack(userID string)`
+- ✅ `RegisterConnection(color, conn) error`
+- ✅ `ReplaceConnection(color, conn)` — reconnection path
+- ✅ `ClearConnection(color)` — disconnect path
+- ✅ `BothPlayersConnected() bool`
+- ✅ `Transition(newStatus) error` — all valid and invalid edges tested
+- ✅ `CurrentStateSnapshot() GameStateSnapshot`
+- ✅ `SendToPlayer` and `SendToBothPlayers` — move pipeline prerequisites
+- ✅ `UpdateClocks` — clock layer prerequisite
+- ✅ `GameRegistry` with `Register`, `Get`, `Unregister`, `AllActive`
+- ✅ Unit tests — all passing with `-race`
+- ✅ Player-to-connection bridge for reconnection — confirmed complete (uses session pointer slots + `ReplaceConnection`)
+
+**Step 7: EventBus**
+- ✅ `GameEvent{GameID, Type, Payload}`
+- ✅ `EventBus` interface: `Publish`, `Subscribe`
+- ✅ `LocalEventBus` implementation
+- ✅ `NewLocalEventBus()`
+- ✅ `messages.go` — single source of truth for all WebSocket protocol strings
+- ✅ Unit tests — publish/subscribe, unsubscribe, multi-subscriber, cross-game isolation, full channel drop — all passing with `-race`
+
+### Technical Debt Introduced
+
+None this session.
+
+### Files Modified
+
+**Modified:**
+- `internal/ws/connection.go` — `ReadLoop` signature, `TextMessage`
+- `internal/ws/registry.go` — `slog`, mutex comment
+
+**Created:**
+- `internal/game/errors.go`
+- `internal/game/session.go`
+- `internal/game/registry.go`
+- `internal/game/messages.go`
+- `internal/game/eventbus.go`
+- `internal/game/session_test.go`
+- `internal/game/registry_test.go`
+- `internal/game/eventbus_test.go`
+
+### Recommended Next Step
+
+**Step 8: Move Pipeline — implement `internal/game/move.go`.**
+
+`MoveProcessor` struct depending on `chess.Validator`, `store.GameStore`, `store.MoveStore`, `EventBus`. Single public method: `ProcessMove(ctx, session *GameSession, color store.Color, san string) error`. Pipeline sequence: turn check → `ValidateMove` → `store.MoveStore.SaveMove` → `store.GameStore.UpdateCurrentFEN` → `ApplyMove` → clock switch via `session.UpdateClocks` → `DetectOutcome` → publish `MOVE_APPLIED` or `GAME_OVER` via EventBus. Integration tests required (real PostgreSQL, `//go:build integration` tag): full pipeline happy path, wrong turn rejection, illegal move rejection, DB failure leaves board unchanged, checkmate detected and `GAME_OVER` published.
+
+---
+
+## PART 2 — Updated CLAUDE.md
+
+```markdown
 # CLAUDE.md — Session Context Document
 
 This file is the authoritative context document for AI-assisted development sessions on this project.
@@ -475,3 +613,4 @@ Integration tests required (`//go:build integration`, real PostgreSQL): full pip
 | 4 | 2025-01-XX | Steps 2–4 complete: migrations, store layer, auth layer |
 | 5 | 2025-01-XX | Step 5 complete: chess layer, ADR-013, notnil/chess workarounds discovered |
 | 6 | 2026-06-27 | ws port (ReadLoop callback, TextMessage, slog), Steps 6–7 complete: GameSession, GameRegistry, EventBus, messages.go |
+```
