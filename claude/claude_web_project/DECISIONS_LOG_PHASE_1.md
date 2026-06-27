@@ -8,7 +8,7 @@ This log records every significant architectural decision, the alternatives cons
 
 ## ADR-001: Language Selection — Go
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -42,7 +42,7 @@ The candidate has already built WebSocket infrastructure in Go: read loops, writ
 
 ## ADR-002: WebSocket Library — gorilla/websocket
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -75,7 +75,7 @@ The candidate has already proven they understand the low-level WebSocket protoco
 
 ## ADR-003: HTTP Router — go-chi/chi v5
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -109,7 +109,7 @@ Framework lock-in is the primary concern. Gin's `gin.Context` wrapping means you
 
 ## ADR-004: Database — PostgreSQL 16
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -147,7 +147,7 @@ Chess game state is naturally relational. Every move belongs to exactly one game
 
 ## ADR-005: Database Driver — pgx/v5 (pgxpool)
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -180,7 +180,7 @@ We are using PostgreSQL specifically. There is no reason to use a lowest-common-
 
 ## ADR-006: Chess Move Validation Library — notnil/chess
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -213,7 +213,7 @@ Chess domain logic is not the learning objective. Using a library is the correct
 
 ## ADR-007: MVP Matchmaking Strategy — Shared Game Link
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -243,7 +243,7 @@ Matchmaking is a separate system design concept that deserves its own phase. Com
 
 ## ADR-008: Authentication Strategy — JWT Player Tokens
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -277,7 +277,7 @@ A player token encodes `{ gameID, userID, color }`. On WebSocket connect, the cl
 
 ## ADR-009: Registry Architecture — Two Separate Registries
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -310,7 +310,7 @@ The WebSocket infrastructure layer must not know about games. If it does, it can
 
 ## ADR-010: EventBus Interface for Phase 2 Seam
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -340,7 +340,7 @@ The cost of the interface in Phase 1 is minimal (one interface definition, one c
 
 ## ADR-011: No ORM — Raw SQL via pgx/v5
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -361,7 +361,7 @@ ORMs hide queries. In a system design learning project, understanding what queri
 
 ## ADR-012: No Framework — chi + stdlib
 
-**Date:** 2025-01-XX
+**Date:** 2025-06-23
 **Status:** ACCEPTED
 
 **Context:**
@@ -375,3 +375,91 @@ Frameworks abstract the concepts being learned. NestJS's `@WebSocketGateway()` h
 **Consequences:**
 - Handler code is portable and testable without the router.
 - No framework-specific patterns to unlearn later.
+
+---
+
+## ADR-013: Chess Move Validation Strategy — Validate-Then-Apply Split
+
+**Date:** 2026-06-25
+**Status:** ACCEPTED
+
+**Context:**
+The move pipeline requires that in-memory board state must not change until a move is
+successfully persisted to PostgreSQL. This is the persistence-first guarantee:
+a move is only "real" once it is in the database. `notnil/chess` has no `UndoMove()`.
+Once `game.MoveStr()` is called and returns nil, the mutation cannot be reversed.
+
+The chess layer must expose an API that lets the pipeline persist first, then advance
+board state — without requiring the pipeline to implement cloning or rollback itself.
+
+**Options Considered:**
+
+**Option A: FEN Round-Trip Clone**
+`ValidateAndApply(game, san) (*chess.Game, error)` clones the game via
+`game.Position().String()` (FEN serialization), applies the move to the clone,
+and returns the clone. The pipeline replaces `session.board` only after DB write succeeds.
+
+Flaw: FEN does not encode position history. `notnil/chess` detects threefold repetition
+by comparing the current position to all prior positions in the game's internal `positions`
+slice. A FEN-cloned game starts this slice from zero. After the first move applied via
+clone-replace, `session.board` contains only one prior position. Threefold repetition
+detection is silently broken for the lifetime of the game.
+
+**Option D: Move Replay Clone (Option A corrected)**
+Same pipeline semantics as Option A, but clones by replaying all moves from
+`game.Moves()` onto a new game object rather than from FEN. Correct position history is
+preserved. Still O(n) per move and allocates a new game object per move. Correct but
+more complex than Option B for the same correctness guarantee.
+
+**Option B: Validate-Then-Apply Split (CHOSEN)**
+Expose two methods:
+- `ValidateMove(game *chess.Game, san string) error` — checks legality, no mutation
+- `ApplyMove(game *chess.Game, san string) error` — mutates game in-place, only call after successful DB write
+
+`session.board` is the single continuous game object for the lifetime of the game.
+All moves are applied to it sequentially. Position history is complete from game start.
+Threefold repetition detection works correctly by construction.
+
+**Option C: In-Place Mutation, Accept the Risk**
+Rejected. Breaks the persistence-first guarantee. Not considered further.
+
+**Decision:** Option B — Validate-Then-Apply Split
+
+**Rationale:**
+The primary correctness requirement is: in-memory board state must not advance past
+the database. The secondary correctness requirement is: game outcome detection
+(including threefold repetition) must be accurate.
+
+Option B satisfies both requirements without cloning. `session.board` is mutated
+exactly once per move, immediately after the DB write succeeds. Because `session.board`
+is never replaced with a cloned object, the full position history accumulates correctly
+in `notnil/chess`'s internal state across the entire game.
+
+The TOCTOU concern (validate at time T, apply at time T+1, state could change between)
+does not apply in this architecture. Each `GameSession` processes moves under a session
+mutex (or a single goroutine per session). No other code path can modify `session.board`
+between `ValidateMove` and `ApplyMove`.
+
+Option D is also correct but pays O(n) per move and allocates a new `*chess.Game` per
+move. These costs are irrelevant at chess move frequency, but the added complexity is
+not justified when Option B achieves the same correctness with less code.
+
+**API Change from Initial Spec:**
+The PHASE_1.md spec suggested a single `ValidateAndApply(game, san) (*chess.Game, error)`
+signature. This is replaced by two methods:
+- `ValidateMove(game *chess.Game, san string) error`
+- `ApplyMove(game *chess.Game, san string) error`
+
+PHASE_1.md explicitly defers exact signatures to implementation time. This change is
+within scope.
+
+**Consequences:**
+- Chess layer exposes `ValidateMove` and `ApplyMove` as separate methods on `*Validator`.
+- The move pipeline calls them with the DB write between them. The persistence boundary
+  is explicit in the pipeline code, not hidden inside the chess layer.
+- `ValidateMove` and `ApplyMove` are independently testable without side effects.
+- `ApplyMove` returning an error after `ValidateMove` returned nil is a bug, not an
+  expected condition. It should be logged as an error with full context and is
+  unrecoverable without reloading game state from the database.
+- Threefold repetition detection works correctly for the full game duration.
+- No object allocations on the move hot path beyond what `notnil/chess` does internally.
