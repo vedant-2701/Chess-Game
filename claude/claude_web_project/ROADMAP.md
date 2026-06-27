@@ -199,6 +199,41 @@ This phase is not about adding features. It is about making the system understan
 
 ---
 
+## Phase 7 — Frontend
+
+**System Design Concept: Browser WebSocket Lifecycle, Client-Server State Synchronization**
+
+**What Is Built:**
+- Next.js 14+ App Router frontend deployed to Vercel
+- Browser native WebSocket connecting directly to Go server (no proxy, no Socket.IO)
+- Chess board via react-chessboard, client-side move validation via chess.js (UX only)
+- Game state driven entirely by server WebSocket messages via useReducer
+- Reconnection with exponential backoff matching the server's abandonment window
+- Game history, spectator view, matchmaking UI, game analysis (step through moves)
+- CORS configured on Go server for Vercel domain
+- WebSocket origin validation tightened on Go server
+
+**What This Teaches:**
+- Browser WebSocket lifecycle: the same connection management problems exist on the client as on the server
+- The boundary between server components (SSR, no browser APIs) and client components (useState, WebSocket) in Next.js App Router — getting this wrong causes hydration errors
+- Optimistic UI updates and rollback: move shows immediately, reverts on server rejection
+- Client clock as cosmetic only: server is authoritative on timeout, client only renders the countdown
+- Token storage strategy for reconnection: localStorage keyed by gameID
+- CORS as a real backend concern, not just a development annoyance
+
+**Tech Stack:**
+Next.js 14+, TypeScript, Tailwind CSS, react-chessboard, chess.js, zod, native fetch, native WebSocket. No Redux, no Zustand, no Socket.IO.
+
+**Deployment:**
+Next.js on Vercel (free tier). Go server on VPS (existing). WebSocket connects directly from browser to Go server — Next.js does not proxy WebSocket connections.
+
+**Phase 7 is complete when:**
+- Two players on different machines complete a full game via the browser UI
+- Reconnection works in production: close tab, reopen, game resumes
+- All functionality works on production Vercel + VPS URLs, not just localhost
+
+---
+
 ## What This Project Does Not Teach
 
 Be explicit about gaps. If you need to learn these concepts, this project is not the vehicle:
