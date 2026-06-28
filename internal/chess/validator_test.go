@@ -15,7 +15,7 @@ var scholarsMate = []string{"e4", "e5", "Bc4", "Nc6", "Qh5", "Nf6", "Qxf7"}
 // Black to move, not in check, no legal moves.
 const stalemateFEN = "k7/8/1QK5/8/8/8/8/8 b - - 0 1"
 
-// Pre-stalemate FEN: White to move; playing Qb7 produces stalemate.
+// Pre-stalemate FEN: White to move; playing Qf7 produces stalemate.
 const preStalemateFEN = "7k/8/4Q1K1/8/8/8/8/8 w - - 0 1"
 
 // En passant FEN: White pawn on e5, Black just played d7-d5 (en passant target d6).
@@ -322,11 +322,11 @@ func TestDetectOutcome_Checkmate_ScholarsMate(t *testing.T) {
 // after a Move or MoveStr call, not on FEN construction — this is expected library behavior.)
 func TestDetectOutcome_Stalemate(t *testing.T) {
 	v := NewValidator()
-	// White plays Qb7: Black king on a8 is not in check and has no legal moves.
+	// White plays Qf7: Black king on h8 is not in check and has no legal moves.
 	g := mustGameFromFEN(t, preStalemateFEN)
 
 	if err := v.ApplyMove(g, "Qf7"); err != nil {
-		t.Fatalf("ApplyMove(Qb7): %v", err)
+		t.Fatalf("ApplyMove(Qf7): %v", err)
 	}
 
 	outcome, hasOutcome := v.DetectOutcome(g)
