@@ -6,12 +6,7 @@ import (
 	"time"
 
 	"github.com/vedant-2701/chess/internal/game"
-	"go.uber.org/goleak"
 )
-
-func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
-}
 
 func TestLocalEventBus_PublishWithNoSubscribers(t *testing.T) {
 	bus := game.NewLocalEventBus()

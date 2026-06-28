@@ -1,3 +1,108 @@
+## Session Summary — Move Pipeline and Typed Rejection Errors
+
+### What Was Built
+
+**`internal/chess/validator.go`** — added package-level function `ComputeFENAfterMove(g *chess.Game, san string) (string, error)`. Uses `chess.AlgebraicNotation{}.Decode` to get `*chess.Move`, then `g.Position().Update(move).String()` to obtain the resulting FEN without touching `g`. No game mutation. Consistent with the established package-level function pattern (`CurrentFEN`, `MoveHistory`).
+
+**`internal/game/errors.go`** — added `MoveRejectionError{Reason string}` with `Error() string` method. Used by the Manager (Step 10) to distinguish client-facing rejections from infrastructure failures via `errors.As`.
+
+**`internal/game/move.go`** — full `MoveProcessor` implementation:
+- `MoveProcessor` struct depending on `*internalchess.Validator`, `*store.GameStore`, `*store.MoveStore`, `EventBus`
+- `NewMoveProcessor(...)` constructor
+- `ProcessMove(ctx, session, color, san) error` — 8-step pipeline in exact ADR-013 order
+- `handleGameOver(ctx, session, fenAfter, outcome)` — transitions session, persists to DB, publishes `GAME_OVER`
+- `publishMoveApplied(ctx, session, san, fenAfter, moveNumber, color, snap)` — marshals and publishes `MOVE_APPLIED`
+- Private JSON structs: `moveAppliedMsg`, `gameOverMsg`
+
+**`internal/game/testmain_integration_test.go`** — `TestMain` with DB pool setup, `truncateAll`, `mustCreateUser`, `mustCreateActiveGame` helpers. Integration build tag only.
+
+**`internal/game/move_test.go`** — 5 integration tests, all passing with `-race`:
+- `TestMoveProcessor_ValidMove_FullPipeline` — verifies MOVE_APPLIED event, DB move record, DB current_fen, in-memory board and turn advance
+- `TestMoveProcessor_WrongTurn_RejectsWithMoveRejectionError` — verifies `*MoveRejectionError` with `RejectReasonNotYourTurn`, board unchanged, nothing persisted
+- `TestMoveProcessor_IllegalMove_RejectsAndLeavesBoard` — verifies `*MoveRejectionError` with `RejectReasonIllegalMove`, board unchanged
+- `TestMoveProcessor_DBFailure_LeavesBoard` — cancelled context causes `SaveMove` to fail; verifies plain error (not `*MoveRejectionError`), board unchanged (persistence-first invariant)
+- `TestMoveProcessor_CheckmateDetected_PublishesGameOver` — Scholar's mate sequence; verifies `GAME_OVER` event with `outcome=WHITE`, `reason=CHECKMATE`, session status `COMPLETED`, DB outcome/reason persisted
+
+### Decisions Made
+
+**`ComputeFENAfterMove` uses `Position.Update(*chess.Move).String()` — no game cloning.** Initial plan was to clone the game via FEN to compute `fenAfter`. During implementation, confirmed that `chess.Position.Update(*chess.Move)` returns `*chess.Position` and `Position.String()` returns FEN. This gives the resulting position without any game allocation or mutation. Cleaner and faster than FEN cloning. No ADR needed — this is an implementation detail of the chess layer, not an architectural decision.
+
+**Single `mu.RLock()` covers both `ValidateMove` and `ComputeFENAfterMove`.** Both operations read `session.board` and use the same `AlgebraicNotation.Decode` path. Acquiring one RLock for both ensures the position cannot change between them and avoids two lock round-trips. `mu.Lock()` is used only for `ApplyMove`.
+
+**`UpdateCurrentFEN` failure is non-fatal.** If `SaveMove` succeeds but `UpdateCurrentFEN` fails, `current_fen` is stale. The move is in the `moves` table (source of truth). Treating this as fatal would leave the board in an inconsistent state (move persisted but not applied in memory). Logged as Error, pipeline continues.
+
+**`handleGameOver` publishes `GAME_OVER` even if DB status update fails.** The in-memory transition has already happened. Players must be notified. DB inconsistency is an error state that must be surfaced in logs, but cannot block player notification.
+
+**Clock values in `MOVE_APPLIED` come from the pre-move snapshot.** Clock switching deferred to Step 9 as agreed. `MOVE_APPLIED.whiteTimeMs` and `MOVE_APPLIED.blackTimeMs` reflect the pre-move clock state until Step 9 wires in the `Clock` object. Not flagged as technical debt — it is the correct sequencing, not a shortcut.
+
+### Tradeoffs Considered
+
+**`ComputeFENAfterMove` via FEN clone vs. `Position.Update`.** FEN clone would create a temporary `*chess.Game` via `GameFromFEN`, apply the move, extract the FEN, and discard it. This allocates a game object per move. `Position.Update` is O(1), allocates only a `*Position`, and avoids any interaction with the game's move history. `Position.Update` is strictly better — chosen.
+
+**`mu.RLock` for read accesses vs. no lock.** The race detector only fires on concurrent read+write, not concurrent read+read. `ValidateMove` and `ComputeFENAfterMove` are reads; holding no lock would pass the race detector since the only concurrent write is `ApplyMove` (protected by `mu.Lock`). However, `session.board` is documented as protected by `mu`. Violating the documented invariant creates a subtle inconsistency even if the race detector doesn't catch it. Holding `mu.RLock` for reads is the correct, documented pattern — chosen.
+
+**`MoveRejectionError` for DB failures vs. separate error type.** PHASE_1.md's pipeline diagram says "DB error → MOVE_REJECTED" for `SaveMove` failure. This would mean using `*MoveRejectionError` even for infrastructure failures. This was rejected: a DB error is not a client-attributable rejection, and surfacing it as "illegal move" or "not your turn" is misleading. Plain error for infrastructure failures, `*MoveRejectionError` for client errors — the Manager decides what to send in each case. This is strictly cleaner.
+
+### Lessons Learned
+
+**`move.go` is in `package game` — direct access to `session.board` and `session.mu` is valid.** This was raised as a concern at session start ("MoveProcessor cannot access `session.board`"). The concern was wrong: package-level field access means private fields of `GameSession` are directly accessible in `move.go`. The architecture already accounted for this — `move.go` was always planned to be in `internal/game`.
+
+**`Position.Update` is the correct tool for computing next-position FEN without game mutation.** This is not obvious from the notnil/chess documentation (which is sparse). `gopls:go_search` surfaced it. Worth noting in CLAUDE.md as a known pattern.
+
+**Cancelled context is a clean way to simulate DB failure in integration tests.** No store mocking needed. `SaveMove` uses `pgxpool`, which respects context cancellation. Passing a pre-cancelled context causes the DB operation to fail with `context.Canceled` — exactly what is needed to test the persistence-first invariant without mocking infrastructure.
+
+### Problems Encountered
+
+**`Filesystem:write_file` and `Filesystem:edit_file` tool schemas required explicit `tool_search` to load.** Minor friction — tool parameter names were not available until `tool_search` was called. Resolved within the session.
+
+**`bash_tool` runs in Claude's container, not the user's WSL environment.** Cannot run `go test` directly. Tests were run by the user and results reported back. This is expected given the project setup and causes no issues.
+
+No substantive problems encountered.
+
+### Checklist Progress
+
+- ✅ `MoveProcessor` struct with dependencies: `*chess.Validator`, `*store.GameStore`, `*store.MoveStore`, `EventBus`
+- ✅ `NewMoveProcessor(...)` constructor
+- ✅ `ProcessMove(ctx, session, color, san) error` — full 8-step pipeline
+- ✅ Turn validation (wrong turn → `*MoveRejectionError`)
+- ✅ Status validation (game not active → `*MoveRejectionError`)
+- ✅ `ValidateMove` before DB write (illegal move → `*MoveRejectionError`)
+- ✅ `ComputeFENAfterMove` — FEN for DB write without board mutation
+- ✅ `MoveStore.SaveMove` on critical path; failure leaves board unchanged
+- ✅ `GameStore.UpdateCurrentFEN` after save; failure non-fatal
+- ✅ `ApplyMove` under `mu.Lock` after DB write confirms
+- ✅ `DetectOutcome` after `ApplyMove`; game-over path handled
+- ✅ `GAME_OVER` published via EventBus with outcome/reason/FEN
+- ✅ `MOVE_APPLIED` published via EventBus with san/fen/turn/moveNumber/clock values
+- ✅ `MoveRejectionError` typed error in `internal/game/errors.go`
+- ✅ Integration tests: full pipeline, wrong turn, illegal move, DB failure, checkmate — all passing with `-race`
+
+### Technical Debt Introduced
+
+None this session.
+
+### Files Modified
+
+**Modified:**
+- `internal/chess/validator.go` — added `ComputeFENAfterMove`
+- `internal/game/errors.go` — added `MoveRejectionError`, added `"fmt"` import
+
+**Created:**
+- `internal/game/move.go`
+- `internal/game/testmain_integration_test.go`
+- `internal/game/move_test.go`
+
+### Recommended Next Step
+
+**Step 9: Clock — implement `internal/game/clock.go`.**
+
+`Clock` struct with fields: `mu sync.Mutex` (protects active, whiteRemaining, blackRemaining, paused, started), `active store.Color`, `whiteRemaining time.Duration`, `blackRemaining time.Duration`, `timer *time.Timer`, `onTimeout func(store.Color)`, `stop chan struct{}`. Public API: `NewClock(initialMs int64) *Clock`, `Start(color Color)`, `Switch()`, `Pause()`, `Resume(color Color)`, `TimeRemaining(color Color) time.Duration`, `SetTimeoutCallback(fn func(Color))`, `Stop()`. The timeout goroutine must drain the timer channel on `Stop` to avoid leaks. All tests must use `goleak.VerifyNone(t)` or manual goroutine count verification to confirm `Stop` terminates the goroutine cleanly. Wire the `Clock` into `GameSession` (add `clock *Clock` field to the protected set) and update `ProcessMove` to call `session.clock.Switch()` after `ApplyMove` and snapshot the updated clock values for `UpdateClocks` and `MOVE_APPLIED`.
+
+---
+
+## PART 2 — UPDATED CLAUDE.md
+
+```markdown
 # CLAUDE.md — Session Context Document
 
 This file is the authoritative context document for AI-assisted development sessions on this project.
@@ -538,3 +643,4 @@ Unit tests — all must pass with `-race` and verify no goroutine leaks via `gol
 | 5 | 2025-01-XX | Step 5 complete: chess layer, ADR-013, notnil/chess workarounds discovered |
 | 6 | 2026-06-27 | ws port (ReadLoop callback, TextMessage, slog), Steps 6–7 complete: GameSession, GameRegistry, EventBus, messages.go |
 | 7 | 2026-06-28 | Step 8 complete: MoveProcessor, MoveRejectionError, ComputeFENAfterMove, 5 integration tests passing with -race |
+```

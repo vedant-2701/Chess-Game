@@ -151,6 +151,22 @@ func CurrentFEN(g *chess.Game) string {
 	return g.FEN()
 }
 
+// ComputeFENAfterMove returns the FEN of the position that results from applying
+// san to g, without mutating g. It is called between ValidateMove and ApplyMove to
+// obtain the FEN required for database persistence before the board state advances.
+// See ADR-013.
+//
+// Must only be called after ValidateMove returned nil for the same (g, san) pair.
+// AlgebraicNotation.Decode uses the same code path as ValidateMove, so if
+// ValidateMove passed, Decode here will not error.
+func ComputeFENAfterMove(g *chess.Game, san string) (string, error) {
+	move, err := chess.AlgebraicNotation{}.Decode(g.Position(), san)
+	if err != nil {
+		return "", fmt.Errorf("ComputeFENAfterMove %q: %w", san, ErrIllegalMove)
+	}
+	return g.Position().Update(move).String(), nil
+}
+
 // MoveHistory returns the ordered list of moves played in g as SAN strings.
 // The slice is empty (not nil) if no moves have been played. It is suitable
 // for inclusion in GAME_STATE messages as the "moves" field.
