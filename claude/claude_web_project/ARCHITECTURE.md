@@ -142,14 +142,21 @@ GET /ws/game/:id  (WebSocket upgrade)
 
 **State transitions are the only place game status is changed.** No code outside `GameSession` is allowed to change game state directly.
 
+**CORRECTED (post-Step-10, see DECISIONS_LOG_PHASE_1.md ADR-015):** The diagram above is simplified and predates a correction to abandonment semantics. As drawn, it implies `ABANDONED` is reachable only when both players disconnect. The authoritative, corrected behavior — detailed in full in PHASE_1.md's Game State Machine section — is:
+
+- **Single-player disconnect, opponent stays connected, 60s elapse without reconnection:** the disconnected player loses by abandonment. Transition is `ACTIVE → COMPLETED`, with `outcome` set to the connected player's color and `outcome_reason: ABANDONED`. This is the common case.
+- **Both players disconnected simultaneously when the 60s timer fires:** transition is `ACTIVE → ABANDONED`, with `outcome: DRAW` and `outcome_reason: ABANDONED`.
+
+`ABANDONED` status is reserved exclusively for the both-disconnected case. A single-player abandonment is recorded as `COMPLETED`, distinguishing it from a drawn `ABANDONED` game by the `status` field, not the `outcome_reason` field (both share `outcome_reason: ABANDONED`).
+
 **State definitions:**
 
 | State | Description |
 |-------|-------------|
 | `WAITING_FOR_PLAYER` | Game created. White is connected or pending. Black has not joined. |
 | `ACTIVE` | Both players connected. Moves are being played. |
-| `COMPLETED` | Game has ended. Outcome and reason are recorded. |
-| `ABANDONED` | Both players disconnected for longer than the reconnection window. |
+| `COMPLETED` | Game has ended with a recorded outcome: checkmate, stalemate, resignation, timeout, OR single-player abandonment (opponent wins). |
+| `ABANDONED` | Both players were disconnected simultaneously when the 60-second abandonment timer fired. Terminal, drawn outcome. |
 
 ---
 
@@ -245,7 +252,10 @@ game.Manager.HandleDisconnect(gameID, color)
         └── Start abandonment timer (e.g. 60 seconds)
                 │
                 └── If player reconnects before timer: cancel timer, resume
-                    If timer fires: transition to ABANDONED, notify opponent
+                    If timer fires: outcome depends on opponent's connection
+                    state at that moment (see Game State Machine correction
+                    above) — opponent connected → COMPLETED, opponent wins;
+                    opponent also disconnected → ABANDONED, drawn
 ```
 
 ---

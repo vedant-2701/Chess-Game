@@ -271,6 +271,8 @@ Sent to both players when the game ends for any reason.
 `outcome`: `"WHITE"` | `"BLACK"` | `"DRAW"`
 `reason`: `"CHECKMATE"` | `"STALEMATE"` | `"RESIGNATION"` | `"TIMEOUT"` | `"ABANDONED"`
 
+**Note on `ABANDONED` outcome pairing (corrected post-Step-10, see DECISIONS_LOG_PHASE_1.md):** `reason: "ABANDONED"` can pair with EITHER a winner (`"WHITE"`/`"BLACK"`) or `"DRAW"`, depending on whether one or both players were disconnected when the 60-second window elapsed. See the corrected Game State Machine section below — single-player abandonment is a COMPLETED game with a winner, not a drawn ABANDONED game.
+
 #### OPPONENT_CONNECTED
 Sent when the opponent connects for the first time (game transitions to ACTIVE).
 ```json
@@ -318,6 +320,8 @@ Response to client PING.
 
 ## Game State Machine
 
+**CORRECTED (post-Step-10, see DECISIONS_LOG_PHASE_1.md ADR-015):** The diagram and rule below originally described only the both-players-disconnected case. As written, a single player who disconnected and never reconnected left the game stuck ACTIVE forever — the actual intended (and now implemented) behavior also handles single-player disconnection.
+
 ```
 [POST /games]
      │
@@ -341,14 +345,27 @@ WAITING_FOR_PLAYER
      │
      └── (terminal state — no transitions out)
 
-ACTIVE ──► ABANDONED
+ACTIVE ──► COMPLETED  (winner = the player who stayed connected)
      │
-     └── Both players disconnected AND
-         at least one player did not reconnect
-         within 60-second abandonment window
+     └── One player disconnects and does NOT reconnect within 60
+         seconds, WHILE the opponent remains connected the entire time.
+         outcome = opponent's color, outcome_reason = ABANDONED.
+
+ACTIVE ──► ABANDONED  (no winner — draw)
+     │
+     └── BOTH players are disconnected at the moment the 60-second
+         timer (started by whichever of them disconnected first) fires,
+         and neither has reconnected.
+         outcome = DRAW, outcome_reason = ABANDONED.
 ```
 
-**Abandonment rule:** When a player disconnects, a 60-second timer starts. If they reconnect, the timer cancels and the game resumes. If both players are disconnected and neither reconnects within 60 seconds, the game transitions to ABANDONED. ABANDONED is terminal.
+**Abandonment rule (corrected):** When a player disconnects, a 60-second timer starts for that player. If they reconnect before the timer fires, the timer cancels and the game resumes with no state change.
+
+When the timer fires, the outcome depends on whether the *opponent* is connected at that moment:
+- **Opponent still connected:** the disconnected player loses by abandonment. The game transitions to `COMPLETED` with the connected player as winner and `outcome_reason: ABANDONED`. This is the common case — one player's connection drops while the other is actively present and waiting.
+- **Opponent also disconnected:** the game transitions to `ABANDONED` (terminal, drawn — `outcome: DRAW`, `outcome_reason: ABANDONED`).
+
+`ABANDONED` status is reserved exclusively for the both-disconnected, no-winner case. A single-player abandonment is recorded as `COMPLETED` with a winner, even though `outcome_reason` is still `ABANDONED` in both cases — the `status` field, not the `outcome_reason` field, is what distinguishes them.
 
 **Clock behavior on disconnect:** When a player disconnects, their clock is paused. It resumes when they reconnect. This is a Phase 1 simplification — in production (Phase 4+), the clock would continue running to prevent disconnect-as-stall-tactic.
 
