@@ -463,3 +463,418 @@ within scope.
   unrecoverable without reloading game state from the database.
 - Threefold repetition detection works correctly for the full game duration.
 - No object allocations on the move hot path beyond what `notnil/chess` does internally.
+
+---
+
+## ADR-014: TOCTOU Race — ProcessMove vs. Concurrent Terminal-State Transitions
+
+**Date:** 2026-06-30
+**Status:** ACCEPTED
+
+**Context:**
+`ProcessMove` checks `session.status == ACTIVE` at the top of the pipeline via
+`CurrentStateSnapshot()` (which acquires and releases `session.mu.RLock`), then proceeds
+through `SaveMove` → `UpdateCurrentFEN` → `ApplyMove` without re-checking status.
+`ApplyMove` acquires `session.mu.Lock()` to mutate `session.board`, but the lock
+acquisition and the status check are decoupled — separated by two DB writes.
+
+Meanwhile, `handleResign`, `handleTimeout`, and `onAbandonTimeout` can call
+`session.Transition(COMPLETED/ABANDONED)` from a different goroutine (the opponent's
+WebSocket read loop, the Clock's background goroutine, or the abandon timer goroutine
+respectively). `Transition` acquires `session.mu.Lock()` and changes `session.status`.
+
+If Transition fires between ProcessMove's initial status check and its ApplyMove lock
+acquisition, ProcessMove will:
+- Persist an orphaned move row for a game that is already logically over
+- Mutate `session.board` past the terminal position
+- Publish a `MOVE_APPLIED` event after `GAME_OVER` has already been broadcast
+
+The orphaned DB row is inert (RestoreActiveGames never loads terminal-state games). The
+board mutation is harmless (no further reads will occur). The out-of-order broadcast is
+a real protocol violation that can confuse clients.
+
+**Options Considered:**
+
+**Option A: Re-check status under the ApplyMove write lock (CHOSEN)**
+Expand the existing `session.mu.Lock()` acquisition for `ApplyMove` to include a status
+check: if `session.status != ACTIVE`, skip ApplyMove, clock switch, outcome detection,
+and broadcast. Return nil — the game ended via a legitimate concurrent path.
+
+~5 lines of code. No new architecture. Orphaned `SaveMove` row (which ran before the
+lock) is inert: COMPLETED/ABANDONED games are never replayed by RestoreActiveGames, so
+a trailing move row has no downstream effect.
+
+- Pros: Minimal change, uses existing lock, closes the exact race window, no latency
+  coupling with DB operations.
+- Cons: Does not prevent the orphaned DB row. Does not prevent future races at other
+  points in the session lifecycle (though no other races are currently identified).
+
+**Option B: Single-writer-per-session (actor model)**
+Route every mutating operation (MOVE, RESIGN, clock timeout, abandon timeout) through a
+single goroutine per session via a channel. Eliminates concurrent entry into session
+state by construction.
+
+- Pros: Eliminates all intra-session races by construction, not just this one. Makes
+  the "single goroutine per session" comment in move.go a structural truth rather than
+  an aspirational comment. Textbook correct for the problem domain.
+- Cons: Architectural change touching MoveProcessor, all three Manager terminal-state
+  handlers, and how Step 11's WebSocket read loops hand off to the game layer. Over-
+  engineering relative to the actual bug count (one race, plus the timeout race that
+  Transition already handles). Introduces channel backpressure concerns and complicates
+  error propagation from the actor goroutine back to the caller.
+
+**Option C: Conditional DB write (UPDATE ... WHERE status = 'ACTIVE')**
+Make the database the authoritative coordination gate via row-level conditional update.
+
+- Pros: Database-level consistency even in multi-instance deployments.
+- Cons: Solves a Phase-2 problem that does not exist in Phase 1's single-process model.
+  More fundamentally, the in-memory session is the authoritative state for in-flight
+  game logic — making the DB a coordination mechanism inverts that design and adds DB
+  latency to the critical path of every mutating operation. Phase 2's multi-instance
+  coordination is solved by Redis pub/sub and distributed locking, not by turning
+  PostgreSQL into a mutex.
+
+**Option D: Hold session.mu.Lock() across the entire post-validation pipeline**
+Acquire the write lock before SaveMove and hold it through ApplyMove, clock switch,
+outcome detection, and broadcast.
+
+- Pros: Eliminates the race window entirely.
+- Cons: Lock is held during DB writes (SaveMove, UpdateCurrentFEN, UpdateClocks),
+  coupling session lock hold time to PostgreSQL latency. All other session operations
+  (including CurrentStateSnapshot for reconnecting players) block during DB round-trips.
+  Trades a narrow race for a potential latency bottleneck.
+
+**Decision:** Option A — Re-check status under the ApplyMove write lock.
+
+**Rationale:**
+The race window is between ProcessMove's initial status check and its `session.mu.Lock()`
+acquisition for ApplyMove. Option A closes this window at exactly the point where the
+symptom occurs: the in-memory mutation and broadcast. The fix is consistent with how
+`handleTimeout` already handles the symmetric race — Transition is the gate, and the
+loser no-ops.
+
+The orphaned `SaveMove` row is provably inert. `RestoreActiveGames` only loads ACTIVE
+and WAITING games via `GetActiveGames`. A COMPLETED or ABANDONED game will never have
+its move rows replayed. The trailing move is invisible to all current and planned
+consumers of the data.
+
+Option B (actor model) is architecturally superior but unjustified by the current bug
+count: exactly one race (this one), plus the timeout race that Transition already
+handles. Introducing an actor model as a quiet bug fix would be over-engineering. If
+Step 11 testing under real concurrent read loops (with `-race`) surfaces additional
+intra-session races, Option B should be revisited as a dedicated ADR.
+
+Option C is rejected as the wrong abstraction layer. Option D is rejected as trading a
+narrow race for a latency bottleneck.
+
+**Consequences:**
+- ProcessMove's ApplyMove section is expanded from:
+  ```go
+  session.mu.Lock()
+  applyErr := p.validator.ApplyMove(session.board, san)
+  session.mu.Unlock()
+  ```
+
+to:
+
+```go
+session.mu.Lock()
+if session.status != store.GameStatusActive {
+    session.mu.Unlock()
+    slog.Info("ProcessMove: game no longer ACTIVE after DB write — skipping apply",
+        "gameID", session.ID, "san", san, "status", session.status)
+    return nil
+}
+applyErr := p.validator.ApplyMove(session.board, san)
+session.mu.Unlock()
+```
+
+- No changes to Manager, terminal-state handlers, EventBus, or Clock.
+- The orphaned SaveMove row is accepted as a known, inert artifact. If future phases require move-table cleanliness (e.g., replay features, move analytics), a migration or cleanup job can be added then.
+- Option B (actor model) is flagged for ADR discussion before or during Step 11 if -race testing under concurrent read loops reveals further intra-session races.
+
+---
+
+## ADR-015: Abandonment Semantics Correction — Single vs. Both Players Disconnected
+
+**Date:** 2026-06-30
+**Status:** ACCEPTED
+
+**Context:**
+
+`PHASE_1.md`'s original Game State Machine section, and `manager.go`'s initial
+`onAbandonTimeout` implementation (Step 10), specified and implemented abandonment as
+follows: when a player disconnects, a 60-second timer starts; if the timer fires
+without reconnection, the game unconditionally transitions to `ABANDONED`.
+
+This is wrong as both a spec and an implementation. As implemented, the condition for
+`ABANDONED` never actually required both players to be disconnected — the timer fires
+based on a single player's disconnect duration, with no check of the opponent's
+connection state. The practical consequence: if Player A's connection drops for any
+reason exceeding 60 seconds while Player B remains actively connected and waiting, the
+game is incorrectly marked `ABANDONED` (a draw) out from under Player B, even though
+B never abandoned anything and was actively present the entire time. Conversely, the
+spec's literal wording ("both players disconnected AND at least one did not reconnect")
+describes a condition that, if actually checked as written, would mean a single
+permanently disconnected player with a connected opponent would leave the game stuck
+`ACTIVE` forever — neither the written spec nor the as-implemented code produced fully
+correct behavior.
+
+This was caught during code review (not via a failing test — no Manager tests exist
+yet) by reading `manager.go`'s `onAbandonTimeout` directly and checking it against the
+stated PHASE_1.md state machine.
+
+**Options Considered:**
+
+**Option A: Keep both-disconnected-only abandonment, fix the missing check (literal spec)**
+Make `onAbandonTimeout` actually verify both players are disconnected before
+transitioning to `ABANDONED`; if only one is disconnected, take no action and leave
+the game `ACTIVE` indefinitely.
+
+- Pros: Matches the literal original spec wording exactly.
+- Cons: A single player who disconnects and never returns (closed laptop, lost phone,
+  gave up) leaves their opponent stuck in an `ACTIVE` game forever, with the clock
+  paused (TD-002) and no path to resolution. Worse user experience than real chess
+  platforms provide, and contradicts the project's own framing of abandonment as
+  something that should resolve a stuck game, not describe one precondition for a
+  rarely-reachable terminal state.
+
+**Option B: Single-player disconnect triggers abandonment-loss; both-disconnected triggers a drawn abandonment (CHOSEN)**
+Distinguish two abandonment outcomes based on the opponent's connection state at the
+moment the 60-second timer fires:
+  - Opponent connected → disconnected player loses by abandonment. `ACTIVE → COMPLETED`,
+    `outcome` = opponent's color, `outcome_reason: ABANDONED`.
+  - Opponent also disconnected → true mutual abandonment. `ACTIVE → ABANDONED`,
+    `outcome: DRAW`, `outcome_reason: ABANDONED`.
+
+- Pros: Resolves the common case (one player's connection drops, the other is left
+  waiting) the way real-time multiplayer games typically handle it — the present
+  player is not penalized by being stuck in limbo. Still correctly handles true mutual
+  abandonment as a draw, matching the original spec's intent for that specific case.
+  No new DB schema or outcome_reason value needed — `ABANDONED` as an `outcome_reason`
+  already supports pairing with either a winner outcome or `DRAW` per the existing
+  `games` table CHECK constraint.
+- Cons: `outcome_reason: ABANDONED` is no longer sufficient on its own to determine
+  whether the game was a decisive result or a draw — clients must read `outcome`
+  (`WHITE`/`BLACK` vs `DRAW`) together with `status` (`COMPLETED` vs `ABANDONED`) to
+  fully interpret an abandonment-ended game. Minor protocol nuance, not a new field or
+  migration.
+
+**Option C: Asymmetric timers — shorter timeout for single-disconnect-loss, longer for mutual-abandonment-draw**
+Use two different timer durations: e.g. 60s for single-player abandonment-loss, but a
+longer window (e.g. 120s) before declaring mutual abandonment a draw, on the theory
+that a draw is a more drastic/final outcome and deserves more grace.
+
+- Pros: Slightly more lenient for the both-disconnected edge case.
+- Cons: Two timer durations is added complexity with no clear product requirement
+  driving it. PHASE_1.md specifies a single 60-second window; introducing a second
+  duration is unscoped complexity for Phase 1, not something requested. Rejected on
+  the same grounds the project rejects other speculative complexity (see ROADMAP.md's
+  "What This Project Does Not Teach" and the "no just-in-case hooks" instruction in
+  PHASE_1.md's Explicitly Out of Scope section).
+
+**Decision:** Option B — single-player disconnect triggers abandonment-loss
+(`COMPLETED`, opponent wins); both-disconnected triggers a drawn abandonment
+(`ABANDONED`).
+
+**Rationale:**
+
+The core problem with the original spec and implementation is that they conflated two
+genuinely different scenarios under one mechanism. "My opponent vanished and I'm stuck
+waiting" and "we both got disconnected at the same time" are different situations with
+different correct outcomes — the first has a clear winner (whoever stayed), the second
+does not. Option B is the only one of the three that resolves both situations to a
+correct, non-stuck terminal state without introducing unscoped complexity (Option C)
+or leaving a real failure mode unaddressed (Option A).
+
+This correction was made to the documentation (`PHASE_1.md`, `ARCHITECTURE.md`) and the
+implementation (`manager.go`'s `onAbandonTimeout`, plus a new `GameSession.IsPlayerConnected`
+method) in the same session, per the project's spec-first discipline: the doc correction
+is recorded here and in both spec files before being treated as settled.
+
+**Consequences:**
+
+- `GameSession` gains `IsPlayerConnected(color store.Color) bool`, a read-locked check
+  of the relevant connection slot. Used exclusively by `onAbandonTimeout` to determine
+  the opponent's connection state at the moment the timer fires.
+- `Manager.onAbandonTimeout` branches on `session.IsPlayerConnected(opponentOf(color))`:
+  connected → `Transition(COMPLETED)` with the opponent as winner; not connected →
+  `Transition(ABANDONED)` with a `DRAW` outcome. Both branches set
+  `outcome_reason: ABANDONED` — the `status` field (`COMPLETED` vs `ABANDONED`), not
+  `outcome_reason`, is what distinguishes a decisive abandonment-loss from a drawn
+  mutual abandonment.
+- No database schema or migration change required. `outcome` already supports
+  `WHITE`/`BLACK`/`DRAW` and `outcome_reason` already supports `ABANDONED` independent
+  of which `outcome` it pairs with.
+- `PHASE_1.md`'s WebSocket Message Protocol section (`GAME_OVER` reason list) and Game
+  State Machine section, and `ARCHITECTURE.md`'s Game State Machine and WebSocket
+  Connection Lifecycle sections, are updated with the corrected behavior.
+- This correction was made in the same session as ADR-014 (TOCTOU re-check) and the
+  `finalizeGame` registry-cleanup centralization (see Implementation Decisions in
+  CLAUDE.md). All three address gaps found by direct code review of `manager.go` and
+  `move.go` against `PHASE_1.md`/`ARCHITECTURE.md`, not by failing tests — Manager has
+  no test coverage yet. This is itself a reason Manager integration tests, including
+  explicit coverage of both `onAbandonTimeout` branches, are scheduled immediately
+  following this ADR, before Step 11.
+
+---
+
+## ADR-016: JoinGame Double-Join Race — Atomic Conditional UPDATE
+
+**Date:** 2026-07-01
+**Status:** ACCEPTED
+
+**Context:**
+
+While writing Manager integration tests (immediately following ADR-015), a test for
+rejecting an already-joined game (`TestManager_JoinGame_RejectsWhenAlreadyJoined`)
+failed against the original `JoinGame` implementation. `JoinGame`'s only precondition
+check was `game.Status != store.GameStatusWaiting`. Per this session's own confirmed
+design (status remains `WAITING_FOR_PLAYER` until both WebSocket connections go live
+in `HandleConnect`, not on the HTTP join call), that check alone could not detect
+"this game already has a Black player assigned." A second, different user calling
+`JoinGame` before any WebSocket connected would pass the status check and silently
+overwrite `player_black_id` in both the DB and the in-memory `GameSession`.
+
+The first fix applied — adding `if game.PlayerBlackID != nil { return ErrGameNotJoinable }`
+to `JoinGame`'s pre-flight check — closed the *sequential* case (second join arriving
+after the first has already committed) but not the *concurrent* case. `JoinGame`'s
+sequence was read-then-write across two separate statements with no transaction or
+locking between them:
+
+```go
+game, err := m.gameStore.GetGame(ctx, gameID)      // READ
+if game.PlayerBlackID != nil { return ... }          // CHECK (in application code)
+...
+m.gameStore.UpdatePlayerBlack(ctx, gameID, userID)   // WRITE — unconditional SQL
+```
+
+`UpdatePlayerBlack`'s original SQL was `UPDATE games SET player_black_id = $1 ...
+WHERE id = $2` — no predicate on the game's current state. Two different users calling
+`JoinGame` for the same `gameID` concurrently could both execute `GetGame` and observe
+`player_black_id IS NULL` before either committed its `UpdatePlayerBlack`. Whichever
+`UPDATE` executed last would win silently, with no error, no conflict signal, and the
+loser believing they had successfully joined (their JWT is validly signed regardless).
+This is a classic application-level check-then-act race resolved against a database
+that was never asked to enforce the invariant itself. It is invisible to `go test -race`
+since the race is at the database level, not a Go memory race — confirmed by writing
+`TestManager_JoinGame_ConcurrentJoins_ExactlyOneWins`, which reproduces the race with
+two real goroutines against a live PostgreSQL instance and only passes once the fix
+below is applied.
+
+**Options Considered:**
+
+**Option A: Row-level lock via `SELECT ... FOR UPDATE`**
+Wrap `GetGame` + `UpdatePlayerBlack` in an explicit transaction, using
+`SELECT ... FOR UPDATE` to lock the row before the check-then-act sequence.
+
+- Pros: Keeps the read-then-write shape of the code close to its current form;
+  the locking is explicit and visible at the call site.
+- Cons: Requires `JoinGame` to manage a `pgx.Tx` directly, which does not fit the
+  current `GameStore`/`MoveStore` method-per-operation shape used everywhere else in
+  `internal/store` (see ADR-011, no-ORM raw-SQL discipline — introducing ad hoc
+  transaction management in `internal/game` would leak persistence-layer concerns
+  upward, violating `ARCHITECTURE.md`'s stated rule that no SQL, and by extension no
+  transaction control, lives outside `internal/store`). Also holds a row lock for the
+  duration of the Go-level round trip between the `SELECT` and the `UPDATE`, which is
+  strictly worse under contention than a single atomic statement.
+
+**Option B: Atomic conditional UPDATE (CHOSEN)**
+Make the `UPDATE` itself the authoritative check, via a `WHERE` clause encoding the
+full precondition, and treat `RowsAffected() == 0` as failure:
+
+```sql
+UPDATE games
+SET player_black_id = $1, updated_at = NOW()
+WHERE id = $2 AND status = 'WAITING_FOR_PLAYER' AND player_black_id IS NULL
+```
+
+- Pros: PostgreSQL evaluates the `WHERE` predicate and performs the write atomically
+  within a single statement — there is no window between check and act for a second
+  transaction to interleave. No explicit transaction or lock management needed in Go
+  code. Stays entirely within `GameStore`'s existing method-per-operation shape;
+  `internal/game` still never touches SQL. The prior `GetGame` pre-flight check in
+  `JoinGame` remains useful for producing a specific, friendly error (`ErrSelfPlay` vs
+  `ErrGameNotJoinable`) in the common non-racing case, but is no longer the source of
+  the actual correctness guarantee — the UPDATE is.
+- Cons: `RowsAffected() == 0` is ambiguous on its own — it fires whether the row is
+  genuinely missing or exists but failed the predicate. Requires a new error sentinel
+  to disambiguate (see Consequences).
+
+**Option C: Advisory lock (`pg_advisory_xact_lock`) keyed on gameID**
+Acquire a PostgreSQL advisory lock for the duration of the join operation.
+
+- Pros: General-purpose serialization primitive, would also cover future
+  multi-statement operations on the same game row.
+- Cons: Solves a more general problem than the one that exists. `JoinGame` has
+  exactly one write; a general-purpose distributed-locking primitive is unscoped
+  complexity for Phase 1 (this project explicitly avoids "just in case" hooks per
+  PHASE_1.md's Explicitly Out of Scope section). Advisory locks also require careful
+  session/transaction-scoping discipline to avoid being held longer than intended —
+  another source of subtle bugs for a problem a single SQL predicate already solves.
+
+**Decision:** Option B — atomic conditional UPDATE with a `WHERE` clause encoding
+the full join precondition, disambiguated from "not found" via a new
+`store.ErrGameNotJoinable` sentinel.
+
+**Rationale:**
+
+The correctness requirement is narrow: exactly one of two racing writers should
+succeed, and PostgreSQL already provides this for free at the single-statement level
+— a `WHERE` clause is evaluated and the write applied atomically per row, with no
+additional locking primitive required. Reaching for explicit transactions (Option A)
+or advisory locks (Option C) would solve the same problem with more moving parts and,
+in Option A's case, would also violate the project's own layering rule that
+transaction/SQL control stays inside `internal/store`. Option B keeps the fix entirely
+within `GameStore.UpdatePlayerBlack`'s existing shape — no new dependency, no new
+concurrency primitive, no change to any call site's calling convention beyond error
+handling.
+
+The original bug in the fix's first pass — returning `store.ErrGameNotFound` on
+`RowsAffected() == 0` — was itself a violation of `CODING_GUIDELINES.md` §1's
+"distinguish not-found from error" rule: a row that exists but fails a precondition is
+not the same failure mode as a row that does not exist, and conflating them produces a
+misleading error for the legitimate loser of a join race (who would see "game not
+found" for a game that plainly exists and that they can see on screen). `store.ErrGameNotJoinable`
+was added to `internal/store/errors.go` rather than reusing `game.ErrGameNotJoinable`
+directly, because `internal/store` must not import from `internal/game` —
+`ARCHITECTURE.md`'s dependency graph is strictly `game → store`, never the reverse.
+`Manager.JoinGame` translates `store.ErrGameNotJoinable` to `game.ErrGameNotJoinable`
+via `errors.Is` at the package boundary, so no caller outside `internal/store` ever
+depends on a store-package sentinel.
+
+**Consequences:**
+
+- `GameStore.UpdatePlayerBlack`'s SQL now reads:
+  `UPDATE games SET player_black_id = $1, updated_at = NOW() WHERE id = $2 AND status = 'WAITING_FOR_PLAYER' AND player_black_id IS NULL`.
+- `store.ErrGameNotJoinable` added to `internal/store/errors.go`, returned by
+  `UpdatePlayerBlack` when `RowsAffected() == 0` (row exists, precondition failed).
+  `store.ErrGameNotFound` is reserved exclusively for a genuinely missing row —
+  `UpdatePlayerBlack` no longer returns it under any circumstance, since the row's
+  existence is already established by `JoinGame`'s prior `GetGame` call in every
+  real call path.
+- `Manager.JoinGame` gained an `errors.Is(err, store.ErrGameNotJoinable)` branch
+  translating to `game.ErrGameNotJoinable` before the generic error-wrapping fallback.
+- `JoinGame`'s pre-flight `GetGame` + `PlayerBlackID != nil` check (added as the first,
+  incomplete fix) is retained. It is now purely a fast-path / friendly-error optimization
+  for the non-racing case — the atomic UPDATE is the sole correctness guarantee. Removing
+  the pre-flight check would not reintroduce the bug, but would lose the distinct
+  `ErrSelfPlay` vs `ErrGameNotJoinable` error specificity in the common case.
+- New regression test `TestManager_JoinGame_ConcurrentJoins_ExactlyOneWins` in
+  `internal/game/manager_race_test.go`: 20 trials per run, each spinning up two real
+  goroutines racing `JoinGame` against a freshly created game, asserting exactly one
+  success and one `ErrGameNotJoinable` failure, and cross-checking the persisted DB row
+  against the in-memory `GameSession` to catch a bug that might otherwise only be
+  visible at the SQL level. Passes under `-race`. This test does not and cannot catch
+  the class of bug it guards against via the Go race detector alone — the underlying
+  race is a database-level TOCTOU, not a Go memory race — so its value is in exercising
+  genuine goroutine concurrency against real PostgreSQL, not in `-race` flagging
+  anything directly.
+- This is the second race condition found and fixed this session via direct code
+  review and adversarial test-writing (the first being ADR-014's `ProcessMove`
+  TOCTOU) rather than via a pre-existing spec requirement — both are now considered
+  precedent for treating "was this checked for concurrent callers, not just sequential
+  ones" as a standing question for any new read-then-write sequence added to the
+  `game` or `store` layers, not just a one-off fix.
+
+---

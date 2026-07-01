@@ -1,3 +1,121 @@
+## PART 1 — SESSION SUMMARY
+
+## Session Summary — Clock Implementation and Manager Orchestrator Complete
+
+### What Was Built
+
+**`internal/game/clock.go`** — full `Clock` implementation: channel-based design with `resetCh` (buffered(1)) carrying timer reconfigurations to a single background goroutine (`run()`), and `stopCh` for clean termination. Fields: `mu sync.Mutex`, `active store.Color`, `whiteRemaining`/`blackRemaining time.Duration`, `startedAt time.Time`, `paused`/`started bool`, `onTimeout func(store.Color)`, `stopCh`, `resetCh`. Public API: `NewClock(initialMs)`, `NewClockWithTimes(whiteMs, blackMs)` (for restore-from-DB with divergent remaining times), `SetTimeoutCallback`, `Start`, `Switch`, `Pause`, `Resume`, `TimeRemaining`, `Stop`, `IsStarted`. The `run()` goroutine never acquires `c.mu` — all communication with it is via channels to avoid lock-ordering issues with the timeout callback.
+
+**`internal/game/clock_test.go`** — 9 unit tests, all passing with `-race`: initial time, countdown-to-timeout, switch changes active color, pause/resume preserves remaining time, Stop terminates goroutine cleanly, Stop is idempotent, Start is idempotent, Resume with mismatched color does not corrupt `active`, concurrent `TimeRemaining` reads are race-free. All goroutine-spawning tests use `goleak.VerifyNone(t)` with `c.Stop()` deferred after it (LIFO: Stop runs before goleak inspects).
+
+**`internal/game/session.go`** — added `clock *Clock` field (documented as protected by its own internal mutex, not `session.mu`). Added `NewGameSessionFromDB(game *store.Game, board *notnil.Game) *GameSession` — hydrates a session from a persisted DB record plus a replayed board, used exclusively by `RestoreActiveGames`. Clock is constructed via `NewClockWithTimes` from persisted `WhiteTimeMs`/`BlackTimeMs` and is NOT started until both players reconnect.
+
+**`internal/game/move.go`** — wired `session.clock.Switch()` into `ProcessMove` immediately after `ApplyMove` succeeds. Post-switch clock values are read via `TimeRemaining`, written to `session.UpdateClocks` (in-memory) and persisted via `gameStore.UpdateClocks` (non-fatal on failure — in-memory is authoritative). `handleGameOver` now calls `session.clock.Stop()` before transitioning to COMPLETED, preventing a stale timeout callback from firing on a finished game. `publishMoveApplied` signature changed from taking a `GameStateSnapshot` to taking explicit `whiteTimeMs, blackTimeMs int64` — removes the dependency on stale snapshot data.
+
+**`internal/game/manager.go`** (new, Step 10) — full `Manager` orchestrator:
+- `NewManager(...)` — depends on `GameRegistry`, `MoveProcessor`, `GameStore`, `MoveStore`, `EventBus`, JWT secret, `chess.Validator`
+- `CreateGame(ctx, userID)` — generates UUID v7 game ID, persists, signs White's token, registers session, subscribes to EventBus
+- `JoinGame(ctx, gameID, userID)` — validates `WAITING_FOR_PLAYER` status and rejects self-play, persists Black, signs Black's token
+- `HandleConnect(ctx, gameID, color, conn)` — handles first-connect (transitions WAITING→ACTIVE, starts clock when both present), reconnect (cancels abandonment timer, resumes or starts clock), and post-restart reconnect (clock never started in this process, so `Start` instead of `Resume`)
+- `HandleDisconnect(gameID, color)` — clears connection slot, pauses clock, starts 60s abandonment timer
+- `HandleMessage(ctx, gameID, color, raw)` — routes MOVE/RESIGN/PING/unknown
+- `RestoreActiveGames(ctx)` — loads all ACTIVE/WAITING games, replays moves via `GameFromMoves` (never trusts `current_fen`), detects and corrects zombie ACTIVE games (board already terminal but DB still ACTIVE) by persisting the correct COMPLETED status and skipping registry insertion
+- `handleResign`, `handleTimeout`, `onAbandonTimeout` — each stops the clock, transitions state, persists outcome, publishes GAME_OVER
+- `startEventSubscriber` — self-terminating goroutine per game: ranges over the EventBus channel, fans out to both players, exits and unsubscribes upon seeing a GAME_OVER event
+- UUID v7 (`github.com/google/uuid`) used for game IDs — correct choice for a DB primary key (time-ordered, avoids B-tree index fragmentation from random inserts)
+
+**`internal/game/errors.go`** — added `ErrGameNotJoinable`, `ErrSelfPlay` sentinels for `JoinGame`.
+
+All changes verified with `go test -race ./internal/game/...` — full suite passing, including all Step 6–10 unit tests.
+
+### Decisions Made
+
+**Clock uses channel-based reconfiguration, not direct timer manipulation from arbitrary goroutines.** The background `run()` goroutine owns the `time.Timer` exclusively; all other methods (`Start`, `Switch`, `Pause`, `Resume`) compute new state under `c.mu` and send a `clockReset` message via `resetCh`. This avoids `c.mu` ever being held while blocked on a channel operation and keeps the goroutine the single writer of `timer`/`timerC`. No ADR needed — implementation detail within the established mutex-documentation pattern.
+
+**`startedAt time.Time` added to the Clock spec.** The original CLAUDE.md spec omitted this field. Without it, `Switch()` and `Pause()` have no reference point to compute elapsed time since the last start. Flagged and corrected in CLAUDE.md before implementation began (per explicit instruction from previous session-end review).
+
+**`Resume(color)` restarts `c.active`, not the passed `color`.** `Pause()` does not clear `active` — it remains the paused player's color. If `Resume` is called with a mismatched color (caller bug), the implementation logs an Error but does not override `active`, preventing silent corruption of clock state. Verified by `TestClock_Resume_WrongColor_LogsErrorAndResumesActive`.
+
+**`RestoreActiveGames` reconstructs boards via `GameFromMoves`, never `GameFromFEN(current_fen)`.** This was flagged as a required Step 10 behavior in the prior session (Concern #3a) due to Step 8's non-fatal `UpdateCurrentFEN` failure mode, which can leave `current_fen` stale. `GameFromMoves` replays the authoritative `moves` table and is always correct.
+
+**Zombie ACTIVE games are detected and corrected during restore, not left for a future job.** If `handleGameOver`'s `UpdateGameStatus` call previously failed (DB still shows ACTIVE despite an in-memory COMPLETED transition having already occurred and been published), `RestoreActiveGames` calls `DetectOutcome` on the replayed board. If the game is already over, the DB record is corrected to COMPLETED and the session is excluded from the registry — it is never added as a live, joinable game.
+
+**UUID v7 for game IDs (DB primary key); UUID v4 reserved for non-DB identifiers (e.g. request IDs at Step 12).** Raised by the user mid-session. UUID v4 is fully random and causes B-tree index fragmentation on insert-heavy primary keys; UUID v7 is time-ordered and inserts append-only into the index. `github.com/google/uuid` replaced an initial hand-rolled `crypto/rand`-based UUID v4 generator that had been written without first checking for an existing, correct library — this was a process violation (the project's working agreement requires checking for existing libraries before writing custom logic) and was corrected immediately within the same session.
+
+**Decision: no shared UUID helper function.** Game IDs and request IDs are different types living in different packages with different version requirements (v7 for game IDs in `internal/game`, v4 for request IDs in `internal/api` at Step 12). Both are one-line library calls. A shared helper would add indirection without benefit — call `uuid.NewV7()` / `uuid.New()` directly at each site.
+
+**EventBus subscriber goroutine is self-terminating on GAME_OVER.** Rather than the Manager separately managing subscriber lifecycle and game lifecycle, the subscriber goroutine itself recognizes the terminal event type, calls the deferred `unsubscribe()`, and returns. This keeps goroutine cleanup colocated with the condition that makes the goroutine's continued existence unnecessary, and avoids the Manager needing to track per-game subscriber state separately from the `GameRegistry`.
+
+**Clock timeout callback boundary race is accepted as TD-002, not engineered around.** A move arriving at `ProcessMove` at the exact instant a clock timeout fires can race with `handleTimeout`. Both paths call `session.Transition`, which is idempotent-safe (the loser of the race gets an error and no-ops, logged at Debug). This is documented inline in `handleTimeout` and is an accepted Phase 1 simplification — Phase 4 will introduce move-submission timestamps to resolve it properly.
+
+### Tradeoffs Considered
+
+**Per-player abandonment timers via `time.AfterFunc` vs. a single sweep goroutine.** A periodic sweep goroutine scanning all sessions for disconnected players past the abandonment window was considered. `time.AfterFunc` per disconnect event was chosen: it is simpler, requires no polling interval tuning, and Go's runtime timer implementation handles many concurrent timers efficiently. The cost — a `map[string]*time.Timer` requiring its own mutex — is small and already follows the established mutex-documentation pattern.
+
+**`HandleConnect` distinguishing first-connect from reconnect via pre-registration status snapshot vs. a separate "hasEverConnected" flag.** Snapshotting `session.CurrentStateSnapshot().Status` before calling `RegisterConnection` was chosen over adding new session state, because `WAITING_FOR_PLAYER` vs `ACTIVE` already encodes exactly this distinction without introducing a new field to keep in sync.
+
+**Manual UUID v4 generation (initial draft) vs. `google/uuid` library.** Initial implementation used `crypto/rand` directly with manual version/variant bit-setting. Rejected upon review: bug-prone (easy to mis-set bits), non-standard, and unnecessary when a well-tested library is one `go get` away. This was a clear case of the project's "use libraries, don't reinvent" principle (consistent with ADR-006's rationale for using `notnil/chess` instead of writing a chess engine) being violated and then corrected.
+
+### Lessons Learned
+
+**A spec gap (missing `startedAt` field) surfaces immediately once you try to write `Switch()`/`Pause()` — but only if you actually attempt to write the deduction logic rather than just declaring the struct.** This reinforces the value of writing the full method bodies before considering a struct design "locked," rather than treating field lists as complete in isolation.
+
+**Library-first discipline needs to be enforced even for "trivial" utility code, not just domain logic.** The chess validation library (ADR-006) was an obvious case for using a library. UUID generation felt small enough to hand-roll, which is exactly the trap — small, "obviously correct" utility code is where custom implementations introduce subtle bugs (version/variant bit errors) that a library has already solved correctly and tested.
+
+**The EventBus self-terminating-subscriber pattern works cleanly with the existing `LocalEventBus.Publish` RLock-for-entire-send-loop design from Step 7.** No friction was found integrating `startEventSubscriber`'s `return` (closing via `defer unsubscribe()`) with the documented Known Sharp Edge about not snapshotting-then-releasing in `Publish` — the two were designed independently in different sessions and composed correctly on the first attempt.
+
+### Problems Encountered
+
+**Initial `manager.go` write used `crypto/rand`-based manual UUID v4 generation instead of checking for an existing library first.** Caught by the user, not self-identified — this is the most significant process gap this session. Corrected immediately: added `github.com/google/uuid`, switched to `uuid.NewV7()`, removed the hand-rolled `generateGameID` function entirely.
+
+**An `edit_file` MCP call failed with a parameter validation error (`newText` undefined) on a multi-edit batch.** Root cause: one edit's `oldText` did not exactly match file content due to a prior partial/failed edit application. Resolved by re-reading the full file and rewriting it via `write_file` instead of patching, which is the safer recovery path when `str_replace`/`edit_file` matches become unreliable mid-session.
+
+No unresolved problems carry into the next session.
+
+### Checklist Progress
+
+- ✅ Step 9: Clock — `Clock` struct, full public API, channel-based goroutine, 9 unit tests passing with `-race` and `goleak`
+- ✅ Step 9: `GameSession` wired with `clock *Clock` field
+- ✅ Step 9: `ProcessMove` calls `clock.Switch()`, persists clock state, passes live values to `MOVE_APPLIED`
+- ✅ Step 10: `Manager` struct and `NewManager` constructor
+- ✅ Step 10: `CreateGame(ctx, userID) (*GameSession, string, error)`
+- ✅ Step 10: `JoinGame(ctx, gameID, userID) (string, error)`
+- ✅ Step 10: `HandleConnect(ctx, gameID, color, conn) error` — first-connect, reconnect, post-restart-reconnect paths
+- ✅ Step 10: `HandleDisconnect(gameID, color)`
+- ✅ Step 10: `HandleMessage(ctx, gameID, color, raw) error` — MOVE/RESIGN/PING/unknown routing
+- ✅ Step 10: `RestoreActiveGames(ctx) error` — stale-FEN and zombie-ACTIVE handling
+- ✅ Step 10: `MsgTypeMove → ProcessMove`, `MsgTypeResign → handleResign`, `MsgTypePing → PONG`, unknown → ERROR
+- ✅ UUID v7 adopted for game ID generation via `github.com/google/uuid`
+- 🔄 Step 11 (WebSocket Handler) — not started; next task
+
+### Technical Debt Introduced
+
+None new this session. TD-002 (clock pauses on disconnect) now has a corollary boundary-race condition between `ProcessMove`-driven game completion and `handleTimeout` — this is an extension of TD-002, not a new debt item, and is documented inline in `manager.go`'s `handleTimeout`.
+
+### Files Modified
+
+**Created:**
+- `internal/game/clock.go`
+- `internal/game/clock_test.go`
+- `internal/game/manager.go`
+
+**Modified:**
+- `internal/game/session.go` — added `clock *Clock` field, `NewGameSessionFromDB` constructor
+- `internal/game/move.go` — wired `clock.Switch()` into `ProcessMove`, `clock.Stop()` into `handleGameOver`, changed `publishMoveApplied` signature
+- `internal/game/errors.go` — added `ErrGameNotJoinable`, `ErrSelfPlay`
+- `go.mod` / `go.sum` — added `github.com/google/uuid`
+
+### Recommended Next Step
+
+**Step 11: WebSocket Handler — implement `internal/ws/handler.go`.**
+
+Before writing code, resolve the context-lifetime decision flagged in Known Sharp Edges: `r.Context()` is cancelled when `ServeHTTP` returns, which happens before the read loop (and thus `HandleMessage` calls) exit. Decide whether to pass `context.Background()`, a context derived from the server's top-level lifecycle context (passed in at `Handler` construction), or another approach — then implement `Handler` struct (deps: `auth.TokenService`, `*game.Manager`, `*ws.Registry`), `ServeHTTP` (token extraction from `?token=`, verification, `claims.GameID` vs URL `:id` match check, upgrade, `ws.Registry.Register`, `Manager.HandleConnect`, wire `ReadLoop` callbacks to `Manager.HandleMessage`/`Manager.HandleDisconnect`), plus integration tests: invalid token → connection refused with correct close code, valid token → GAME_STATE received, reconnection with same token → current GAME_STATE delivered. Estimated 2-3 hours given the context-lifetime decision needs deliberate review before implementation, not just during it.
+
+---
+
+## PART 2 — UPDATED CLAUDE.md
+
+```markdown
 # CLAUDE.md — Session Context Document
 
 This file is the authoritative context document for AI-assisted development sessions on this project.
@@ -22,7 +140,7 @@ Update this file at the end of every session. Stale context is worse than no con
 ## Current Phase
 
 **Phase 1 — MVP**
-**Status: 🔄 In Progress — Steps 1–10 Complete and hardened (two correctness bugs found and fixed via review/testing), Step 11 (WebSocket Handler) Next**
+**Status: 🔄 In Progress — Steps 1–10 Complete, Step 11 (WebSocket Handler) Next**
 
 ---
 
@@ -34,12 +152,12 @@ Update this file at the end of every session. Stale context is worse than no con
 - [x] All documentation files created
 - [x] Phase 1 spec written (PHASE_1.md)
 - [x] Architecture documented (ARCHITECTURE.md)
-- [x] All ADRs logged (DECISIONS_LOG_PHASE_1.md) — now through **ADR-016**
+- [x] All ADRs logged (DECISIONS_LOG_PHASE_1.md)
+- [x] Coding guidelines defined (CODING_GUIDELINES.md)
 - [x] `turn` field casing corrected to uppercase (`"WHITE"`/`"BLACK"`) in CLAUDE.md — PHASE_1.md is authoritative
 - [x] `GET /games/:id` added to ARCHITECTURE.md endpoint list
 - [x] Clock spec corrected to include `startedAt time.Time` field and precise `Resume` semantics before Step 9 implementation began
 - [x] Step 10 sharp edges (stale `current_fen`, zombie ACTIVE games) documented before Step 10 implementation began
-- [x] **PHASE_1.md and ARCHITECTURE.md Game State Machine sections corrected** to reflect ADR-015 abandonment semantics (single-disconnect vs. both-disconnected produce different terminal states)
 
 ### Implementation
 - [x] WebSocket infrastructure (`internal/ws`): connection lifecycle, read loop (callback-based), write loop, heartbeats, registry, graceful shutdown — ported from learning project and updated for production use
@@ -50,10 +168,9 @@ Update this file at the end of every session. Stale context is worse than no con
 - [x] Step 5: Chess Layer — errors.go, types.go, validator.go + 20 unit tests (all passing with -race)
 - [x] Step 6: Game Session and Registry — session.go, registry.go, errors.go + unit tests (all passing with -race)
 - [x] Step 7: EventBus — eventbus.go, messages.go + unit tests (all passing with -race)
-- [x] Step 8: Move Pipeline — move.go (MoveProcessor, MoveRejectionError, ComputeFENAfterMove) + integration tests (all passing with -race)
-- [x] Step 9: Clock — clock.go (channel-based, goroutine-per-clock), wired into session.go and move.go, clock_test.go unit tests passing with -race and goleak (pgxpool false-positive resolved via `goleak.IgnoreTopFunction`, see Known Sharp Edges)
-- [x] Step 10: Manager — manager.go (CreateGame, JoinGame, HandleConnect, HandleDisconnect, HandleMessage, RestoreActiveGames, abandonment timers, resign/timeout/abandon game-over paths, `finalizeGame` registry cleanup)
-- [x] **Pre-Step-11 hardening pass:** ADR-014 (TOCTOU re-check in ProcessMove) verified correct; ADR-015 (abandonment semantics correction) designed, implemented, tested; ADR-016 (JoinGame concurrent-join race) found, fixed, tested; Manager integration test suite written from scratch (was a complete gap through Step 10)
+- [x] Step 8: Move Pipeline — move.go (MoveProcessor, MoveRejectionError, ComputeFENAfterMove) + 5 integration tests (all passing with -race)
+- [x] Step 9: Clock — clock.go (channel-based design, goroutine-per-clock), wired into session.go and move.go, clock_test.go with 9 unit tests passing with -race and goleak
+- [x] Step 10: Manager — manager.go (CreateGame, JoinGame, HandleConnect, HandleDisconnect, HandleMessage, RestoreActiveGames, abandonment timers, resign/timeout/abandon game-over paths)
 
 ---
 
@@ -90,16 +207,15 @@ Update this file at the end of every session. Stale context is worse than no con
 
 ### Game Layer
 - [x] GameSession struct defined
-- [x] GameState machine (WAITING → ACTIVE → COMPLETED / ABANDONED) — **corrected transition semantics per ADR-015**
+- [x] GameState machine (WAITING → ACTIVE → COMPLETED / ABANDONED)
 - [x] GameRegistry (gameID → *GameSession)
 - [x] EventBus interface defined (LocalEventBus for Phase 1)
 - [x] Player-to-connection bridge for reconnection (session pointer slots + ReplaceConnection)
-- [x] `GameSession.IsPlayerConnected(color)` — added for ADR-015, used by onAbandonTimeout
 - [x] messages.go — single source of truth for all WebSocket protocol strings
-- [x] MoveProcessor — full 8-step pipeline (Step 8), clock-switching wired in (Step 9), TOCTOU re-check under session.mu.Lock() before ApplyMove (ADR-014), **returns `(gameEnded bool, err error)`**
+- [x] MoveProcessor — full 8-step pipeline (Step 8), clock-switching wired in (Step 9)
 - [x] MoveRejectionError — typed client-facing rejection error (Step 8)
 - [x] Clock — per-game countdown timers, timeout detection, channel-based goroutine (Step 9)
-- [x] Manager — top-level orchestrator: game creation/join, connection lifecycle, message routing, restart recovery (Step 10), **`finalizeGame` centralized registry cleanup**, **`onAbandonTimeout` corrected for single- vs. both-disconnected**
+- [x] Manager — top-level orchestrator: game creation/join, connection lifecycle, message routing, restart recovery (Step 10)
 
 ### API Layer (HTTP)
 - [ ] chi router setup
@@ -124,7 +240,6 @@ Update this file at the end of every session. Stale context is worse than no con
 - [x] Broadcast MOVE_APPLIED to both players (via EventBus)
 - [x] Check for game over after each move
 - [x] Reject illegal moves with MOVE_REJECTED response (typed error for Manager)
-- [x] Re-check session status under lock immediately before ApplyMove (ADR-014 — closes TOCTOU with concurrent resign/timeout/abandon)
 
 ### Time Controls
 - [x] Server-side clock per game (10 minutes per player)
@@ -140,17 +255,10 @@ Update this file at the end of every session. Stale context is worse than no con
 - [x] Full game state sent to reconnecting player (GAME_STATE message) — sendGameState
 - [x] Opponent notified of reconnection (OPPONENT_RECONNECTED message)
 
-### Abandonment (ADR-015 correction)
-- [x] Single-player disconnect >60s with opponent connected → opponent wins (`COMPLETED`, `outcome_reason: ABANDONED`)
-- [x] Both-players-disconnected >60s → drawn abandonment (`ABANDONED`, `outcome: DRAW`, `outcome_reason: ABANDONED`)
-- [x] `GameSession.IsPlayerConnected` used to distinguish the two cases at timer-fire time
-- [x] `finalizeGame` called on both branches — no dangling abandon timers or un-unregistered sessions
-
 ### Persistence Recovery
 - [x] On server restart, active games are recoverable from DB — RestoreActiveGames
 - [x] GameSession can be hydrated from DB records — NewGameSessionFromDB
 - [x] In-progress games resume correctly after server restart — board via GameFromMoves, zombie ACTIVE games corrected
-- [x] **Covered by integration tests** (manager_test.go): stale-FEN handling, zombie-ACTIVE correction, WAITING-status restore, per-game failure isolation, genuinely-COMPLETED games correctly excluded
 
 ### Testing
 - [x] Store layer: integration tests with real PostgreSQL (integration build tag)
@@ -158,10 +266,9 @@ Update this file at the end of every session. Stale context is worse than no con
 - [x] Chess layer: unit tests (no build tag, no database)
 - [x] Game session and registry: unit tests (no build tag, no database)
 - [x] EventBus: unit tests (no build tag, no database)
-- [x] Move pipeline: integration tests (integration build tag, real PostgreSQL), including gameEnded-signal assertion
-- [x] Clock: unit tests with goleak goroutine-leak verification, pgxpool false-positive resolved via `goleak.IgnoreTopFunction` (no build tag for the tests themselves, but must pass correctly when run alongside `-tags integration`)
-- [x] **Manager: integration tests (CreateGame, JoinGame, RestoreActiveGames) — `manager_test.go`, written this session, all passing**
-- [x] **Manager: concurrency regression test — `manager_race_test.go`, `TestManager_JoinGame_ConcurrentJoins_ExactlyOneWins`, 20 trials, passing under `-race`**
+- [x] Move pipeline: integration tests (integration build tag, real PostgreSQL)
+- [x] Clock: unit tests with goleak goroutine-leak verification (no build tag, no database)
+- [ ] Manager: integration tests (CreateGame, JoinGame, RestoreActiveGames with real PostgreSQL) — not yet written; should be added alongside or before Step 11 WebSocket handler tests
 - [ ] WebSocket handler: httptest-based tests
 - [ ] Reconnection scenario: integration test
 
@@ -186,9 +293,6 @@ Full rationale in DECISIONS_LOG_PHASE_1.md. This is the quick-reference list.
 | ADR-011 | ORM strategy | No ORM. pgx/v5 with raw SQL |
 | ADR-012 | Framework | No framework. chi for routing, stdlib everywhere else |
 | ADR-013 | Chess move validation strategy | Validate-Then-Apply split (ValidateMove + ApplyMove separate methods) |
-| ADR-014 | ProcessMove TOCTOU fix | Re-check session status under `session.mu.Lock()` immediately before ApplyMove |
-| ADR-015 | Abandonment semantics correction | Single-disconnect (opponent connected) → COMPLETED, opponent wins. Both-disconnected → ABANDONED, DRAW. |
-| ADR-016 | JoinGame double-join race | Atomic conditional `UPDATE ... WHERE status = 'WAITING_FOR_PLAYER' AND player_black_id IS NULL`, disambiguated via new `store.ErrGameNotJoinable` sentinel |
 
 ### Implementation Decisions (No ADR Required)
 
@@ -229,11 +333,6 @@ Full rationale in DECISIONS_LOG_PHASE_1.md. This is the quick-reference list.
 | Abandonment timer mechanism | Per-player `time.AfterFunc`, keyed by `gameID+":"+color`, tracked in `Manager.abandonTimers` map under `Manager.mu` | Simpler than a periodic sweep goroutine; Go runtime handles many concurrent timers efficiently |
 | Game ID generation library | `github.com/google/uuid`, `uuid.NewV7()` | Initial implementation hand-rolled UUID v4 via crypto/rand — corrected: violates library-first principle (ADR-006 precedent), and v7 is structurally correct for a DB primary key |
 | Request ID generation (planned, Step 12) | `uuid.New()` (v4) inline at the API layer, no shared helper | Different package, different version requirement from game IDs; a shared helper adds indirection without benefit for a one-line call |
-| `finalizeGame(gameID)` centralization | One method, three call sites (`handleResign`, both `onAbandonTimeout` branches, `HandleMessage`'s MOVE case via `gameEnded`) | Prevents registry-cleanup omission recurring a fourth time (e.g. a future draw-agreement path); `cancelAbandonTimer` and `registry.Unregister` are both safe no-ops on missing keys, so unconditional calls on every terminal path are cheap and correct |
-| `ProcessMove` returns `(gameEnded bool, err error)` | Not error-only | `HandleMessage` needs to know when to call `finalizeGame`; `gameEnded` is true whenever `handleGameOver` ran, even if its internal DB persist failed (in-memory transition + GAME_OVER publish already happened) |
-| `GameSession.IsPlayerConnected(color)` | Read-locked check of one connection slot | Used exclusively by `onAbandonTimeout` (ADR-015) to determine the opponent's connection state at the moment the abandon timer fires |
-| `goleak.IgnoreTopFunction` over a package-level `integrationTestsActive` flag | Targeted exemption of `pgxpool.(*Pool).backgroundHealthCheck` by exact symbol name (verified via `gopls:go_search` against vendored `pgx/v5@v5.7.1`) | A package-level mutable bypass flag would violate `CODING_GUIDELINES.md` §5 and silently disable all Clock goroutine-leak detection whenever `-tags integration` is present — exactly the acceptance-criterion-#7 check this project worked hardest to establish |
-| `store.ErrGameNotJoinable` as a new sentinel, not reuse of `game.ErrGameNotJoinable` | Added to `internal/store/errors.go` | `internal/store` must not import `internal/game` (dependency graph is `game → store` only); `Manager.JoinGame` translates via `errors.Is` at the package boundary |
 
 ---
 
@@ -243,20 +342,17 @@ Full rationale in DECISIONS_LOG_PHASE_1.md. This is the quick-reference list.
 TD-001: Player token passed in URL query parameter (visible in logs) | Phase 1 | Fix by: Phase 3
 TD-002: Clock pauses on disconnect (disconnect-stalling possible) | Phase 1 | Fix by: Phase 4
         Corollary (Step 10): boundary race between ProcessMove-driven completion
-        and Clock timeout firing at the same instant. Resolved for the specific
-        ProcessMove-vs-terminal-transition case by ADR-014's re-check under lock.
-        Broader TD-002 root cause (no move timestamps) remains open.
+        and Clock timeout firing at the same instant. Both paths call
+        session.Transition, which is idempotent-safe (loser no-ops, logged Debug).
+        Not a new debt item — extension of TD-002's root cause (no move timestamps).
 TD-003: No draw offer mechanism | Phase 1 | Fix by: Phase 4
 TD-004: Anonymous identity only (no real user accounts) | Phase 1 | Fix by: Phase 3
 TD-005: Single time control (10+0 only) | Phase 1 | Fix by: Phase 4
 TD-006: DetectOutcome maps ThreefoldRepetition/FiftyMoveRule/InsufficientMaterial to "DRAW_AGREEMENT" | Phase 1 | Fix by: Phase 4
 TD-007: GameFromFEN loses position history — threefold repetition blind after server restart | Phase 1 | Fix by: Phase 4
         Note: RestoreActiveGames (Step 10) uses GameFromMoves, not GameFromFEN, for
-        exactly this reason — the restored board has full position history. Covered
-        by integration tests as of this session (manager_test.go).
+        exactly this reason — the restored board has full position history.
 ```
-
-No new technical debt introduced this session — all changes were correctness fixes to previously "complete" Step 10 work.
 
 ---
 
@@ -273,7 +369,6 @@ These decisions are locked. Do not revisit without a new ADR.
 7. **Every I/O function takes context.Context as first argument.**
 8. **ValidateMove before DB write; ApplyMove after DB write succeeds.** Never mutate board state before persistence confirms. (ADR-013)
 9. **Check for an existing, well-tested library before writing custom logic for solved problems** (e.g. UUID generation, chess move validation). Hand-rolling "trivial" utility code is exactly where subtle bugs hide.
-10. **Any read-then-write sequence spanning two or more statements must be checked for concurrent-caller correctness, not just sequential correctness, before being considered complete.** (ADR-014, ADR-016) A test that only exercises sequential calls does not prove a fix; a dedicated concurrent-goroutines test against real infrastructure is required when the sequence guards a uniqueness or exclusivity invariant.
 
 ---
 
@@ -287,25 +382,13 @@ These decisions are locked. Do not revisit without a new ADR.
 
 - **`DetectOutcome` must be called after `ApplyMove`.** Calling it before any move is played will always return `(nil, false)` even for checkmate/stalemate positions loaded from FEN.
 
-- **`ReadLoop` context decision deferred to Step 11.** The HTTP request context (`r.Context()`) is cancelled when `ServeHTTP` returns, which is before `ReadLoop` exits. At Step 11, decide whether to pass `r.Context()`, a derived context, or `context.Background()` to `HandleMessage`. The comment in `ReadLoop` flags this explicitly. **This decision must be made deliberately before Step 11 implementation begins, not discovered mid-implementation.** Recommendation carried into this session: a server-lifetime context created at `Handler` construction, cancelled on SIGTERM — aligns with Step 13's graceful shutdown requirement.
+- **`ReadLoop` context decision deferred to Step 11.** The HTTP request context (`r.Context()`) is cancelled when `ServeHTTP` returns, which is before `ReadLoop` exits. At Step 11, decide whether to pass `r.Context()`, a derived context, or `context.Background()` to `HandleMessage`. The comment in `ReadLoop` flags this explicitly. **This decision must be made deliberately before Step 11 implementation begins, not discovered mid-implementation.**
 
 - **`LocalEventBus.Publish` holds `mu.RLock()` during the send loop.** This is intentional. Do not "optimise" it to snapshot-then-release — that pattern creates a window where `unsubscribe` can close a channel between the snapshot and the send, causing a send-on-closed-channel panic.
 
 - **`ComputeFENAfterMove` must only be called after `ValidateMove` returned nil for the same `(g, san)` pair.** Both use `AlgebraicNotation{}.Decode` internally. If `ValidateMove` passed, `ComputeFENAfterMove` will not error. If it does error, it is a bug — log at Error level and return a plain (non-rejection) error.
 
-- **`move.go` accesses `session.board` and `session.mu` directly.** This is valid because `move.go` is in `package game` — same package as `session.go`. Private fields are accessible within a package. `mu.RLock()` is held for `ValidateMove` + `ComputeFENAfterMove`; `mu.Lock()` is held for the status re-check (ADR-014) and `ApplyMove` together, as a single critical section.
-
-- **`ProcessMove` re-checks `session.status == ACTIVE` under `session.mu.Lock()` immediately before `ApplyMove` (ADR-014).** This closes the TOCTOU window between the pipeline's initial status snapshot (taken before SaveMove) and the point where the board is actually mutated — a concurrent RESIGN, timeout, or abandonment firing in that window is now correctly observed. If the re-check fails, `ApplyMove` is skipped and `ProcessMove` returns `(false, nil)` — the move row is already saved to the `moves` table by this point, which is accepted as a harmless orphaned row (a COMPLETED/ABANDONED game is never replayed by RestoreActiveGames).
-
-- **`onAbandonTimeout` branches on `session.IsPlayerConnected(opponentOf(color))` (ADR-015).** Opponent connected at timer-fire time → `COMPLETED`, opponent wins, `outcome_reason: ABANDONED`. Opponent also disconnected → `ABANDONED`, `DRAW`, `outcome_reason: ABANDONED`. The `status` field (`COMPLETED` vs `ABANDONED`), not `outcome_reason`, is what distinguishes a decisive abandonment-loss from a drawn mutual abandonment — both share the same `outcome_reason` value.
-
-- **`finalizeGame(gameID)` must be called exactly once per game-ending event, after the session has already transitioned to a terminal state and GAME_OVER has already been published.** It is safe to call more than once (both `cancelAbandonTimer` and `registry.Unregister` are no-ops on missing keys) but that safety should not be relied on as a substitute for calling it from the correct single call site per code path. The three current call sites are `handleResign`, both branches of `onAbandonTimeout`, and `HandleMessage`'s MOVE case (gated on `ProcessMove`'s `gameEnded` return value).
-
-- **`JoinGame`'s actual correctness guarantee lives in `GameStore.UpdatePlayerBlack`'s SQL, not in the Go-level pre-flight check (ADR-016).** The `WHERE id = $2 AND status = 'WAITING_FOR_PLAYER' AND player_black_id IS NULL` clause is what makes concurrent joins safe. The pre-flight `GetGame` + `PlayerBlackID != nil` check in `JoinGame` is retained only for producing specific, friendly errors (`ErrSelfPlay` vs `ErrGameNotJoinable`) in the non-racing case — removing it would not reintroduce the race, but would lose error specificity. Do not add new multi-statement read-then-write sequences to `GameStore` without the same atomic-write-as-source-of-truth discipline.
-
-- **`store.ErrGameNotJoinable` is distinct from `store.ErrGameNotFound`.** `UpdatePlayerBlack` returns `ErrGameNotJoinable` when the row exists but its `WHERE` predicate fails (already joined, or not `WAITING_FOR_PLAYER`) — never `ErrGameNotFound` for that condition, since row existence is already established by the caller's prior `GetGame`. `Manager.JoinGame` translates `store.ErrGameNotJoinable` to `game.ErrGameNotJoinable` via `errors.Is` — no caller outside `internal/store` should depend on the store-package sentinel directly.
-
-- **`goleak.IgnoreTopFunction` in `clock_test.go` exempts exactly one symbol: `github.com/jackc/pgx/v5/pgxpool.(*Pool).backgroundHealthCheck`.** This goroutine is spawned once by `TestMain`'s pool for the lifetime of the test binary when running with `-tags integration`, and is not a leak from code under test. Verified against the actual vendored `pgx/v5@v5.7.1` source via `gopls:go_search`, not assumed from documentation. If the pgx dependency version changes, re-verify this exact symbol string before trusting the exemption still matches — `IgnoreTopFunction` fails silently (matches nothing, exemption becomes a no-op) rather than erroring on a stale string.
+- **`move.go` accesses `session.board` and `session.mu` directly.** This is valid because `move.go` is in `package game` — same package as `session.go`. Private fields are accessible within a package. `mu.RLock()` is held for `ValidateMove` + `ComputeFENAfterMove`; `mu.Lock()` is held for `ApplyMove` only.
 
 - **`Clock` struct requires a `startedAt time.Time` field — omitted from original Step 9 spec.** `Switch()` and `Pause()` deduct elapsed time since the clock last started from the active player's remaining duration, using `time.Since(startedAt)`. `startedAt` is set on every `Start`/`Resume` call. This is implemented correctly in the current `clock.go` — flagging here for any future reimplementation reference.
 
@@ -313,13 +396,11 @@ These decisions are locked. Do not revisit without a new ADR.
 
 - **`Clock.run()` never acquires `c.mu`.** All exported methods compute new state under `c.mu`, then send a `clockReset` message via the buffered(1) `resetCh` channel to the background goroutine, which is the sole owner of the `time.Timer`. This avoids the goroutine ever blocking while holding `c.mu`, and avoids `c.mu` being held during a channel send that could theoretically block.
 
-- **`RestoreActiveGames` must reconstruct boards via `chess.GameFromMoves`, never `chess.GameFromFEN(game.CurrentFEN)`.** `UpdateCurrentFEN`'s non-fatal failure mode (Step 8) means `games.current_fen` can be stale relative to the `moves` table, which is the source of truth. Implemented correctly in `manager.go`'s `restoreGame`; covered by `TestManager_RestoreActiveGames_IgnoresStaleCurrentFEN`.
+- **`RestoreActiveGames` must reconstruct boards via `chess.GameFromMoves`, never `chess.GameFromFEN(game.CurrentFEN)`.** `UpdateCurrentFEN`'s non-fatal failure mode (Step 8) means `games.current_fen` can be stale relative to the `moves` table, which is the source of truth. Implemented correctly in `manager.go`'s `restoreGame`.
 
-- **`RestoreActiveGames` must detect and correct zombie ACTIVE games.** `handleGameOver`'s decision to publish GAME_OVER even when `UpdateGameStatus` fails (Step 8) can leave a game COMPLETED in memory (and already broadcast as such to players) but still recorded as ACTIVE in the DB. `GetActiveGames` will return it on the next restart. `restoreGame` calls `DetectOutcome` on the replayed board; if the game is already over, it corrects the DB status to COMPLETED and does NOT add the session to the registry. Implemented in `manager.go`; covered by `TestManager_RestoreActiveGames_CorrectsZombieActiveGame`.
+- **`RestoreActiveGames` must detect and correct zombie ACTIVE games.** `handleGameOver`'s decision to publish GAME_OVER even when `UpdateGameStatus` fails (Step 8) can leave a game COMPLETED in memory (and already broadcast as such to players) but still recorded as ACTIVE in the DB. `GetActiveGames` will return it on the next restart. `restoreGame` calls `DetectOutcome` on the replayed board; if the game is already over, it corrects the DB status to COMPLETED and does NOT add the session to the registry. Implemented in `manager.go`.
 
-- **`gopls` does not index files under non-default build tags (e.g. `//go:build integration`).** `go_diagnostics`, `go_file_context`, and `go_search` all report empty results or "no package metadata" for these files, regardless of which gopls tool is invoked, even when the file compiles correctly. This is a tooling limitation, not a signal of a problem. Verification of integration-tagged files requires an actual `go build -tags integration ./...` or `go test -tags integration ./...` run — gopls cannot substitute for this.
-
-- **Integration tests for `internal/game` use `//go:build integration`.** Running `go test -race ./internal/game/...` runs only unit tests. Running `go test -race -tags integration ./internal/game/...` runs both unit and integration tests (`testmain_test.go`'s `TestMain` sets up `testPool`; unit tests ignore it). Manager now has full integration test coverage (`manager_test.go`, `manager_race_test.go`) as of this session.
+- **Integration tests for `internal/game` use `//go:build integration`.** Running `go test -race ./internal/game/...` runs only unit tests. Running `go test -race -tags integration ./internal/game/...` runs both unit and integration tests (the `TestMain` in `testmain_integration_test.go` sets up the DB pool; unit tests ignore it). **Note: Manager does not yet have integration tests (CreateGame, JoinGame, RestoreActiveGames) — should be written alongside or before Step 11.**
 
 - **`handleTimeout` must never call any `Clock` method.** It is invoked from within the Clock's own background goroutine (`run()`) via the registered `onTimeout` callback. Calling back into the Clock that is currently executing the callback would deadlock or corrupt state. `handleTimeout` only touches `GameSession` and store/EventBus — never `session.clock`.
 
@@ -355,9 +436,7 @@ All constants are defined in `internal/game/messages.go` — never hardcode thes
 
 **Note on `moves` field in GAME_STATE:** Contains annotated SAN from `chess.MoveHistory()`. Check moves include `+`, checkmates include `#`.
 
-**Note on clock values in GAME_STATE and MOVE_APPLIED:** As of Step 9/10, all clock values sent to clients are live reads from `session.clock.TimeRemaining()`, accounting for in-flight elapsed time.
-
-**Note on `ABANDONED` outcome pairing (ADR-015):** `reason: "ABANDONED"` can pair with EITHER a winner (`"WHITE"`/`"BLACK"`) or `"DRAW"`, depending on whether one or both players were disconnected when the 60-second window elapsed. The `status` field on the game record (`COMPLETED` vs `ABANDONED`) is what actually distinguishes a decisive abandonment-loss from a drawn mutual abandonment — clients must not infer this from `outcome_reason` alone.
+**Note on clock values in GAME_STATE and MOVE_APPLIED:** As of Step 9/10, all clock values sent to clients are live reads from `session.clock.TimeRemaining()`, accounting for in-flight elapsed time. No longer pre-move/stale snapshot values (that limitation, noted in earlier sessions, was resolved by Step 9's clock wiring).
 
 ---
 
@@ -368,37 +447,29 @@ cmd/server/main.go            — Wires all dependencies, starts HTTP server, ha
 internal/ws/connection.go     — Connection struct, read loop (callback-based), write loop, heartbeat
 internal/ws/registry.go       — connID -> *Connection map with RWMutex
 internal/ws/errors.go         — ErrConnectionClosed, ErrQueueFull
-internal/ws/handler.go        — HTTP upgrade, token validation, GameManager handoff [Step 11 — NEXT]
+internal/ws/handler.go        — HTTP upgrade, token validation, GameManager handoff [Step 11]
 internal/game/errors.go       — ErrGameNotFound, ErrConnectionOccupied, ErrInvalidTransition,
                                 MoveRejectionError, ErrGameNotJoinable, ErrSelfPlay
 internal/game/messages.go     — All WebSocket message type strings, rejection reasons, error codes
 internal/game/session.go      — GameSession struct, state machine, connection management, snapshots,
-                                clock field, NewGameSessionFromDB (restore-from-DB constructor),
-                                IsPlayerConnected (ADR-015)
+                                clock field, NewGameSessionFromDB (restore-from-DB constructor)
 internal/game/registry.go     — gameID -> *GameSession map with RWMutex
 internal/game/eventbus.go     — EventBus interface + LocalEventBus implementation
 internal/game/manager.go      — Top-level orchestrator: CreateGame, JoinGame, HandleConnect,
                                 HandleDisconnect, HandleMessage, RestoreActiveGames,
-                                handleResign/handleTimeout/onAbandonTimeout (ADR-015 corrected),
-                                finalizeGame (registry cleanup, centralized), abandonment timers
-internal/game/manager_test.go       — Integration tests: CreateGame, JoinGame, RestoreActiveGames [NEW]
-internal/game/manager_race_test.go  — Concurrency regression: JoinGame race, ADR-016 [NEW]
+                                handleResign/handleTimeout/onAbandonTimeout, abandonment timers
 internal/game/move.go         — MoveProcessor: 8-step pipeline + clock switching (Step 9 wiring),
-                                MoveRejectionError, handleGameOver (stops clock), TOCTOU re-check
-                                under lock before ApplyMove (ADR-014), returns (gameEnded bool, err error)
-internal/game/move_test.go    — Integration tests, updated for ProcessMove's new signature
+                                MoveRejectionError, handleGameOver (stops clock)
 internal/game/clock.go        — Clock: channel-based per-game countdown timers, timeout detection
-internal/game/clock_test.go   — Unit tests with goleak, IgnoreTopFunction exemption for pgxpool health-check goroutine
 internal/chess/errors.go      — ErrIllegalMove, ErrInvalidFEN sentinels
 internal/chess/types.go       — GameOutcome{Winner, Reason} — chess-layer result type
 internal/chess/validator.go   — Validator, NewGame, GameFromFEN, GameFromMoves,
                                 ValidateMove, ApplyMove, ComputeFENAfterMove,
                                 DetectOutcome, CurrentFEN, MoveHistory
-internal/store/errors.go      — ErrGameNotFound, ErrUserNotFound, ErrGameNotJoinable (ADR-016) sentinels
+internal/store/errors.go      — ErrGameNotFound, ErrUserNotFound sentinels
 internal/store/models.go      — Domain types: User, Game, Move, GameStatus, Color, Outcome, OutcomeReason, GameOutcome
 internal/store/postgres.go    — NewPool (pgxpool initialization with ping)
-internal/store/game_store.go  — CreateGame, GetGame, UpdateGameStatus, UpdateCurrentFEN,
-                                UpdatePlayerBlack (atomic conditional UPDATE, ADR-016), GetActiveGames, UpdateClocks
+internal/store/game_store.go  — CreateGame, GetGame, UpdateGameStatus, UpdateCurrentFEN, UpdatePlayerBlack, GetActiveGames, UpdateClocks
 internal/store/move_store.go  — SaveMove (RETURNING id/played_at), GetMovesForGame (ASC order)
 internal/store/user_store.go  — CreateOrGetUser (upsert), GetUser
 internal/auth/token.go        — PlayerClaims, SignPlayerToken, VerifyPlayerToken (HS256, algorithm confusion prevention)
@@ -411,7 +482,7 @@ migrations/                   — SQL migration files (golang-migrate format)
 
 ## Chess Layer Key Patterns
 
-**Validate-then-apply split (ADR-013) with FEN computation between, plus ADR-014's re-check:**
+**Validate-then-apply split (ADR-013) with FEN computation between:**
 ```go
 // Step 1: validate — no mutation, before DB write
 if err := validator.ValidateMove(session.board, san); err != nil {
@@ -426,20 +497,13 @@ if err := moveStore.SaveMove(ctx, move); err != nil {
     return fmt.Errorf(...) // plain error, not MoveRejectionError
 }
 
-// Step 4 (ADR-014): re-check status under lock, then apply — mutate only after
-// DB confirms AND the game is still confirmed ACTIVE at this exact instant
+// Step 4: apply — mutate only after DB confirms
 session.mu.Lock()
-if session.status != store.GameStatusActive {
-    session.mu.Unlock()
-    return false, nil // game ended between initial check and this point — skip apply
-}
-applyErr := validator.ApplyMove(session.board, san)
+validator.ApplyMove(session.board, san)
 session.mu.Unlock()
 
 // Step 5 (Step 9 addition): switch clock after board mutation
 session.clock.Switch()
-
-// Step 6: return gameEnded so HandleMessage knows whether to call finalizeGame
 ```
 
 **MoveRejectionError — always use errors.As at the call site:**
@@ -493,9 +557,8 @@ Methods on *Validator (used in move pipeline):
 ```go
 // Valid edges only:
 WAITING_FOR_PLAYER → ACTIVE
-ACTIVE             → COMPLETED   // checkmate, stalemate, timeout, resignation,
-                                  // OR single-player abandonment (opponent wins) — ADR-015
-ACTIVE             → ABANDONED   // both-players-disconnected only — ADR-015
+ACTIVE             → COMPLETED
+ACTIVE             → ABANDONED
 // COMPLETED and ABANDONED are terminal.
 ```
 
@@ -509,9 +572,6 @@ session.ReplaceConnection(color, conn)   // unconditional overwrite
 
 // Disconnect:
 session.ClearConnection(color)           // sets slot to nil
-
-// Abandonment check (ADR-015):
-session.IsPlayerConnected(color)         // read-locked slot check, used by onAbandonTimeout
 ```
 
 **Sending messages — always through session, never via raw *ws.Connection:**
@@ -530,12 +590,8 @@ if validateErr == nil {
 }
 session.mu.RUnlock()
 
-// Status re-check (ADR-014) + ApplyMove: single write-lock critical section
+// ApplyMove: write lock
 session.mu.Lock()
-if session.status != store.GameStatusActive {
-    session.mu.Unlock()
-    return false, nil
-}
 applyErr = validator.ApplyMove(session.board, san)
 session.mu.Unlock()
 
@@ -607,20 +663,12 @@ remaining := clock.TimeRemaining(store.ColorWhite)  // accurate even mid-countdo
 
 **Stopping — always before a terminal state transition:**
 ```go
-session.clock.Stop()  // in handleGameOver, handleResign, handleTimeout, onAbandonTimeout (both branches)
-session.Transition(store.GameStatusCompleted)  // or ABANDONED per ADR-015 branching
+session.clock.Stop()  // in handleGameOver, handleResign, handleTimeout, onAbandonTimeout
+session.Transition(store.GameStatusCompleted)
 ```
 
 **Internal goroutine discipline — `run()` never touches `c.mu`:**
 All exported methods (`Start`, `Switch`, `Pause`, `Resume`) compute the new timer duration under `c.mu`, then send a `clockReset{duration, color}` via the buffered(1) `resetCh`. The background `run()` goroutine is the sole owner of the active `*time.Timer` and reacts only to `resetCh`/`stopCh`/`timerC`.
-
-**Test leak verification — goleak with a targeted exemption (this session):**
-```go
-goleak.VerifyNone(t,
-    goleak.IgnoreTopFunction("github.com/jackc/pgx/v5/pgxpool.(*Pool).backgroundHealthCheck"),
-)
-```
-Applies whenever `clock_test.go` runs in a binary that also links `testmain_test.go`'s `TestMain` (i.e., under `-tags integration`). Do not replace this with a package-level bypass flag — see Non-Negotiable Constraints and CODING_GUIDELINES.md §5.
 
 ---
 
@@ -647,61 +695,6 @@ gameID := gameUUID.String()
    instead of Resume — this is why IsStarted() exists on Clock.
 ```
 
-**onAbandonTimeout — corrected branching (ADR-015):**
-```go
-func (m *Manager) onAbandonTimeout(gameID string, color store.Color) {
-    // ... cancel own timer entry, fetch session, snapshot status check ...
-    session.clock.Stop()
-    opponent := opponentOf(color)
-    if session.IsPlayerConnected(opponent) {
-        // Opponent present and waiting — disconnected player loses.
-        session.Transition(store.GameStatusCompleted)
-        session.SetOutcome(store.Outcome(opponent), store.OutcomeReasonAbandoned)
-        // persist, publish GAME_OVER, finalizeGame(gameID)
-        return
-    }
-    // Both disconnected — true mutual abandonment, drawn.
-    session.Transition(store.GameStatusAbandoned)
-    session.SetOutcome(store.OutcomeDraw, store.OutcomeReasonAbandoned)
-    // persist, publish GAME_OVER, finalizeGame(gameID)
-}
-```
-
-**finalizeGame — centralized registry cleanup, three call sites:**
-```go
-func (m *Manager) finalizeGame(gameID string) {
-    m.cancelAbandonTimer(gameID, store.ColorWhite)
-    m.cancelAbandonTimer(gameID, store.ColorBlack)
-    m.registry.Unregister(gameID)
-}
-
-// Call sites:
-// 1. handleResign — after publishGameOver
-// 2. onAbandonTimeout — after publishGameOver, both branches
-// 3. HandleMessage's MsgTypeMove case — after ProcessMove, gated on gameEnded:
-gameEnded, moveErr := m.processor.ProcessMove(ctx, session, color, msg.SAN)
-// ... handle moveErr (rejection vs infrastructure error) ...
-if gameEnded {
-    m.finalizeGame(gameID)
-}
-```
-
-**JoinGame — atomic conditional write is the correctness guarantee (ADR-016):**
-```go
-game, err := m.gameStore.GetGame(ctx, gameID)          // existence + friendly-error checks
-if game.PlayerWhiteID == userID { return "", ErrSelfPlay }
-if game.PlayerBlackID != nil { return "", ErrGameNotJoinable }  // fast-path, not authoritative
-
-if err := m.gameStore.UpdatePlayerBlack(ctx, gameID, userID); err != nil {
-    if errors.Is(err, store.ErrGameNotJoinable) {
-        // Lost a concurrent join race — the atomic UPDATE's WHERE clause
-        // is what actually decided this, not the check above.
-        return "", fmt.Errorf(..., ErrGameNotJoinable)
-    }
-    return "", fmt.Errorf(..., err)
-}
-```
-
 **RestoreActiveGames — defensive reconstruction, never trusts current_fen:**
 ```go
 moves, _ := moveStore.GetMovesForGame(ctx, gameID)
@@ -717,14 +710,13 @@ session := NewGameSessionFromDB(game, board)
 registry.Register(session)
 ```
 
-**Game-over paths all follow the same shape — stop clock, transition, persist (non-fatal), publish, finalize:**
+**Game-over paths all follow the same shape — stop clock, transition, persist (non-fatal), publish:**
 ```go
 session.clock.Stop()
-session.Transition(store.GameStatusCompleted)  // or ABANDONED per ADR-015
+session.Transition(store.GameStatusCompleted)  // or ABANDONED
 session.SetOutcome(outcome, reason)
 gameStore.UpdateGameStatus(ctx, gameID, status, &store.GameOutcome{...})  // log on failure, continue
 publishGameOver(ctx, session, outcome, reason, fen)  // via EventBus; falls back to direct send on publish failure
-m.finalizeGame(gameID)  // registry cleanup — every terminal path ends here
 ```
 
 **EventBus subscriber — self-terminating on GAME_OVER:**
@@ -773,8 +765,6 @@ The read lock must be held for the entire send loop. See Known Sharp Edges.
 
 **Empty slice convention** — always return `make([]*T, 0)`, never `var x []*T`.
 
-**Atomic conditional writes for uniqueness/exclusivity invariants (ADR-016).** Any store method that enforces "only one caller may succeed" (e.g. `UpdatePlayerBlack`) must encode the full precondition in the SQL `WHERE` clause and treat `RowsAffected() == 0` as the authoritative failure signal — never rely on a caller's prior `SELECT` to establish correctness under concurrency. Disambiguate "row not found" from "row exists, precondition failed" with distinct sentinels; do not conflate them.
-
 ---
 
 ## Auth Layer Key Patterns
@@ -813,18 +803,17 @@ Recommendation to evaluate at session start: Option 2, since Step 13 (Main and W
 - Invalid token → connection refused before upgrade, correct HTTP status / close code
 - Valid token → connection accepted, `GAME_STATE` message received
 - Second connection with the same token (reconnection) → current `GAME_STATE` delivered, original connection's session state reflected correctly
-- **New, given this session's findings:** consider whether Step 11's tests should also probe the abandonment-timer interaction (a real WebSocket disconnect triggering `onAbandonTimeout`'s corrected branching) now that real connections exist to disconnect — this was untestable without real `*ws.Connection` objects until Step 11 provides them.
 
-**Manager integration tests are now complete** (`manager_test.go`, `manager_race_test.go`) — no longer a blocking gap for Step 11's fixture setup.
+**Also recommended for this same session or immediately after:** write Manager integration tests (`CreateGame`, `JoinGame`, `RestoreActiveGames`) against real PostgreSQL — these exist as a checklist gap from Step 10 and should not be deferred indefinitely, since Step 11's tests will depend on `Manager.CreateGame`/`JoinGame` working correctly to set up test fixtures.
 
-Estimated 2-3 hours: the context-lifetime decision requires deliberate review (not just an implementation detail), and this session closed out the previously-blocking Manager test gap, so Step 11 can now proceed without that dependency.
+Estimated 2-3 hours: the context-lifetime decision requires deliberate review (not just an implementation detail), and untested integration surface area (Manager) compounds with new Handler code if not addressed first.
 
 ---
 
 ## Session Log
 
 | Session | Date | What Was Done |
-|---------|------|----------------|
+|---------|------|---------------|
 | 1 | 2025-01-XX | Project scoped, tech stack decided, all documentation created |
 | 2 | 2025-01-XX | Documentation corrections only |
 | 3 | 2025-01-XX | Step 1 scaffold complete |
@@ -833,4 +822,4 @@ Estimated 2-3 hours: the context-lifetime decision requires deliberate review (n
 | 6 | 2026-06-27 | ws port (ReadLoop callback, TextMessage, slog), Steps 6–7 complete: GameSession, GameRegistry, EventBus, messages.go |
 | 7 | 2026-06-28 | Step 8 complete: MoveProcessor, MoveRejectionError, ComputeFENAfterMove, 5 integration tests passing with -race |
 | 8 | 2026-06-30 | Step 9 complete: Clock (channel-based, goleak-verified), wired into session/move pipeline. Step 10 complete: Manager (CreateGame, JoinGame, HandleConnect/Disconnect/Message, RestoreActiveGames with stale-FEN and zombie-ACTIVE handling, abandonment timers, resign/timeout/abandon paths). Switched game ID generation from hand-rolled UUID v4 to google/uuid v7 mid-session after review. All unit tests passing with -race. |
-| 9 | 2026-07-01 | Pre-Step-11 hardening session. Verified ADR-014 (pre-existing). Designed, implemented, and tested ADR-015 (abandonment semantics correction: single- vs. both-disconnected produce different terminal states; `IsPlayerConnected` added; `onAbandonTimeout` rewritten). Centralized registry cleanup into `finalizeGame`, required changing `ProcessMove`'s signature to `(gameEnded bool, err error)`. Fixed a `goleak`/`pgxpool` false positive via `IgnoreTopFunction`, rejecting a package-level-flag approach that would have violated CODING_GUIDELINES.md §5. Wrote `manager_test.go` from scratch (previously a complete gap). Your own test run caught a real double-join bug in `JoinGame`; you fixed the sequential case, I identified and fixed the underlying concurrent-caller race (ADR-016: atomic conditional UPDATE in `UpdatePlayerBlack`, new `store.ErrGameNotJoinable` sentinel) and a follow-on not-found-vs-error conflation bug in that fix. Wrote `manager_race_test.go`, confirmed passing under `-race` with 20 trials. Corrected `PHASE_1.md` and `ARCHITECTURE.md` state-machine sections to match ADR-015. Logged ADR-015 and ADR-016 in full. |
+```

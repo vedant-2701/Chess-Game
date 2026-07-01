@@ -1,3 +1,92 @@
+## Session Summary — Fixed abandonment logic, two concurrency races
+
+### What Was Built
+
+- **Abandonment semantics correction:** `GameSession.IsPlayerConnected(color store.Color) bool` added to `session.go` (read-locked check of the relevant connection slot). `Manager.onAbandonTimeout` rewritten to branch on the opponent's connection state at the moment the 60-second timer fires: opponent still connected → `ACTIVE → COMPLETED`, opponent wins, `outcome_reason: ABANDONED`; opponent also disconnected → `ACTIVE → ABANDONED`, `DRAW`, `outcome_reason: ABANDONED`.
+- **Registry cleanup centralization:** `Manager.finalizeGame(gameID)` added — cancels both colors' abandon timers and calls `registry.Unregister(gameID)`. Called from exactly three sites: `handleResign`, both branches of the corrected `onAbandonTimeout`, and `HandleMessage`'s `MsgTypeMove` case (gated on a new `gameEnded` signal).
+- **`MoveProcessor.ProcessMove` signature changed** from `(err error)` to `(gameEnded bool, err error)` so `HandleMessage` knows when to call `finalizeGame`. Updated the single call site in `manager.go` and all seven call sites in `move_test.go`, including a new assertion on `gameEnded` in the checkmate test.
+- **Verified ADR-014** (TOCTOU re-check under `session.mu.Lock()` in `ProcessMove`) was already correctly implemented outside this conversation — reviewed against the code directly, not re-implemented.
+- **Fixed a `goleak` false positive** against `pgxpool`'s `backgroundHealthCheck` goroutine in `clock_test.go`, using `goleak.IgnoreTopFunction`, verified against the actual vendored symbol via `gopls:go_search` (`github.com/jackc/pgx/v5@v5.7.1/pgxpool.(*Pool).backgroundHealthCheck`) rather than trusting web search alone. Replaced a rejected package-level-mutable-flag approach (`integrationTestsActive`) that violated `CODING_GUIDELINES.md` §5 and would have silently disabled all Clock leak detection under `-tags integration`.
+- **`internal/game/manager_test.go` written and passing:** integration tests for `CreateGame` (persistence, distinct UUIDv7 IDs, token claims), `JoinGame` (persistence, self-play rejection, already-joined rejection, nonexistent-game rejection), and `RestoreActiveGames` (in-progress hydration, stale-`current_fen` rejection in favor of `GameFromMoves`, zombie-ACTIVE detection/correction, WAITING-status restore, genuinely-COMPLETED-games-skipped, per-game failure isolation).
+- **Real bug found by your own test run:** `JoinGame`'s only precondition was `status != WAITING_FOR_PLAYER`, insufficient because status stays `WAITING_FOR_PLAYER` until both WebSockets connect — a second user could silently overwrite `player_black_id`. You added `PlayerBlackID != nil` as a guard.
+- **Follow-on concurrency bug identified and fixed:** the above guard closed the sequential case only. `UpdatePlayerBlack`'s SQL had no `WHERE` predicate tying the write to the precondition, so two concurrent `JoinGame` calls could both pass the pre-flight check before either committed. Fixed with an atomic conditional `UPDATE ... WHERE id = $2 AND status = 'WAITING_FOR_PLAYER' AND player_black_id IS NULL`.
+- **Follow-on correctness bug in that fix:** `RowsAffected() == 0` originally returned `store.ErrGameNotFound`, conflating "row missing" with "row exists, precondition failed" — a direct violation of `CODING_GUIDELINES.md` §1. Added `store.ErrGameNotJoinable` to `internal/store/errors.go`, updated `UpdatePlayerBlack` to return it, added `errors.Is` translation in `Manager.JoinGame` to `game.ErrGameNotJoinable` so no caller depends on a store-package sentinel (preserves `game → store` dependency direction).
+- **`manager_race_test.go` written and passing under `-race`:** `TestManager_JoinGame_ConcurrentJoins_ExactlyOneWins` — 20 trials, two real goroutines racing `JoinGame` against a fresh game each trial, asserting exactly one success/one `ErrGameNotJoinable`, cross-checked against both the DB row and the in-memory session. Confirmed passing by you, along with the full `internal/game` suite.
+- **Documentation corrected:** `PHASE_1.md` and `ARCHITECTURE.md` state-machine sections and `GAME_OVER` protocol notes updated to reflect corrected abandonment semantics. `DECISIONS_LOG_PHASE_1.md` gained **ADR-015** (abandonment correction) and **ADR-016** (JoinGame race fix), both with full options-considered sections.
+
+### Decisions Made
+
+- **ADR-015 (logged):** Single-player disconnect >60s with opponent connected → opponent wins (`COMPLETED`); both disconnected → drawn `ABANDONED`. Rejected keeping the literal original spec (Option A: leaves a game stuck `ACTIVE` forever if one player never returns) and rejected asymmetric timer durations (Option C: unscoped complexity).
+- **ADR-016 (logged):** Atomic conditional `UPDATE` as the sole correctness guarantee for `JoinGame`, not a `SELECT ... FOR UPDATE` transaction (Option A — would require ad hoc transaction management leaking into `internal/game`, violating the store-layer SQL boundary) or an advisory lock (Option C — unscoped general-purpose primitive for a single-write problem).
+- **No shared "was this checked for concurrent callers" helper introduced** — ADR-016 explicitly notes this is now a standing question for any new read-then-write sequence in `game`/`store`, not a new abstraction or lint rule.
+
+### Tradeoffs Considered
+
+- Kept the pre-flight `GetGame` + `PlayerBlackID != nil` check in `JoinGame` even after the atomic `UPDATE` made it non-load-bearing for correctness — retained purely for `ErrSelfPlay`/`ErrGameNotJoinable` error specificity in the non-racing common case.
+- `finalizeGame` cancels both colors' abandon timers unconditionally on every terminal path (including checkmate/resign, where no timer may exist) rather than conditionally — accepted as a safe, always-idempotent no-op rather than adding branching to avoid a cheap redundant call.
+
+### Lessons Learned
+
+- A sequential-only test (`TestManager_JoinGame_RejectsWhenAlreadyJoined`) can pass while a real concurrency bug remains underneath it; proving the fix required a dedicated concurrent-goroutines test against real PostgreSQL, since the race is DB-level and invisible to `go test -race`.
+- `gopls` cannot index files under non-default build tags (`//go:build integration`) — `go_diagnostics`, `go_file_context`, and `go_search` all report empty/no-metadata for these files regardless of which gopls tool is used. Verification of integration-tagged files requires the actual `go test -tags integration` run on your machine; this was underestimated earlier in the session and cost a round trip.
+- Symbol verification for third-party library internals (e.g., `pgxpool.(*Pool).backgroundHealthCheck`) should go through `gopls:go_search` against your actual vendored source first, not web search — you correctly flagged this after I did it the slower way.
+- Editing files containing box-drawing characters (state machine diagrams) via `Filesystem:edit_file`'s exact-string matching is fragile; retyped Unicode box-drawing characters can silently mismatch whitespace. Safer pattern: `view_range` to extract the literal block, then use that exact text as `oldText`, or avoid touching the diagram and append a correction note instead (done for `ARCHITECTURE.md`).
+
+### Problems Encountered
+
+- My own signature change to `ProcessMove` broke `move_test.go` (an existing, already-passing integration test file) — all seven call sites needed updating in the same session before anything would compile. Caught before handing back to you, but should have been done atomically with the signature change, not as an afterthought.
+- Initial `manager_test.go` draft assumed test helpers (`mustCreateUser`, `truncateAll`, `testPool`) without having freshly confirmed their existence in `testmain_test.go` in this exact session — turned out correct, but the confirmation came from re-reading the file, not from `gopls`, which reported false negatives on build-tagged files.
+- `Filesystem:read_text_file` with a `tail` parameter on `DECISIONS_LOG_PHASE_1.md` initially targeted the wrong path (repo root instead of the actual `claude/claude_web_project/` subfolder) — corrected via `list_directory`.
+- No unresolved problems carry into the next session. `move_test.go` is confirmed compiling and passing (per your full-suite run). ADR-016 is now written and no longer a dangling reference.
+
+### Checklist Progress
+
+- ✅ ADR-014 verified (pre-existing, not new this session)
+- ✅ ADR-015 written and applied: abandonment semantics correction (`GameSession.IsPlayerConnected`, `onAbandonTimeout` rewrite)
+- ✅ `Manager.finalizeGame` — registry cleanup centralized across three call sites
+- ✅ `ProcessMove` signature change to `(gameEnded bool, err error)`, all call sites updated
+- ✅ `goleak`/`pgxpool` false-positive fixed via `IgnoreTopFunction`, package-level-flag approach rejected and removed
+- ✅ `internal/game/manager_test.go` — `CreateGame`, `JoinGame`, `RestoreActiveGames` integration tests, all passing
+- ✅ ADR-016 written and applied: `JoinGame` atomic conditional UPDATE, `store.ErrGameNotJoinable` sentinel
+- ✅ `internal/game/manager_race_test.go` — concurrent-join regression test, passing under `-race`
+- ✅ `PHASE_1.md`, `ARCHITECTURE.md` state-machine sections corrected to match ADR-015
+- 🔄 CLAUDE.md full rewrite — this document (Part 2 below)
+- ❌ Step 11 (`internal/ws/handler.go`) — not started; ReadLoop context-lifetime decision still undecided
+
+### Technical Debt Introduced
+
+None new this session. All changes were correctness fixes to already-"complete" Step 10 work, not new shortcuts. TD-001 through TD-007 (see CLAUDE.md) remain unchanged and accurate.
+
+### Files Modified
+
+**Created:**
+- `internal/game/manager_test.go`
+- `internal/game/manager_race_test.go`
+
+**Modified:**
+- `internal/game/session.go` — added `IsPlayerConnected`
+- `internal/game/manager.go` — `onAbandonTimeout` rewritten, `finalizeGame` added and wired into three call sites, `HandleMessage`'s MOVE branch updated for new `ProcessMove` signature, `JoinGame` gained `store.ErrGameNotJoinable` translation
+- `internal/game/move.go` — `ProcessMove` signature changed to `(gameEnded bool, err error)`
+- `internal/game/move_test.go` — seven call sites updated for new signature, one new `gameEnded` assertion added
+- `internal/game/clock_test.go` — `goleak.IgnoreTopFunction` fix applied (per your report; exact diff not re-verified by me in this session beyond confirming the target symbol)
+- `internal/store/game_store.go` — `UpdatePlayerBlack` SQL made an atomic conditional UPDATE, error handling corrected to return `ErrGameNotJoinable` instead of `ErrGameNotFound`
+- `internal/store/errors.go` — added `ErrGameNotJoinable`
+- `claude/claude_web_project/PHASE_1.md` — Game State Machine section and `GAME_OVER` reason note corrected
+- `claude/claude_web_project/ARCHITECTURE.md` — Game State Machine and WebSocket Connection Lifecycle sections corrected
+- `claude/claude_web_project/DECISIONS_LOG_PHASE_1.md` — ADR-015 and ADR-016 appended
+
+**Deleted (per your report, not independently verified by me):**
+- `internal/game/integration_flag.go`, `internal/game/integration_flag_off.go` — removed in favor of `goleak.IgnoreTopFunction`
+
+### Recommended Next Step
+
+**Step 11: `internal/ws/handler.go`.** Before writing code, explicitly decide the `ReadLoop` context-lifetime question flagged repeatedly in Known Sharp Edges: `r.Context()` is cancelled when `ServeHTTP` returns, but `ReadLoop` and the `HandleMessage`/`HandleDisconnect` callbacks it drives continue running after that. Recommended: a server-lifetime context created at `Handler` construction, cancelled on SIGTERM — this is also the natural backbone Step 13's graceful shutdown will need ("wait for in-progress moves to complete"). Then implement `Handler` struct, `ServeHTTP` (token extraction, verification, `claims.GameID` vs URL match, upgrade, registration, `HandleConnect`, `ReadLoop` wiring), plus httptest-based integration tests per `CODING_GUIDELINES.md` §6: invalid token refused pre-upgrade, valid token receives `GAME_STATE`, reconnection with the same token receives current `GAME_STATE`. Estimated 2-3 hours.
+
+---
+
+## PART 2 — UPDATED CLAUDE.md
+
+```markdown
 # CLAUDE.md — Session Context Document
 
 This file is the authoritative context document for AI-assisted development sessions on this project.
@@ -834,3 +923,4 @@ Estimated 2-3 hours: the context-lifetime decision requires deliberate review (n
 | 7 | 2026-06-28 | Step 8 complete: MoveProcessor, MoveRejectionError, ComputeFENAfterMove, 5 integration tests passing with -race |
 | 8 | 2026-06-30 | Step 9 complete: Clock (channel-based, goleak-verified), wired into session/move pipeline. Step 10 complete: Manager (CreateGame, JoinGame, HandleConnect/Disconnect/Message, RestoreActiveGames with stale-FEN and zombie-ACTIVE handling, abandonment timers, resign/timeout/abandon paths). Switched game ID generation from hand-rolled UUID v4 to google/uuid v7 mid-session after review. All unit tests passing with -race. |
 | 9 | 2026-07-01 | Pre-Step-11 hardening session. Verified ADR-014 (pre-existing). Designed, implemented, and tested ADR-015 (abandonment semantics correction: single- vs. both-disconnected produce different terminal states; `IsPlayerConnected` added; `onAbandonTimeout` rewritten). Centralized registry cleanup into `finalizeGame`, required changing `ProcessMove`'s signature to `(gameEnded bool, err error)`. Fixed a `goleak`/`pgxpool` false positive via `IgnoreTopFunction`, rejecting a package-level-flag approach that would have violated CODING_GUIDELINES.md §5. Wrote `manager_test.go` from scratch (previously a complete gap). Your own test run caught a real double-join bug in `JoinGame`; you fixed the sequential case, I identified and fixed the underlying concurrent-caller race (ADR-016: atomic conditional UPDATE in `UpdatePlayerBlack`, new `store.ErrGameNotJoinable` sentinel) and a follow-on not-found-vs-error conflation bug in that fix. Wrote `manager_race_test.go`, confirmed passing under `-race` with 20 trials. Corrected `PHASE_1.md` and `ARCHITECTURE.md` state-machine sections to match ADR-015. Logged ADR-015 and ADR-016 in full. |
+```
