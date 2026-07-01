@@ -45,7 +45,7 @@ func TestMoveProcessor_ValidMove_FullPipeline(t *testing.T) {
 	}
 	defer unsubscribe()
 
-	if err := processor.ProcessMove(ctx, session, store.ColorWhite, "e4"); err != nil {
+	if _, err := processor.ProcessMove(ctx, session, store.ColorWhite, "e4"); err != nil {
 		t.Fatalf("ProcessMove: %v", err)
 	}
 
@@ -129,7 +129,7 @@ func TestMoveProcessor_WrongTurn_RejectsWithMoveRejectionError(t *testing.T) {
 	processor := newMoveProcessor(bus)
 
 	// It is White's turn; Black attempts to move.
-	err := processor.ProcessMove(ctx, session, store.ColorBlack, "e5")
+	_, err := processor.ProcessMove(ctx, session, store.ColorBlack, "e5")
 	if err == nil {
 		t.Fatal("expected error for wrong turn, got nil")
 	}
@@ -173,7 +173,7 @@ func TestMoveProcessor_IllegalMove_RejectsAndLeavesBoard(t *testing.T) {
 
 	// e5 is Black's pawn move — illegal when it is White's turn (and also
 	// structurally illegal from White's perspective in starting position).
-	err := processor.ProcessMove(ctx, session, store.ColorWhite, "e5")
+	_, err := processor.ProcessMove(ctx, session, store.ColorWhite, "e5")
 	if err == nil {
 		t.Fatal("expected error for illegal move, got nil")
 	}
@@ -215,7 +215,7 @@ func TestMoveProcessor_DBFailure_LeavesBoard(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := processor.ProcessMove(ctx, session, store.ColorWhite, "e4")
+	_, err := processor.ProcessMove(ctx, session, store.ColorWhite, "e4")
 	if err == nil {
 		t.Fatal("expected error for DB failure, got nil")
 	}
@@ -268,7 +268,7 @@ func TestMoveProcessor_CheckmateDetected_PublishesGameOver(t *testing.T) {
 
 	// Drain MOVE_APPLIED events for all but the last move.
 	for i, m := range scholarsMate[:len(scholarsMate)-1] {
-		if err := processor.ProcessMove(ctx, session, m.color, m.san); err != nil {
+		if _, err := processor.ProcessMove(ctx, session, m.color, m.san); err != nil {
 			t.Fatalf("ProcessMove move %d %q: %v", i+1, m.san, err)
 		}
 		select {
@@ -283,8 +283,12 @@ func TestMoveProcessor_CheckmateDetected_PublishesGameOver(t *testing.T) {
 
 	// Final move should produce GAME_OVER.
 	last := scholarsMate[len(scholarsMate)-1]
-	if err := processor.ProcessMove(ctx, session, last.color, last.san); err != nil {
+	gameEnded, err := processor.ProcessMove(ctx, session, last.color, last.san)
+	if err != nil {
 		t.Fatalf("ProcessMove checkmate move %q: %v", last.san, err)
+	}
+	if !gameEnded {
+		t.Error("gameEnded: got false, want true after checkmate move")
 	}
 
 	select {
@@ -359,7 +363,7 @@ func TestMoveProcessor_GameNotActive_RejectsMove(t *testing.T) {
 	session := NewGameSession(moveTestGameID, moveTestWhiteID)
 	processor := newMoveProcessor(bus)
 
-	err := processor.ProcessMove(ctx, session, store.ColorWhite, "e4")
+	_, err := processor.ProcessMove(ctx, session, store.ColorWhite, "e4")
 	if err == nil {
 		t.Fatal("expected error for non-active game, got nil")
 	}

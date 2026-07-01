@@ -73,14 +73,20 @@ type gameOverMsg struct {
 // illegal move, game not active). Returns a plain error for infrastructure
 // failures (DB errors, unexpected internal states). The Manager uses errors.As
 // to distinguish and send the appropriate WebSocket message.
-func (p *MoveProcessor) ProcessMove(ctx context.Context, session *GameSession, color store.Color, san string) error {
+//
+// The first return value, gameEnded, is true if and only if this call caused
+// the game to transition to COMPLETED (checkmate/stalemate detected). The
+// Manager uses this to call finalizeGame (registry cleanup, abandon-timer
+// cancellation) exactly once, from exactly one place, regardless of which
+// terminal path ended the game. gameEnded is always false when err != nil.
+func (p *MoveProcessor) ProcessMove(ctx context.Context, session *GameSession, color store.Color, san string) (gameEnded bool, err error) {
 	// Step 1: status and turn check from a consistent snapshot.
 	snap := session.CurrentStateSnapshot()
 	if snap.Status != store.GameStatusActive {
-		return &MoveRejectionError{Reason: RejectReasonGameNotActive}
+		return false, &MoveRejectionError{Reason: RejectReasonGameNotActive}
 	}
 	if snap.Turn != color {
-		return &MoveRejectionError{Reason: RejectReasonNotYourTurn}
+		return false, &MoveRejectionError{Reason: RejectReasonNotYourTurn}
 	}
 
 	// Steps 2–3: validate legality and compute fenAfter under the read lock.
@@ -102,14 +108,14 @@ func (p *MoveProcessor) ProcessMove(ctx context.Context, session *GameSession, c
 			session.mu.RUnlock()
 			slog.Error("ComputeFENAfterMove failed after ValidateMove succeeded — this is a bug",
 				"gameID", session.ID, "san", san, "error", computeErr)
-			return fmt.Errorf("ProcessMove gameID=%s san=%s: compute fen after: %w",
+			return false, fmt.Errorf("ProcessMove gameID=%s san=%s: compute fen after: %w",
 				session.ID, san, computeErr)
 		}
 	}
 	session.mu.RUnlock()
 
 	if rejErr != nil {
-		return rejErr
+		return false, rejErr
 	}
 
 	// Step 4: persist the move. Board state must not advance before this succeeds.
@@ -123,7 +129,7 @@ func (p *MoveProcessor) ProcessMove(ctx context.Context, session *GameSession, c
 	if err := p.moveStore.SaveMove(ctx, move); err != nil {
 		slog.Error("failed to save move",
 			"gameID", session.ID, "san", san, "moveNumber", move.MoveNumber, "error", err)
-		return fmt.Errorf("ProcessMove gameID=%s san=%s moveNumber=%d: save move: %w",
+		return false, fmt.Errorf("ProcessMove gameID=%s san=%s moveNumber=%d: save move: %w",
 			session.ID, san, move.MoveNumber, err)
 	}
 
@@ -139,7 +145,21 @@ func (p *MoveProcessor) ProcessMove(ctx context.Context, session *GameSession, c
 	// Step 6: apply the move to the in-memory board under the write lock.
 	// session.mu.Lock prevents a data race with CurrentStateSnapshot or any other
 	// concurrent reader of session.board.
+	//
+	// ADR-014: re-check status under the same lock acquisition used for ApplyMove.
+	// Between the initial status check (Step 1) and this lock acquisition, a concurrent
+	// goroutine (opponent's RESIGN, clock timeout, abandon timer) may have called
+	// session.Transition, moving the game to COMPLETED or ABANDONED. If so, skip the
+	// in-memory apply and all downstream effects (clock switch, outcome detection,
+	// broadcast). The SaveMove row persisted in Step 4 is orphaned but inert — terminal
+	// games are never loaded by RestoreActiveGames.
 	session.mu.Lock()
+	if session.status != store.GameStatusActive {
+		session.mu.Unlock()
+		slog.Info("ProcessMove: game no longer ACTIVE after DB write — skipping apply",
+			"gameID", session.ID, "san", san, "status", session.status)
+		return false, nil
+	}
 	applyErr := p.validator.ApplyMove(session.board, san)
 	session.mu.Unlock()
 
@@ -150,23 +170,44 @@ func (p *MoveProcessor) ProcessMove(ctx context.Context, session *GameSession, c
 		// without reloading state from the database.
 		slog.Error("ApplyMove failed after ValidateMove succeeded — game state unrecoverable",
 			"gameID", session.ID, "san", san, "error", applyErr)
-		return fmt.Errorf("ProcessMove gameID=%s san=%s: apply move: %w",
+		return false, fmt.Errorf("ProcessMove gameID=%s san=%s: apply move: %w",
 			session.ID, san, applyErr)
+	}
+
+	// Step 6a: switch clocks after the move is applied to session.board.
+	// session.clock has its own internal mutex; accessing it directly is valid
+	// here because move.go and session.go are both in package game.
+	session.clock.Switch()
+	whiteMs := session.clock.TimeRemaining(store.ColorWhite).Milliseconds()
+	blackMs := session.clock.TimeRemaining(store.ColorBlack).Milliseconds()
+
+	// Update in-memory clocks immediately so CurrentStateSnapshot is accurate.
+	session.UpdateClocks(whiteMs, blackMs)
+
+	// Persist clock state to DB. Non-fatal: in-memory state is authoritative;
+	// DB value is a durability checkpoint for server restart recovery.
+	if err := p.gameStore.UpdateClocks(ctx, session.ID, whiteMs, blackMs); err != nil {
+		slog.Error("failed to persist clock state after move",
+			"gameID", session.ID, "san", san, "error", err)
 	}
 
 	// Step 7: detect outcome after the move is applied.
 	// DetectOutcome reads session.board; no lock needed — the write is complete
 	// and only one goroutine calls ProcessMove per session at a time.
 	if outcome, ended := p.validator.DetectOutcome(session.board); ended {
-		return p.handleGameOver(ctx, session, fenAfter, outcome)
+		return true, p.handleGameOver(ctx, session, fenAfter, outcome)
 	}
 
-	// Step 8: no outcome — publish MOVE_APPLIED.
-	return p.publishMoveApplied(ctx, session, san, fenAfter, move.MoveNumber, color, snap)
+	// Step 8: no outcome — publish MOVE_APPLIED with updated clock values.
+	return false, p.publishMoveApplied(ctx, session, san, fenAfter, move.MoveNumber, color, whiteMs, blackMs)
 }
 
-// handleGameOver transitions the session to COMPLETED, persists the outcome to
-// the database, and publishes a GAME_OVER event via the EventBus.
+// handleGameOver stops the clock, transitions the session to COMPLETED,
+// persists the outcome to the database, and publishes a GAME_OVER event via
+// the EventBus.
+//
+// The clock is stopped first to prevent a simultaneous timeout from firing a
+// stale callback on an already-completed game.
 //
 // If the DB update fails after the in-memory transition, the error is logged and
 // the GAME_OVER event is still published — players must be notified regardless of
@@ -177,6 +218,8 @@ func (p *MoveProcessor) handleGameOver(
 	fenAfter string,
 	outcome *internalchess.GameOutcome,
 ) error {
+	session.clock.Stop()
+
 	if err := session.Transition(store.GameStatusCompleted); err != nil {
 		slog.Error("failed to transition game to COMPLETED",
 			"gameID", session.ID, "outcome", outcome.Winner, "error", err)
@@ -221,15 +264,15 @@ func (p *MoveProcessor) handleGameOver(
 }
 
 // publishMoveApplied marshals and publishes a MOVE_APPLIED event via the EventBus.
-// Clock values come from the pre-move snapshot; clock switching is wired in at
-// Step 9 when the Clock is implemented.
+// whiteTimeMs and blackTimeMs are the post-switch clock values snapshotted after
+// session.clock.Switch() in ProcessMove.
 func (p *MoveProcessor) publishMoveApplied(
 	ctx context.Context,
 	session *GameSession,
 	san, fenAfter string,
 	moveNumber int,
 	color store.Color,
-	snap GameStateSnapshot,
+	whiteTimeMs, blackTimeMs int64,
 ) error {
 	nextTurn := store.ColorBlack
 	if color == store.ColorBlack {
@@ -242,8 +285,8 @@ func (p *MoveProcessor) publishMoveApplied(
 		FEN:         fenAfter,
 		Turn:        string(nextTurn),
 		MoveNumber:  moveNumber,
-		WhiteTimeMs: snap.WhiteTimeMs,
-		BlackTimeMs: snap.BlackTimeMs,
+		WhiteTimeMs: whiteTimeMs,
+		BlackTimeMs: blackTimeMs,
 	}
 	payload, err := json.Marshal(msg)
 	if err != nil {

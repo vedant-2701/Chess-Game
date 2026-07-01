@@ -49,18 +49,24 @@ type GameSession struct {
 	ID string
 
 	// mu protects: status, playerWhiteID, playerBlackID, playerWhite,
-	// playerBlack, board, whiteTimeMs, blackTimeMs, outcome, outcomeReason.
 	mu            sync.RWMutex
 	status        store.GameStatus
 	playerWhiteID string
-	playerBlackID string        // empty string until SetPlayerBlack is called
+	playerBlackID string         // empty string until SetPlayerBlack is called
 	playerWhite   *ws.Connection // nil when White is disconnected
 	playerBlack   *ws.Connection // nil when Black is disconnected
+
+	// mu also protects: board, whiteTimeMs, blackTimeMs, outcome, outcomeReason.
 	board         *notnil.Game
 	whiteTimeMs   int64
 	blackTimeMs   int64
 	outcome       *store.Outcome       // nil until game reaches a terminal state
 	outcomeReason *store.OutcomeReason // nil until game reaches a terminal state
+
+	// clock manages per-player countdown timers. Its internal state is
+	// protected by clock.mu (not session.mu). The pointer is set once in
+	// NewGameSession and never replaced.
+	clock *Clock
 }
 
 // NewGameSession constructs a GameSession for a newly created game. The board
@@ -74,7 +80,36 @@ func NewGameSession(id string, whiteID string) *GameSession {
 		board:         internalchess.NewGame(),
 		whiteTimeMs:   InitialTimeMs,
 		blackTimeMs:   InitialTimeMs,
+		clock:         NewClock(InitialTimeMs),
 	}
+}
+
+// NewGameSessionFromDB hydrates a GameSession from an existing database record
+// and a board reconstructed by replaying stored moves. Used exclusively by
+// Manager.RestoreActiveGames on server startup.
+//
+// The clock is initialised with the persisted remaining times for each player
+// and is NOT started — it starts when both players reconnect via HandleConnect.
+func NewGameSessionFromDB(game *store.Game, board *notnil.Game) *GameSession {
+	s := &GameSession{
+		ID:            game.ID,
+		status:        game.Status,
+		playerWhiteID: game.PlayerWhiteID,
+		board:         board,
+		whiteTimeMs:   game.WhiteTimeMs,
+		blackTimeMs:   game.BlackTimeMs,
+		clock:         NewClockWithTimes(game.WhiteTimeMs, game.BlackTimeMs),
+	}
+	if game.PlayerBlackID != nil {
+		s.playerBlackID = *game.PlayerBlackID
+	}
+	if game.Outcome != nil {
+		s.outcome = game.Outcome
+	}
+	if game.OutcomeReason != nil {
+		s.outcomeReason = game.OutcomeReason
+	}
+	return s
 }
 
 // SetPlayerBlack records the userID of the player who joined as Black.
@@ -138,6 +173,22 @@ func (s *GameSession) BothPlayersConnected() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.playerWhite != nil && s.playerBlack != nil
+}
+
+// IsPlayerConnected reports whether the given color currently has a live
+// WebSocket connection. Used by Manager.onAbandonTimeout to distinguish a
+// single-player disconnect (opponent wins by abandonment) from a both-players-
+// disconnected scenario (abandonment draw) per PHASE_1.md's state machine.
+func (s *GameSession) IsPlayerConnected(color store.Color) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	switch color {
+	case store.ColorWhite:
+		return s.playerWhite != nil
+	case store.ColorBlack:
+		return s.playerBlack != nil
+	}
+	return false
 }
 
 // Transition advances the game state machine to newStatus. Returns

@@ -21,6 +21,18 @@ var (
 	ErrInvalidTransition = errors.New("invalid state transition")
 )
 
+var (
+	// ErrGameNotJoinable is returned by Manager.JoinGame when the game exists
+	// but is not in WAITING_FOR_PLAYER status. The API handler maps this to
+	// HTTP 409 Conflict.
+	ErrGameNotJoinable = errors.New("game is not joinable")
+
+	// ErrSelfPlay is returned by Manager.JoinGame when the joining userID
+	// matches the game creator (White). The API handler maps this to HTTP 409
+	// Conflict.
+	ErrSelfPlay = errors.New("cannot join your own game")
+)
+
 // MoveRejectionError is returned by MoveProcessor.ProcessMove when a move is
 // rejected for a client-attributable reason. The Manager constructs and sends a
 // MOVE_REJECTED message to the submitting player using the Reason field.

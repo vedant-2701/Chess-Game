@@ -163,15 +163,28 @@ func (s *GameStore) UpdateCurrentFEN(ctx context.Context, id string, fen string)
 
 // UpdatePlayerBlack sets player_black_id when the second player joins via
 // POST /games/:id/join. Called once per game lifetime.
+//
+// The UPDATE's WHERE clause (status = WAITING_FOR_PLAYER AND player_black_id
+// IS NULL) makes this an atomic conditional write, not a check-then-act pair
+// with the caller's prior GetGame read. Two concurrent JoinGame calls for the
+// same gameID can both pass a pre-flight GetGame check (both observe
+// player_black_id IS NULL) before either commits — only this UPDATE's
+// predicate, evaluated atomically by PostgreSQL, decides the actual winner.
+// See ADR-016 in DECISIONS_LOG_PHASE_1.md.
 func (s *GameStore) UpdatePlayerBlack(ctx context.Context, id string, playerBlackID string) error {
-	const q = `UPDATE games SET player_black_id = $1, updated_at = NOW() WHERE id = $2`
+	const q = `UPDATE games SET player_black_id = $1, updated_at = NOW() WHERE id = $2 AND status = 'WAITING_FOR_PLAYER' AND player_black_id IS NULL`
 
 	tag, err := s.pool.Exec(ctx, q, playerBlackID, id)
 	if err != nil {
 		return fmt.Errorf("GameStore.UpdatePlayerBlack gameID=%s playerBlackID=%s: %w", id, playerBlackID, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("GameStore.UpdatePlayerBlack gameID=%s: %w", id, ErrGameNotFound)
+		// Zero rows affected means the row exists but the predicate failed —
+		// game already has a Black player, or is no longer WAITING_FOR_PLAYER.
+		// This is NOT "not found": the caller already confirmed existence via
+		// GetGame before calling. Returning ErrGameNotFound here would be a
+		// misleading error for the loser of a genuine join race.
+		return fmt.Errorf("GameStore.UpdatePlayerBlack gameID=%s: %w", id, ErrGameNotJoinable)
 	}
 	return nil
 }
