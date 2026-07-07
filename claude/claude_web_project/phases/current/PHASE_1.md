@@ -556,36 +556,39 @@ Schema is defined in ARCHITECTURE.md. Do not deviate from it without updating AR
 ---
 
 ### Step 11: WebSocket Handler
-- [ ] `internal/ws/handler.go`:
-  - [ ] `Handler` struct (depends on: auth.TokenService, game.Manager, ws.Registry)
-  - [ ] `ServeHTTP(w http.ResponseWriter, r *http.Request)` — upgrades and handles lifecycle
-  - [ ] Extract token from query parameter `?token=`
-  - [ ] Verify token, extract claims
-  - [ ] Verify claims.GameID matches URL parameter :id
-  - [ ] Register connection into ws.Registry
-  - [ ] Call game.Manager.HandleConnect
-  - [ ] Read loop: deserialize messages, route to game.Manager.HandleMessage
-  - [ ] On disconnect: call game.Manager.HandleDisconnect, unregister from ws.Registry
-- [ ] Integration tests:
-  - [ ] Invalid token: connection refused with appropriate close code
-  - [ ] Valid token: connection accepted, GAME_STATE received
-  - [ ] Reconnection: second connection with same token receives current GAME_STATE
+
+**Location correction (2026-07-02, see ARCHITECTURE.md “internal/ws” and “internal/api” sections):** This step was originally specified as `internal/ws/handler.go` with a `Handler` holding a `*game.Manager` field. That is a circular import: `internal/game` already imports `internal/ws` for `*ws.Connection`, so `internal/ws` cannot import `internal/game` back. The handler lives in `internal/api` instead, as `WSHandler`, which is the layer already documented to depend on `internal/game`.
+
+- [x] `internal/api/ws_handler.go`:
+  - [x] `WSHandler` struct (depends on: token-verify function/`*auth` package, `*game.Manager`, `*ws.Registry`, a server-lifetime `context.Context` per ADR-018)
+  - [x] `ServeHTTP(w http.ResponseWriter, r *http.Request)` — upgrades and handles lifecycle
+  - [x] Extract token from query parameter `?token=`
+  - [x] Verify token, extract claims
+  - [x] Verify claims.GameID matches URL parameter :id
+  - [x] Register connection into ws.Registry
+  - [x] Call game.Manager.HandleConnect
+  - [x] Read loop: deserialize messages, route to game.Manager.HandleMessage using the server-lifetime context (ADR-018), not `r.Context()`
+  - [x] On disconnect: call game.Manager.HandleDisconnect, unregister from ws.Registry
+- [x] Integration tests (in `internal/api/ws_handler_test.go`):
+  - [x] Invalid token: connection refused with appropriate close code
+  - [x] Valid token: connection accepted, GAME_STATE received
+  - [x] Reconnection: second connection with same token receives current GAME_STATE
 
 ---
 
 ### Step 12: HTTP API Handlers
-- [ ] `internal/api/game_handler.go`:
-  - [ ] `GameHandler` struct (depends on: game.Manager)
-  - [ ] `CreateGame(w, r)` — POST /games
-  - [ ] `JoinGame(w, r)` — POST /games/:id/join
-  - [ ] `GetGame(w, r)` — GET /games/:id
-  - [ ] `Health(w, r)` — GET /health
-- [ ] `internal/api/routes.go`:
-  - [ ] chi router setup
-  - [ ] Request logging middleware (slog)
-  - [ ] Panic recovery middleware
-  - [ ] Route registration
-- [ ] Unit tests for all handlers (httptest, no real DB in handler tests — use store interfaces)
+- [x] `internal/api/game_handler.go`:
+  - [x] `GameHandler` struct (depends on: game.Manager, *and* `*store.UserStore` — deviation from the literal spec, see CLAUDE.md Implementation Decisions: Manager.CreateGame/JoinGame assume the user row already exists, and user upsert is an HTTP-layer concern)
+  - [x] `CreateGame(w, r)` — POST /games
+  - [x] `JoinGame(w, r)` — POST /games/:id/join
+  - [x] `GetGame(w, r)` — GET /games/:id
+  - [x] `Health(w, r)` — GET /health (response deliberately NOT wrapped in the `{"data":...}` envelope — see CLAUDE.md Implementation Decisions)
+- [x] `internal/api/routes.go`:
+  - [x] chi router setup
+  - [x] Request logging middleware (slog)
+  - [x] Panic recovery middleware (chi's `middleware.Recoverer` — third-party, not held to §4's slog-only rule, see CLAUDE.md)
+  - [x] Route registration
+- [x] Unit tests for all handlers (integration-tagged, real PostgreSQL via shared testPool — no mocks, per CODING_GUIDELINES.md §6; PHASE_1.md's original "no real DB in handler tests" note was superseded once GameHandler took on a direct store dependency)
 
 ---
 
