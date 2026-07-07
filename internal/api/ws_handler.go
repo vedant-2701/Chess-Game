@@ -27,7 +27,11 @@ var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		return origin == "http://"+r.Host || origin == "https://"+r.Host
 	},
 }
 
@@ -100,7 +104,7 @@ func NewWSHandler(ctx context.Context, manager *game.Manager, wsRegistry *ws.Reg
 func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	gameID := chi.URLParam(r, "id")
 	if gameID == "" {
-		http.Error(w, "missing game id in URL", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "missing game id in URL")
 		return
 	}
 
