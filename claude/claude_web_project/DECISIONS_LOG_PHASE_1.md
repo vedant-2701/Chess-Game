@@ -878,3 +878,79 @@ depends on a store-package sentinel.
   `game` or `store` layers, not just a one-off fix.
 
 ---
+
+## ADR-017: HandleConnect Double-Join Race — Atomic State Transition
+
+**Date:** 2026-07-01
+**Status:** ACCEPTED
+
+**Context:**
+`HandleConnect`'s first-connect path has a Go memory race if both players connect concurrently. The sequence executes three distinct methods on `GameSession`:
+1. `session.RegisterConnection(color, conn)`
+2. `session.BothPlayersConnected()`
+3. `session.Transition(store.GameStatusActive)`
+
+Each method acquires and releases `session.mu` independently. If White and Black connect simultaneously, both goroutines can complete `RegisterConnection` before either evaluates `BothPlayersConnected`. Both will observe `true`, and both will call `Transition(ACTIVE)`. 
+
+`Transition` correctly allows only one caller to succeed. The losing goroutine receives an `ErrInvalidTransition` and errors out of `HandleConnect`. This silently drops the losing player's WebSocket connection while leaving their `*ws.Connection` pointer dangling in the `GameSession`. Furthermore, it breaks the WebSocket message protocol: the winning goroutine sends `OPPONENT_CONNECTED` to a connection that is actively being dropped by the losing goroutine.
+
+**Options Considered:**
+
+**Option A: Atomic compound method on GameSession (CHOSEN)**
+Combine the registration, presence check, and state transition into a single atomic operation inside `GameSession` under one lock acquisition. The method returns a boolean indicating if this specific call triggered the transition to `ACTIVE`.
+
+- Pros: Eliminates the TOCTOU window completely. Ensures exactly one goroutine executes the downstream side-effects (DB persistence, clock start, opponent notification). Cleanest encapsulation of the state machine.
+- Cons: Slightly couples connection registration with state machine progression inside `GameSession`.
+
+**Option B: Catch `ErrInvalidTransition` in `HandleConnect`**
+Let the race happen, catch the error on the losing goroutine, and treat it as a reconnect.
+
+- Pros: No changes to `GameSession` API.
+- Cons: Causes chaotic message broadcasting. The winning goroutine sends `OPPONENT_CONNECTED`, while the losing goroutine (treating it as a reconnect) sends `OPPONENT_RECONNECTED`. Clients receive contradictory state messages. Patches a symptom instead of fixing the underlying atomicity violation.
+
+**Option C: Single-writer-per-session (Actor Model)**
+Route all mutations through a single goroutine per session via channels (as discussed in ADR-014).
+
+- Pros: Solves all intra-session concurrency races by construction.
+- Cons: High implementation cost. Complicates synchronous error returns for connection rejection. Over-engineering for a localized race that a 5-line mutex fix can solve.
+
+**Decision:** Option A — Atomic compound method on `GameSession`.
+
+**Rationale:**
+The race requires that connection registration and state transition occur atomically. Option A pushes this atomicity into `GameSession`, mirroring the fix from ADR-016 where the state-holding layer (the database) was made responsible for the atomic check-then-act. Option B is rejected because it corrupts the WebSocket message protocol with duplicate messages. Option C remains tabled as over-engineering for the current phase.
+
+**Consequences:**
+- `GameSession` will expose an atomic method (e.g., `RegisterAndMaybeActivate`) or `RegisterConnection` will be modified to return an `activated bool`.
+- `HandleConnect` will use this boolean to ensure only one goroutine handles the transition side-effects (starting the clock, updating the DB, and broadcasting `OPPONENT_CONNECTED`).
+- The losing concurrent caller will simply return `nil` and send a `GAME_STATE` message to itself, completing its connection lifecycle correctly.
+
+**Implementation follow-up (2026-07-02):** `RegisterConnection`'s WAITING to ACTIVE branch was found, during code review, to assign `s.status` directly rather than routing through `Transition`/`validTransitions` -- a second, duplicated source of truth for legal state-machine edges. Refactored to extract `transitionLocked(newStatus) error` (no locking, assumes caller holds `s.mu`), called by both `Transition` (which locks) and `RegisterConnection` (already holding the lock). `validTransitions` is once again the single point where legal edges are decided. Added `TestRegisterConnection_ConcurrentBothConnect_ExactlyOneActivates` (200 trials, real goroutines, run under `-race`) per CLAUDE.md Non-Negotiable Constraint #10 -- the existing tests on `RegisterConnection` were all sequential and did not prove the race was closed. Both changes verified passing. No new ADR opened for this -- treated as an implementation-decision-level correction to ADR-017's own fix.
+
+---
+
+## ADR-018: ReadLoop / HandleMessage Context Lifetime
+
+Date: 2026-07-02
+Status: ACCEPTED
+
+Context: ws.Connection.ReadLoop runs for the lifetime of a WebSocket connection, which outlives the HTTP request that established it -- ServeHTTP returns immediately after the upgrade and goroutine spawn, but ReadLoop (and the onMessage/onClose callbacks it drives) continue running until the connection closes. Per CODING_GUIDELINES.md section 2, every I/O function takes context.Context as its first argument -- this applies to Manager.HandleMessage and, in spirit, to the disconnect path as well. But there is no live request-scoped context available at the point onMessage/onClose fire, since r.Context() from the original upgrade request is already cancelled. This was flagged as a known sharp edge as far back as Step 7/8 (see the NOTE comment already present in ws/connection.go's ReadLoop doc) and called out repeatedly in CLAUDE.md as a decision that must be made deliberately before Step 11 implementation begins, not discovered mid-implementation.
+
+Options Considered:
+
+Option A: context.Background() per call. Each onMessage/onClose callback passes context.Background() directly to Manager.HandleMessage/HandleDisconnect. Pros: simplest possible implementation, no new state threaded through Handler. Cons: no cancellation ever propagates into the game layer from the server's lifecycle -- directly conflicts with PHASE_1.md Step 13's requirement to "wait for in-progress moves to complete" on SIGTERM, since there would be no context to cancel and therefore nothing for in-flight DB calls or the eventual graceful-shutdown wait to key off of.
+
+Option B: Server-lifetime context, created at Handler construction, cancelled on SIGTERM (CHOSEN). Handler holds a context.Context set once at construction time. main.go (Step 13) creates it via context.WithCancel(context.Background()), passes the ctx into Handler's constructor, and calls the matching cancel() from its SIGTERM branch. Every ReadLoop callback, for every connection, for the life of the process, uses this same context. Pros: gives Step 13's graceful-shutdown requirement an actual mechanism to key off of -- shutdown cancels the context, in-flight store calls observe ctx.Err() on their next check, and main.go can bound the wait with the same waitWithTimeout pattern already used in ws/registry.go's CloseAll. Matches the scope of the thing being cancelled: the WebSocket session's lifetime is intentionally decoupled from any single HTTP request, so a server-lifetime context is the correctly-scoped choice, not a request-scoped one. Cons: Handler now holds a context.Context as a struct field, which is normally a code smell (CODING_GUIDELINES.md section 2 -- "never store context in a struct" -- is written with request-scoped contexts in mind). This is an intentional, documented exception: the guideline's rationale ("context belongs to the call, not the struct") assumes a per-call context is available; here there is none by construction, and the alternative (Option A) forfeits Step 13's shutdown requirement entirely. This exception is scoped narrowly to Handler's server-lifetime context field and must not be used as precedent for storing request-scoped contexts elsewhere.
+
+Option C: Per-connection derived context, cancelled when that connection's ReadLoop exits. Each connection gets its own context.WithCancel(serverCtx), cancelled in ReadLoop's deferred cleanup. Pros: superficially appealing -- "scope cancellation to the connection." Cons: backwards. ReadLoop's deferred cleanup is exactly the code that calls onClose -> Manager.HandleDisconnect, which needs to run to completion (persist clock pause state, start the abandonment timer) -- racing that against its own about-to-be-cancelled context solves a problem that doesn't exist while creating one (a HandleDisconnect implementation that later adds a context-cancellation check could spuriously abort its own cleanup).
+
+Decision: Option B -- server-lifetime context, owned by main.go, injected into Handler at construction.
+
+Rationale: Step 13 explicitly requires waiting for in-progress moves before shutdown completes; a server-lifetime cancellable context is the only option of the three that gives that requirement a mechanism at all. The CODING_GUIDELINES.md section 2 "never store context in a struct" rule is written for the ordinary case where a per-call context is available and correctly threading it through call chains is possible; a long-lived WebSocket connection's message-handling callbacks are the documented exception to that ordinary case -- there is no call boundary to derive a context from, only a connection lifetime and a server lifetime, and the server lifetime is the correct scope.
+
+Consequences:
+- Handler's constructor takes context.Context as an explicit parameter/field, not context.Background() inline.
+- cmd/server/main.go (Step 13, not yet implemented) must create this context via context.WithCancel, pass ctx into Handler's constructor, and call the matching cancel() in its SIGTERM branch, ordered before ws.Registry.CloseAll() so that in-flight HandleMessage calls observe cancellation before connections are force-closed.
+- No change to any already-implemented layer -- this affects only internal/ws/handler.go (Step 11, in progress) and wiring not yet written (Step 13).
+- This is a narrow, documented exception to CODING_GUIDELINES.md section 2 and must be called out as such at the Handler struct's field declaration, not left implicit.
+
+---

@@ -48,7 +48,7 @@ type GameStateSnapshot struct {
 type GameSession struct {
 	ID string
 
-	// mu protects: status, playerWhiteID, playerBlackID, playerWhite,
+	// mu protects: status, playerWhiteID, playerBlackID, playerWhite, playerBlack.
 	mu            sync.RWMutex
 	status        store.GameStatus
 	playerWhiteID string
@@ -120,25 +120,40 @@ func (s *GameSession) SetPlayerBlack(userID string) {
 	s.playerBlackID = userID
 }
 
-// RegisterConnection sets the *ws.Connection for the given color. Returns
-// ErrConnectionOccupied if the slot is already held by a live connection.
-// Use ReplaceConnection for reconnection flows.
-func (s *GameSession) RegisterConnection(color store.Color, conn *ws.Connection) error {
+// RegisterConnection sets the *ws.Connection for the given color. If this registration
+// completes the player pair and the game is in WAITING_FOR_PLAYER status, it atomically
+// transitions the game to ACTIVE and returns activated=true. Returns ErrConnectionOccupied
+// if the slot is already held by a live connection. Use ReplaceConnection for reconnection flows.
+func (s *GameSession) RegisterConnection(color store.Color, conn *ws.Connection) (activated bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch color {
 	case store.ColorWhite:
 		if s.playerWhite != nil {
-			return fmt.Errorf("GameSession.RegisterConnection color=%s: %w", color, ErrConnectionOccupied)
+			return false, fmt.Errorf("GameSession.RegisterConnection color=%s: %w", color, ErrConnectionOccupied)
 		}
 		s.playerWhite = conn
 	case store.ColorBlack:
 		if s.playerBlack != nil {
-			return fmt.Errorf("GameSession.RegisterConnection color=%s: %w", color, ErrConnectionOccupied)
+			return false, fmt.Errorf("GameSession.RegisterConnection color=%s: %w", color, ErrConnectionOccupied)
 		}
 		s.playerBlack = conn
 	}
-	return nil
+
+	if s.playerWhite != nil && s.playerBlack != nil && s.status == store.GameStatusWaiting {
+		// Route through transitionLocked rather than assigning s.status
+		// directly, so validTransitions remains the single source of truth
+		// for legal edges (ADR-017 follow-up).
+		if tErr := s.transitionLocked(store.GameStatusActive); tErr != nil {
+			// Unreachable in practice: s.mu has been held continuously since
+			// the status == WAITING check above, and WAITING→ACTIVE is a
+			// valid edge. Treated as an invariant violation, not swallowed.
+			return false, fmt.Errorf("GameSession.RegisterConnection gameID=%s: %w", s.ID, tErr)
+		}
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // ReplaceConnection unconditionally replaces the *ws.Connection for the given
@@ -191,6 +206,22 @@ func (s *GameSession) IsPlayerConnected(color store.Color) bool {
 	return false
 }
 
+// transitionLocked validates newStatus against validTransitions and, if
+// legal, applies it. Callers must already hold s.mu (write lock) — this
+// method does not lock. This is the single point where validTransitions is
+// consulted; both Transition (external callers) and RegisterConnection's
+// WAITING→ACTIVE fast path (ADR-017) route through it so there is exactly
+// one source of truth for which state-machine edges are legal.
+func (s *GameSession) transitionLocked(newStatus store.GameStatus) error {
+	allowed, ok := validTransitions[s.status]
+	if !ok || !allowed[newStatus] {
+		return fmt.Errorf("GameSession.transitionLocked gameID=%s %s→%s: %w",
+			s.ID, s.status, newStatus, ErrInvalidTransition)
+	}
+	s.status = newStatus
+	return nil
+}
+
 // Transition advances the game state machine to newStatus. Returns
 // ErrInvalidTransition for any edge not defined in validTransitions.
 // This is the only place game status changes; no external code sets
@@ -198,13 +229,7 @@ func (s *GameSession) IsPlayerConnected(color store.Color) bool {
 func (s *GameSession) Transition(newStatus store.GameStatus) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	allowed, ok := validTransitions[s.status]
-	if !ok || !allowed[newStatus] {
-		return fmt.Errorf("GameSession.Transition gameID=%s %s→%s: %w",
-			s.ID, s.status, newStatus, ErrInvalidTransition)
-	}
-	s.status = newStatus
-	return nil
+	return s.transitionLocked(newStatus)
 }
 
 // SetOutcome records the game result. Must be called after Transition(COMPLETED)

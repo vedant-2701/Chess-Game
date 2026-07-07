@@ -2,6 +2,7 @@ package game_test
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/vedant-2701/chess/internal/game"
@@ -119,16 +120,16 @@ func TestRegisterConnection_FirstConnectionSucceeds(t *testing.T) {
 	s := game.NewGameSession("game-1", "user-white")
 	conn := fakeConn("conn-1")
 
-	if err := s.RegisterConnection(store.ColorWhite, conn); err != nil {
+	if _, err := s.RegisterConnection(store.ColorWhite, conn); err != nil {
 		t.Fatalf("expected RegisterConnection to succeed, got: %v", err)
 	}
 }
 
 func TestRegisterConnection_OccupiedSlotReturnsError(t *testing.T) {
 	s := game.NewGameSession("game-1", "user-white")
-	_ = s.RegisterConnection(store.ColorWhite, fakeConn("conn-1"))
+	_, _ = s.RegisterConnection(store.ColorWhite, fakeConn("conn-1"))
 
-	err := s.RegisterConnection(store.ColorWhite, fakeConn("conn-2"))
+	_, err := s.RegisterConnection(store.ColorWhite, fakeConn("conn-2"))
 	if err == nil {
 		t.Fatal("expected error when registering into an occupied slot")
 	}
@@ -137,9 +138,76 @@ func TestRegisterConnection_OccupiedSlotReturnsError(t *testing.T) {
 	}
 }
 
+// TestRegisterConnection_ConcurrentBothConnect_ExactlyOneActivates reproduces
+// ADR-017's race directly: two goroutines calling RegisterConnection for
+// different colors on the same session, concurrently. Before the fix
+// (RegisterConnection + BothPlayersConnected + Transition as three separate
+// lock acquisitions inside Manager.HandleConnect), both goroutines could
+// observe "both connected" as true and both attempt the WAITING→ACTIVE
+// transition — the loser errored out of HandleConnect after already having
+// registered its connection into the session.
+//
+// This test proves the fix at the GameSession level, where the atomic
+// compound operation now lives. Run under -race. Across many trials, exactly
+// one of the two concurrent registrations must report activated=true, and
+// the session must end up ACTIVE regardless of interleaving.
+//
+// A sequential-only test (as every other test in this file is) cannot catch
+// this class of bug — see CLAUDE.md Non-Negotiable Constraint #10 and
+// ADR-016's precedent, where a sequential-only test passed while the
+// underlying concurrent bug remained unfixed.
+func TestRegisterConnection_ConcurrentBothConnect_ExactlyOneActivates(t *testing.T) {
+	const trials = 200
+
+	for i := 0; i < trials; i++ {
+		s := game.NewGameSession("game-1", "user-white")
+
+		var wg sync.WaitGroup
+		activations := make(chan bool, 2)
+		errsCh := make(chan error, 2)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			activated, err := s.RegisterConnection(store.ColorWhite, fakeConn("conn-w"))
+			activations <- activated
+			errsCh <- err
+		}()
+		go func() {
+			defer wg.Done()
+			activated, err := s.RegisterConnection(store.ColorBlack, fakeConn("conn-b"))
+			activations <- activated
+			errsCh <- err
+		}()
+		wg.Wait()
+		close(activations)
+		close(errsCh)
+
+		for err := range errsCh {
+			if err != nil {
+				t.Fatalf("trial %d: unexpected error from concurrent RegisterConnection: %v", i, err)
+			}
+		}
+
+		activatedCount := 0
+		for activated := range activations {
+			if activated {
+				activatedCount++
+			}
+		}
+		if activatedCount != 1 {
+			t.Fatalf("trial %d: expected exactly one concurrent caller to activate the game, got %d", i, activatedCount)
+		}
+
+		if snap := s.CurrentStateSnapshot(); snap.Status != store.GameStatusActive {
+			t.Fatalf("trial %d: expected session to be ACTIVE after both connected, got %s", i, snap.Status)
+		}
+	}
+}
+
 func TestReplaceConnection_OverwritesExisting(t *testing.T) {
 	s := game.NewGameSession("game-1", "user-white")
-	_ = s.RegisterConnection(store.ColorWhite, fakeConn("conn-old"))
+	_, _ = s.RegisterConnection(store.ColorWhite, fakeConn("conn-old"))
 
 	// ReplaceConnection must not return an error and must succeed even when
 	// the slot is occupied (this is the reconnection path).
@@ -147,7 +215,7 @@ func TestReplaceConnection_OverwritesExisting(t *testing.T) {
 
 	// After replace, registering again should still fail (slot is occupied
 	// by the new connection).
-	err := s.RegisterConnection(store.ColorWhite, fakeConn("conn-3"))
+	_, err := s.RegisterConnection(store.ColorWhite, fakeConn("conn-3"))
 	if !errors.Is(err, game.ErrConnectionOccupied) {
 		t.Errorf("expected slot to remain occupied after ReplaceConnection, got: %v", err)
 	}
@@ -155,12 +223,12 @@ func TestReplaceConnection_OverwritesExisting(t *testing.T) {
 
 func TestClearConnection_SetsSlotToNil(t *testing.T) {
 	s := game.NewGameSession("game-1", "user-white")
-	_ = s.RegisterConnection(store.ColorWhite, fakeConn("conn-1"))
+	_, _ = s.RegisterConnection(store.ColorWhite, fakeConn("conn-1"))
 
 	s.ClearConnection(store.ColorWhite)
 
 	// After clearing, registering again should succeed (slot is free).
-	if err := s.RegisterConnection(store.ColorWhite, fakeConn("conn-2")); err != nil {
+	if _, err := s.RegisterConnection(store.ColorWhite, fakeConn("conn-2")); err != nil {
 		t.Errorf("expected slot to be free after ClearConnection, got: %v", err)
 	}
 }
@@ -174,12 +242,12 @@ func TestBothPlayersConnected(t *testing.T) {
 		t.Fatal("expected false with no connections registered")
 	}
 
-	_ = s.RegisterConnection(store.ColorWhite, fakeConn("conn-w"))
+	_, _ = s.RegisterConnection(store.ColorWhite, fakeConn("conn-w"))
 	if s.BothPlayersConnected() {
 		t.Fatal("expected false with only White connected")
 	}
 
-	_ = s.RegisterConnection(store.ColorBlack, fakeConn("conn-b"))
+	_, _ = s.RegisterConnection(store.ColorBlack, fakeConn("conn-b"))
 	if !s.BothPlayersConnected() {
 		t.Fatal("expected true with both players connected")
 	}

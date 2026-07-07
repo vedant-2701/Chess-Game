@@ -72,10 +72,25 @@ func (c *Connection) Close() {
 // likely means a temporarily slow client, not a dead one, so the caller
 // just gets ErrQueueFull back and can decide what to do (e.g. drop and
 // log, in the case of Broadcast).
+//
+// The closed-check and the queue-send are deliberately two separate
+// select statements, not one three-case select. A single select with
+// `case <-c.closeSig` and `case c.outboundQueue <- msg` both listed is a
+// real bug once the queue has free capacity: Go's select picks
+// pseudo-randomly among ALL ready cases, not in source order, so once
+// closeSig is closed, a still-roomy queue makes both cases ready
+// simultaneously — Send would non-deterministically enqueue onto a
+// channel nobody is draining instead of reporting closed. Checking
+// closeSig in its own select (competing only against a default, never
+// against the queue-send case) makes the closed-check deterministic.
 func (c *Connection) Send(payload []byte) error {
 	select {
 	case <-c.closeSig:
 		return ErrConnectionClosed
+	default:
+	}
+
+	select {
 	case c.outboundQueue <- outboundMessage{messageType: websocket.TextMessage, payload: payload}:
 		return nil
 	default:
@@ -87,11 +102,20 @@ func (c *Connection) Send(payload []byte) error {
 // the connection if the queue is full, because during shutdown the end
 // state is "closed" either way — there's no healthy-slow-connection case
 // worth preserving here.
+//
+// Same two-stage select as Send, for the same reason: combining the
+// closed-check with the queue-send in one select is unreliable once the
+// queue has room (see Send's comment).
 func (c *Connection) SendCloseFrame(statusCode int, reason string) error {
 	payload := websocket.FormatCloseMessage(statusCode, reason)
+
 	select {
 	case <-c.closeSig:
 		return ErrConnectionClosed
+	default:
+	}
+
+	select {
 	case c.outboundQueue <- outboundMessage{messageType: websocket.CloseMessage, payload: payload}:
 		return nil
 	default:
@@ -103,10 +127,16 @@ func (c *Connection) SendCloseFrame(statusCode int, reason string) error {
 // enqueuePing is the heartbeat monitor's only way to cause a ping to be
 // written. It goes through the same single-writer path as everything
 // else — no goroutine besides WriteLoop ever calls wsConn.WriteMessage.
+//
+// Same two-stage select as Send, for the same reason.
 func (c *Connection) enqueuePing() error {
 	select {
 	case <-c.closeSig:
 		return ErrConnectionClosed
+	default:
+	}
+
+	select {
 	case c.outboundQueue <- outboundMessage{messageType: websocket.PingMessage, payload: nil}:
 		return nil
 	default:
@@ -132,6 +162,25 @@ func (c *Connection) WriteLoop() {
 			}
 		}
 	}
+}
+
+// Start launches this connection's three goroutines — WriteLoop, ReadLoop,
+// and the heartbeat monitor — with wg bookkeeping handled internally. This
+// is the only supported way for a caller outside package ws (e.g.
+// internal/api's WebSocket upgrade handler) to start a Connection: wg is
+// intentionally unexported so Registry.CloseAll's graceful-shutdown wait
+// (which depends on wg reaching zero) cannot be bypassed or double-counted
+// by an external caller.
+//
+// wg.Add(2), not 3: WriteLoop and ReadLoop both call wg.Done() on exit and
+// are the two goroutines CloseAll's waitWithTimeout actually waits on.
+// StartHeartbeatMonitor self-terminates on closeSig but is not part of
+// that handshake — it never blocks shutdown and never calls wg.Done().
+func (c *Connection) Start(onMessage func([]byte), onClose func()) {
+	c.wg.Add(2)
+	go c.WriteLoop()
+	go c.ReadLoop(onMessage, onClose)
+	go c.StartHeartbeatMonitor(pingInterval, pongTimeout)
 }
 
 // ReadLoop owns the connection's only reader. For every application frame
