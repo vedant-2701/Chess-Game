@@ -9,7 +9,8 @@ import (
 // dataEnvelope and errorEnvelope are the two JSON response shapes required by
 // CODING_GUIDELINES.md §7 for every response in this package — REST and the
 // WS pre-upgrade rejection path alike. One envelope implementation, not one
-// per handler file.
+// per handler file. (except GET /health, which is
+// intentionally a flat {"status":"ok"} response).
 type dataEnvelope struct {
 	Data any `json:"data"`
 }
