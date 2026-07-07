@@ -223,7 +223,7 @@ func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.
 	// (WAITING) from reconnect (ACTIVE).
 	snap := session.CurrentStateSnapshot()
 
-	regErr := session.RegisterConnection(color, conn)
+	activated, regErr := session.RegisterConnection(color, conn)
 	isOccupied := errors.Is(regErr, ErrConnectionOccupied)
 	if isOccupied {
 		// Slot is held by a stale pointer (simultaneous reconnect edge case).
@@ -235,6 +235,26 @@ func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.
 
 	// Cancel any pending abandonment timer for this player.
 	m.cancelAbandonTimer(gameID, color)
+
+	if activated {
+		// Both players now connected for the first time. This goroutine atomically
+		// transitioned the session to ACTIVE.
+
+		// Persist status change. Non-fatal: in-memory state is authoritative.
+		if err := m.gameStore.UpdateGameStatus(ctx, gameID, store.GameStatusActive, nil); err != nil {
+			slog.Error("failed to persist ACTIVE status", "gameID", gameID, "error", err)
+		}
+
+		// White always moves first; start the clock for White.
+		session.clock.Start(store.ColorWhite)
+
+		// Send GAME_STATE to the connecting player; OPPONENT_CONNECTED to the waiting player.
+		m.sendGameState(session, color)
+		m.sendSimple(session, opponentOf(color), MsgTypeOpponentConnected)
+
+		slog.Info("game is now ACTIVE", "gameID", gameID)
+		return nil
+	}
 
 	// Reconnect path: game is already ACTIVE (or we replaced a stale pointer).
 	if isOccupied || snap.Status == store.GameStatusActive {
@@ -255,30 +275,8 @@ func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.
 		return nil
 	}
 
-	// First-connect path: game is WAITING_FOR_PLAYER.
-	if !session.BothPlayersConnected() {
-		m.sendGameState(session, color)
-		return nil
-	}
-
-	// Both players now connected for the first time. Transition to ACTIVE.
-	if err := session.Transition(store.GameStatusActive); err != nil {
-		return fmt.Errorf("Manager.HandleConnect gameID=%s: transition to ACTIVE: %w", gameID, err)
-	}
-
-	// Persist status change. Non-fatal: in-memory state is authoritative.
-	if err := m.gameStore.UpdateGameStatus(ctx, gameID, store.GameStatusActive, nil); err != nil {
-		slog.Error("failed to persist ACTIVE status", "gameID", gameID, "error", err)
-	}
-
-	// White always moves first; start the clock for White.
-	session.clock.Start(store.ColorWhite)
-
-	// Send GAME_STATE to the connecting player; OPPONENT_CONNECTED to the waiting player.
+	// First-connect path: game is WAITING_FOR_PLAYER and opponent is not yet connected.
 	m.sendGameState(session, color)
-	m.sendSimple(session, opponentOf(color), MsgTypeOpponentConnected)
-
-	slog.Info("game is now ACTIVE", "gameID", gameID)
 	return nil
 }
 
@@ -364,6 +362,20 @@ func (m *Manager) HandleMessage(ctx context.Context, gameID string, color store.
 	}
 
 	return nil
+}
+
+// GetGame returns the persisted game record for gameID. This is a thin
+// passthrough to the store layer for read-only status queries (e.g. GET
+// /games/:id, PHASE_1.md Step 12) that need no in-memory GameSession state.
+// Routing it through Manager rather than giving internal/api a direct
+// *store.GameStore dependency keeps internal/api's only dependency on the
+// game layer as game.Manager, matching ARCHITECTURE.md's Dependency Graph.
+func (m *Manager) GetGame(ctx context.Context, gameID string) (*store.Game, error) {
+	g, err := m.gameStore.GetGame(ctx, gameID)
+	if err != nil {
+		return nil, fmt.Errorf("Manager.GetGame gameID=%s: %w", gameID, err)
+	}
+	return g, nil
 }
 
 // RestoreActiveGames is called once on server startup. It loads every game with
