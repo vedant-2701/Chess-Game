@@ -10,12 +10,12 @@ This document describes how the chess server is built, why it is built that way,
                           ┌─────────────────────────────────────────┐
                           │              Chess Server               │
                           │                                         │
-  Browser (White) ───WS──►│  ws.Handler                             │
+  Browser (White) ───WS──►│  api.WSHandler                          │
                           │      │                                  │
   Browser (Black) ───WS──►│      ▼                                  │
                           │  game.Manager                           │
                           │      │                                  │
-        REST API ─────────►  api.Handler                            │
+        REST API ─────────►  api.GameHandler                        │
   (POST /games)           │      │                                  │
   (POST /games/:id/join)  │      ▼                                  │
                           │  game.Registry ──► game.Session         │
@@ -45,9 +45,10 @@ Responsible for: WebSocket connection lifecycle only. This layer knows nothing a
 
 - `Connection`: Holds a `*websocket.Conn`, a `send chan []byte`, and manages read/write goroutines independently. The write loop is the only goroutine that calls `conn.WriteMessage` (Gorilla is not concurrent-safe for writes).
 - `Registry`: Thread-safe map of `connectionID → *Connection`. Handles registration, unregistration, and graceful shutdown with the snapshot-then-release pattern to avoid deadlock.
-- `Handler`: Upgrades HTTP to WebSocket, assigns a connectionID, registers into `ws.Registry`, then hands the connection to `game.Manager`.
 
 **This layer does not know what a game is.** It knows how to move bytes. Everything else is the application layer's concern.
+
+**Correction (2026-07-02):** An earlier draft of this document and of `PHASE_1.md` placed the WebSocket upgrade `Handler` inside this package, holding a `*game.Manager` field directly. That is not possible as written: `internal/game` already imports `internal/ws` (for `*ws.Connection`), so `internal/ws` importing `internal/game` back would be a circular import — rejected by the Go compiler, not just a style violation. The upgrade handler lives in `internal/api` (`WSHandler`) instead; see that section below and the Dependency Graph. This keeps the statement above literally true: `internal/ws` genuinely has zero dependency on `internal/game`, not just "ignorant of it" by convention.
 
 ### `internal/game` — Game Application Layer
 
@@ -92,7 +93,10 @@ Two token types exist:
 
 ### `internal/api` — HTTP API Layer
 
-Responsible for: Handling HTTP requests for game creation and joining. WebSocket upgrade is delegated to `ws.Handler`.
+Responsible for: Handling HTTP requests for game creation and joining, and the WebSocket upgrade endpoint. This is the only layer that depends on both `internal/ws` (for `*ws.Connection`, `ws.Registry`) and `internal/game` (for `*game.Manager`) — see Dependency Graph below. `internal/ws` itself has zero knowledge of games; `WSHandler` is what bridges the two.
+
+- `GameHandler` (`internal/api/game_handler.go`, Step 12): `POST /games`, `POST /games/:id/join`, `GET /games/:id`, `GET /health`.
+- `WSHandler` (`internal/api/ws_handler.go`, Step 11): `GET /ws/game/:id`. Verifies the player token, upgrades to WebSocket, registers the connection into `ws.Registry`, and hands off to `game.Manager.HandleConnect` / `HandleMessage` / `HandleDisconnect`.
 
 **Endpoints (Phase 1):**
 
@@ -211,7 +215,7 @@ Client sends: { "type": "MOVE", "san": "e4" }
 Client connects to /ws/game/:id?token=<jwt>
         │
         ▼
-ws.Handler upgrades HTTP to WebSocket
+api.WSHandler upgrades HTTP to WebSocket
         │
         ▼
 auth.VerifyPlayerToken(token) → { gameID, userID, color }
@@ -222,7 +226,7 @@ auth.VerifyPlayerToken(token) → { gameID, userID, color }
 ws.Registry.Register(connID, conn)
         │
         ▼
-game.GameRegistry.RegisterPlayer(gameID, color, conn)
+game.Manager.HandleConnect(ctx, gameID, color, conn)  // internally: registry.Get + session.RegisterConnection/ReplaceConnection
         │
         ├── Game not found → CloseMessage, unregister from ws.Registry
         │
@@ -372,8 +376,9 @@ Persistent clock state. On server restart, the remaining time for both players i
 ```
 cmd/server/main.go
     │
-    ├── internal/api         (chi router, HTTP handlers)
-    │       └── internal/game (game.Manager)
+    ├── internal/api         (chi router, HTTP handlers, WS upgrade)
+    │       ├── internal/game (game.Manager)
+    │       └── internal/ws   (ws.Connection, ws.Registry — types only, not the reverse)
     │
     ├── internal/ws          (WebSocket infrastructure)
     │       └── (no application dependencies)
@@ -393,7 +398,7 @@ cmd/server/main.go
             └── (no application dependencies)
 ```
 
-Dependencies flow downward only. No circular imports. `internal/ws` does not know about `internal/game`. This is enforced by the Go compiler.
+Dependencies flow downward only. No circular imports. `internal/ws` does not know about `internal/game`. This is enforced by the Go compiler — not just a style convention: `internal/api` is the only package permitted to import both `internal/ws` and `internal/game`, since it is the one place both are genuinely needed (bridging an HTTP-upgraded WebSocket connection to a game session).
 
 ---
 
