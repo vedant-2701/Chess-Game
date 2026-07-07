@@ -100,7 +100,7 @@ func NewWSHandler(ctx context.Context, manager *game.Manager, wsRegistry *ws.Reg
 func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	gameID := chi.URLParam(r, "id")
 	if gameID == "" {
-		http.Error(w, "missing game id in URL", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "missing game id in URL")
 		return
 	}
 
