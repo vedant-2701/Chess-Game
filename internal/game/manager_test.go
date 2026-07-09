@@ -522,6 +522,137 @@ func TestManager_RestoreActiveGames_SkipsCompletedGames(t *testing.T) {
 	}
 }
 
+// --- HandleDisconnect ------------------------------------------------
+
+// TestManager_HandleDisconnect_PersistsClockState is a regression test for
+// this session's fix: HandleDisconnect previously only called
+// session.clock.Pause() (in-memory only) and never wrote the paused reading
+// to the database, leaving the DB holding whatever was written after the
+// game's last move. A player who disconnects mid-turn and is then caught by
+// a hard kill -9 (no graceful shutdown) would resume with extra time that
+// was never actually theirs.
+//
+// To make this deterministic without any time.Sleep (forbidden by
+// CODING_GUIDELINES.md §6), the test seeds the DB with a distinctive "stale"
+// sentinel value that is neither InitialTimeMs nor the live clock's actual
+// reading, then asserts the persisted value moves to the live clock's
+// reading, not that it changes by some expected amount over elapsed time.
+// A before/after comparison using only InitialTimeMs would not catch a
+// regression here, since near-zero wall-clock time elapses during the test
+// and the "before" and "after" values would look identical either way if the
+// persist call were silently removed.
+func TestManager_HandleDisconnect_PersistsClockState(t *testing.T) {
+	truncateAll(t)
+	mustCreateUser(t, mgrTestWhiteID)
+	mustCreateUser(t, mgrTestBlackID)
+
+	ctx := context.Background()
+	m := newTestManager(t)
+
+	session, _, err := m.CreateGame(ctx, mgrTestWhiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+	if _, err := m.JoinGame(ctx, session.ID, mgrTestBlackID); err != nil {
+		t.Fatalf("JoinGame: %v", err)
+	}
+	if err := session.Transition(store.GameStatusActive); err != nil {
+		t.Fatalf("Transition to ACTIVE: %v", err)
+	}
+
+	// Seed a distinctive, obviously-wrong DB value before disconnecting.
+	gs := store.NewGameStore(testPool)
+	const staleMs = 999999
+	if err := gs.UpdateClocks(ctx, session.ID, staleMs, staleMs); err != nil {
+		t.Fatalf("seed stale clock: %v", err)
+	}
+
+	// Swap in a clock with known, distinct-from-stale remaining times and
+	// start it for White. Direct field access is legitimate here — same
+	// package — since GameSession exposes no "ReplaceClock" method; nothing
+	// in the public API needs one outside tests.
+	const liveWhiteMs, liveBlackMs int64 = 500000, 480000
+	session.clock = NewClockWithTimes(liveWhiteMs, liveBlackMs)
+	session.clock.Start(store.ColorWhite)
+	t.Cleanup(session.clock.Stop) // avoid leaking the Clock's background goroutine
+
+	m.HandleDisconnect(ctx, session.ID, store.ColorWhite)
+
+	game, err := gs.GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame after disconnect: %v", err)
+	}
+
+	if game.WhiteTimeMs == staleMs || game.BlackTimeMs == staleMs {
+		t.Fatalf("DB clocks still show the stale sentinel after disconnect: white=%d black=%d — persist did not happen",
+			game.WhiteTimeMs, game.BlackTimeMs)
+	}
+
+	// Black was never the active color, so its remaining time must be exactly
+	// unchanged — no wall-clock dependency in this assertion.
+	if game.BlackTimeMs != liveBlackMs {
+		t.Errorf("DB BlackTimeMs after disconnect: got %d, want exactly %d (inactive color, untouched by elapsed time)",
+			game.BlackTimeMs, liveBlackMs)
+	}
+
+	// White was the active, disconnecting color: Pause() deducts real elapsed
+	// time since Start(), so allow a generous bound for test execution
+	// overhead rather than asserting exact equality.
+	if game.WhiteTimeMs > liveWhiteMs {
+		t.Errorf("DB WhiteTimeMs after disconnect: got %d, want <= %d (Pause must not increase remaining time)",
+			game.WhiteTimeMs, liveWhiteMs)
+	}
+	const maxElapsedToleranceMs = 5000
+	if liveWhiteMs-game.WhiteTimeMs > maxElapsedToleranceMs {
+		t.Errorf("DB WhiteTimeMs after disconnect: got %d, more than %dms below the live reading %d — suspicious for a test with no real gameplay delay",
+			game.WhiteTimeMs, maxElapsedToleranceMs, liveWhiteMs)
+	}
+
+	// In-memory session state must also reflect the persisted values
+	// (HandleDisconnect calls session.UpdateClocks alongside the DB write).
+	snap := session.CurrentStateSnapshot()
+	if snap.WhiteTimeMs != game.WhiteTimeMs || snap.BlackTimeMs != game.BlackTimeMs {
+		t.Errorf("in-memory session clocks (white=%d black=%d) do not match persisted DB clocks (white=%d black=%d)",
+			snap.WhiteTimeMs, snap.BlackTimeMs, game.WhiteTimeMs, game.BlackTimeMs)
+	}
+}
+
+// TestManager_HandleDisconnect_ClockNotStarted_NoOp covers the defensive
+// branch: a player disconnecting before the clock has ever been started
+// (e.g. White created a game and disconnected again before Black joined)
+// must not attempt to persist clock state at all — IsStarted() gates the
+// entire block. This also guards against a nil-handling regression if the
+// gating condition were ever removed.
+func TestManager_HandleDisconnect_ClockNotStarted_NoOp(t *testing.T) {
+	truncateAll(t)
+	mustCreateUser(t, mgrTestWhiteID)
+
+	ctx := context.Background()
+	m := newTestManager(t)
+
+	session, _, err := m.CreateGame(ctx, mgrTestWhiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+
+	if session.clock.IsStarted() {
+		t.Fatal("precondition failed: freshly created session's clock must not be started yet")
+	}
+
+	// Must not panic and must not touch the DB clock columns.
+	m.HandleDisconnect(ctx, session.ID, store.ColorWhite)
+
+	gs := store.NewGameStore(testPool)
+	game, err := gs.GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame after disconnect: %v", err)
+	}
+	if game.WhiteTimeMs != InitialTimeMs || game.BlackTimeMs != InitialTimeMs {
+		t.Errorf("DB clocks changed despite clock never having started: white=%d black=%d, want both %d",
+			game.WhiteTimeMs, game.BlackTimeMs, InitialTimeMs)
+	}
+}
+
 func TestManager_RestoreActiveGames_MultipleGamesIndependentFailureIsolation(t *testing.T) {
 	// One game with an unreplayable move sequence must not prevent other,
 	// valid games from being restored. RestoreActiveGames logs and skips

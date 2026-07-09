@@ -1,3 +1,80 @@
+## Session Summary — Step 13 Wiring, E2E Bug Fixes
+
+### What Was Built
+
+- **`internal/api/game_handler_test.go`** (new) — 12 integration tests closing the Step 12 gap flagged at session start: `CreateGame` (success + token-claims verification, invalid UUID → 400, malformed JSON → 400), `JoinGame` (success, game-not-found → 404, already-joined → 409, self-play → 409, invalid UUID → 400), `GetGame` (success, not-found → 404), and `Health` (asserts the response body has **no** top-level `"data"` key, not just `status == "ok"`, so a future regression to the enveloped format would actually be caught). Reuses the real unexported response types (`createGameResponseData`, `errorDetail`, etc.) rather than parallel test structs, and drives setup through the HTTP layer itself rather than calling `Manager` directly.
+- **`cmd/server/main.go`** (new) — full Step 13 wiring: env-based `config` with fail-fast on missing `DATABASE_URL`/`JWT_SECRET`, `store.NewPool`, `runMigrations` via golang-migrate's `pgx5://`-scheme driver (scheme verified directly against the driver's `init()` source, not assumed), full dependency graph construction in ARCHITECTURE.md's stated order, `RestoreActiveGames`, the ADR-018 server-lifetime context, `api.NewRouter`, and a 5-step `shutdown()` sequence (HTTP drain → cancel WS context → `wsRegistry.CloseAll()` → `PersistActiveClockState` → pool close).
+- **`cmd/server/main_test.go`** (new) — unit tests for `loadConfig` (missing `DATABASE_URL`/`JWT_SECRET`, defaults for optional vars, explicit pass-through) and table-driven `parseLogLevel`.
+- **`internal/game/manager.go`** — `HandleDisconnect` now persists paused clock state to the DB (previously in-memory only — a real gap against PHASE_1.md acceptance criterion #3, found by direct code review before Step 13 was written). New `Manager.PersistActiveClockState(ctx)` for the shutdown-time defense-in-depth flush. Both later revised (see Problems Encountered) to fix a shutdown-time context-cancellation bug caught by real E2E testing.
+- **`internal/game/manager_test.go`** — `TestManager_HandleDisconnect_PersistsClockState` (regression test using a distinctive "stale sentinel" DB seed so it's deterministic without `time.Sleep`) and `TestManager_HandleDisconnect_ClockNotStarted_NoOp`.
+- **`internal/game/session.go`** — new `GameSession.CloseConnections(statusCode int, reason string)`, sending a close frame to both players and clearing their connection slots.
+- **`internal/game/messages.go`** — new `wsCloseNormal = 1000` constant (RFC 6455 normal closure), kept as a bare int rather than importing `gorilla/websocket` into `internal/game`.
+- **`internal/api/ws_handler.go`** — one-line fix threading `h.ctx` into the now-context-taking `HandleDisconnect` call.
+- **`internal/api/ws_handler_test.go`** — new `TestWSHandler_GameOver_ClosesConnectionsAfterDelivery`, using real dialed WebSocket connections (not fakes) to prove both that connections close after game-over **and** that `GAME_OVER` is strictly delivered before the close frame — the second assertion is what actually exercises the ordering fix, not just "eventually closed."
+- **`Makefile`** — `test-integration` target updated to run with `-p 1` (done by user, confirmed working; not re-touched this session).
+
+### Decisions Made
+
+- **`GET /health`'s flat (non-enveloped) response — explicitly confirmed this session**, resolving the item that was previously "pending sign-off." Rationale: health checks are consumed by infrastructure that expects a trivial top-level shape, not application clients; PHASE_1.md's own spec example is flat; kept as a narrow, documented exception to CODING_GUIDELINES §7, not precedent for anything else.
+- **Migrations run automatically on `main.go` startup — kept, not reverted.** Flagged as **TD-008** (below) rather than an ADR, since there's no competing design being chosen between right now — just an accepted Phase 1 simplification with an explicit revisit trigger (Phase 2 multi-instance deployment, where this becomes a real lock-contention and privilege-separation problem).
+- **Two decisions from this session should be formally logged as ADRs next session — flagging now, not yet written into `DECISIONS_LOG_PHASE_1.md`:**
+  1. **Detached-context pattern for `HandleDisconnect`'s clock-persist write.** Uses `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)` instead of the caller's context directly, because ADR-018's own cancellation ordering (cancel server-lifetime context *before* `ws.Registry.CloseAll()`) guarantees that context is already cancelled by the time `CloseAll`-triggered disconnects reach this code — the persist would fail on **every** graceful shutdown, not as a rare race. This is a genuine architectural decision (reorder shutdown vs. detach the context) with real tradeoffs, same category as ADR-014/016/017.
+  2. **`GameSession.CloseConnections` must only be called from the same goroutine, immediately after, whichever call sent the terminal `GAME_OVER` message** (`startEventSubscriber`'s terminal branch, `publishGameOver`'s fallback) — never from `Manager.finalizeGame`, which runs on a different goroutine and would race the close frame against `GAME_OVER`'s own delivery through the shared per-connection outbound queue. Confirmed via direct reading of `eventbus.go`: `LocalEventBus.Publish`'s buffered-channel send only guarantees the event was *enqueued*, not that the subscriber goroutine has processed it yet.
+
+### Tradeoffs Considered
+
+- **Reordering `main.go`'s shutdown steps** (`CloseAll()` before `cancelWSCtx()`) instead of detaching the persist context — rejected because it would reopen the exact race ADR-018 was written to prevent on the `HandleMessage` side (in-flight move processing continuing after connections are force-closed).
+- **Closing connections from `finalizeGame`** (one centralized call site, simpler) vs. from the terminal-broadcast goroutine (correct ordering, two call sites) — chose correctness over centralization once the buffered-channel semantics were confirmed; a doc-comment warning was added to `finalizeGame` specifically to prevent a future session from "simplifying" this back into the race.
+- **Testing the close-after-game-over fix at the `internal/game` package level** (constructing fake `*ws.Connection`s) vs. `internal/api` with real dialed WebSocket connections through the actual `WSHandler` — chose the latter, since the bug is fundamentally about wire-level byte ordering, which fake connections can't demonstrate.
+
+### Lessons Learned
+
+- A context's cancellation timing, chosen correctly for one operation (ADR-018's `HandleMessage` safety), can silently poison a *different* operation (the new clock-persist write) once both are wired through the same shared context — adding new I/O to an existing ctx-taking function requires re-examining the caller's cancellation lifecycle, not just adding the parameter mechanically.
+- A buffered channel's successful send (`Publish` returning `nil`) does not mean the consumer has processed the value yet — assuming synchronous-like ordering from an actually-async primitive nearly produced a second production bug (closing connections from the wrong goroutine) before `eventbus.go` was checked directly.
+- Manual E2E testing (real process, real `Ctrl+C`, real `wscat` terminals) caught two real bugs that the full `-race -tags integration` suite and gopls diagnostics missed entirely — validates PHASE_1.md's decision to make Step 14 a separate, mandatory, non-automated checklist rather than folding it into Step 1–13's test coverage.
+
+### Problems Encountered
+
+- **Graceful shutdown logged `"context canceled"` on every clock-persist attempt** — not a rare race, 100% reproducible, caught directly from the user's terminal output. Root cause and fix described above.
+- **WebSocket connections never closed after game-over** — user observed this directly via resignation testing (`wscat` stayed open, further messages produced silent non-responses). `finalizeGame` never touched connections at all; fixed via `CloseConnections`, placed carefully to avoid a second, more subtle bug (message-ordering race against `GAME_OVER`).
+- **Self-inflicted, caught before handoff:** while drafting `manager_test.go`'s new tests, introduced a broken comment (missing `//` prefix on a continuation line) and a leftover dead-code fragment. Caught by immediate re-read before the user built anything — not by a failed build.
+
+### Checklist Progress
+
+- ✅ `game_handler_test.go` — Step 12 test gap fully closed
+- ✅ Step 13 (`cmd/server/main.go`) — implemented; `go build`/`go vet`/`go test -race`/`go test -race -tags integration -p 1` all confirmed passing
+- ✅ `cmd/server/main_test.go` — `loadConfig`/`parseLogLevel` unit coverage
+- ✅ `TestManager_HandleDisconnect_PersistsClockState` / `_ClockNotStarted_NoOp` — added, confirmed passing
+- ✅ PHASE_1.md Step 14 (E2E manual verification) — health check, create/join, move pipeline, turn/illegal-move rejection, reconnection, and kill-9 restart all exercised successfully; graceful shutdown and resignation both surfaced real bugs, now fixed
+- 🔄 TD-008 — documented, correctly deferred to pre-Phase-2 work, not yet resolved
+
+### Technical Debt Introduced
+
+**TD-008**: Migrations run automatically on server startup (`cmd/server/main.go`'s `runMigrations`, called unconditionally before the dependency graph is constructed). Acceptable for Phase 1's single-instance deployment (ROADMAP.md explicitly defers the multi-instance problem to Phase 2). Must be revisited before Phase 2 ships multiple concurrent instances — they will contend on golang-migrate's Postgres advisory lock during startup, coupling pod-readiness time to lock contention, and an app process with DDL privileges widens blast radius unnecessarily. Migration execution should likely move to a separate deploy step (CI job, `make migrate-up` as a pre-deploy gate) decoupled from application boot. | Phase introduced: 1 (Step 13) | Must fix by: Phase 2
+
+No other new technical debt — the two bugs fixed this session were correctness fixes closing real gaps, not shortcuts trading correctness for speed.
+
+### Files Modified
+
+**Created:**
+- `internal/api/game_handler_test.go`
+- `cmd/server/main.go`
+- `cmd/server/main_test.go`
+
+**Modified:**
+- `internal/game/manager.go` — `HandleDisconnect` ctx signature + clock persist + detached-context fix; new `PersistActiveClockState`; `publishGameOver` fallback close; `startEventSubscriber` close-after-`GAME_OVER`; `finalizeGame` doc comment warning
+- `internal/game/session.go` — new `CloseConnections` method
+- `internal/game/messages.go` — new `wsCloseNormal` constant
+- `internal/game/manager_test.go` — two new `HandleDisconnect` tests
+- `internal/api/ws_handler.go` — pass `h.ctx` into `HandleDisconnect`
+- `internal/api/ws_handler_test.go` — new `TestWSHandler_GameOver_ClosesConnectionsAfterDelivery` + `assertConnectionClosedNormally` helper
+- `Makefile` — `test-integration` target uses `-p 1` (done by user)
+
+---
+
+## PART 2 — UPDATED CLAUDE.md
+
+```markdown
 # CLAUDE.md — Session Context Document
 
 This file is the authoritative context document for AI-assisted development sessions on this project.
@@ -701,3 +778,4 @@ pool.Close()                           // 5. close DB pool
 | 9 | 2026-07-01 | Pre-Step-11 hardening: ADR-014, ADR-015, ADR-016 found/fixed/tested |
 | 10 | 2026-07-02 to 2026-07-06 | ADR-017, ADR-018. Handler relocated to `internal/api`. Steps 11–12 complete |
 | 11 | 2026-07-08 to 2026-07-09 | **Step 12 test gap closed** (`game_handler_test.go`, 12 tests). **`/health` flat response explicitly confirmed.** **Step 13 complete**: `cmd/server/main.go` full wiring, `main_test.go`. **`HandleDisconnect` clock-persist fix** (found via code review before Step 13 was written) — required ctx-taking signature change; new `PersistActiveClockState`; regression tests added. **Manual E2E testing (PHASE_1.md Step 14) began** and found two real bugs missed by the full automated test suite: (1) graceful shutdown's clock-persist write failing on every run with `"context canceled"`, root-caused to ADR-018's cancel-before-CloseAll ordering poisoning the new I/O — fixed via a detached `context.WithoutCancel` + timeout; (2) WebSocket connections never closing after a game ends (observed via resignation) — root-caused to `finalizeGame` never touching connections at all, fixed via new `GameSession.CloseConnections`, deliberately placed in the same goroutine as the `GAME_OVER` send (not `finalizeGame`) after tracing `eventbus.go`'s buffered-channel semantics to find a real ordering race in the naive fix. New regression test `TestWSHandler_GameOver_ClosesConnectionsAfterDelivery` using real dialed WebSocket connections. `Makefile`'s `test-integration` target fixed to run with `-p 1` after user diagnosed a cross-package DB collision from Go's default parallel package test execution. **TD-008 logged** (automatic migrations on startup, accepted for Phase 1, must revisit before Phase 2). **Two ADR candidates flagged, not yet formally logged**: detached-context pattern for cleanup writes; same-goroutine ordering requirement for connection-close-after-terminal-broadcast. |
+```

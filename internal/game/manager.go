@@ -281,9 +281,15 @@ func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.
 }
 
 // HandleDisconnect clears the player's connection slot, notifies the opponent,
-// pauses the clock, and starts a 60-second abandonment timer. If the player
-// reconnects before the timer fires, HandleConnect cancels it.
-func (m *Manager) HandleDisconnect(gameID string, color store.Color) {
+// pauses and persists the clock, and starts a 60-second abandonment timer. If
+// the player reconnects before the timer fires, HandleConnect cancels it.
+//
+// ctx is the caller's (WSHandler's ADR-018 server-lifetime context, threaded
+// through from ws.Connection.Start's onClose callback). HandleDisconnect now
+// performs I/O (the clock persist below), so per CODING_GUIDELINES.md §2 it
+// takes context.Context as its first argument — this was not required when
+// the function was pure in-memory bookkeeping.
+func (m *Manager) HandleDisconnect(ctx context.Context, gameID string, color store.Color) {
 	session, err := m.registry.Get(gameID)
 	if err != nil {
 		return // Session already cleaned up (completed game).
@@ -297,13 +303,90 @@ func (m *Manager) HandleDisconnect(gameID string, color store.Color) {
 	session.ClearConnection(color)
 	m.sendSimple(session, opponentOf(color), MsgTypeOpponentDisconnected)
 
-	// Pause the active clock on any disconnect (TD-002).
+	// Pause the active clock on any disconnect (TD-002) and persist the
+	// paused reading immediately.
+	//
+	// Prior to this fix, Pause() only updated in-memory state — the database
+	// still held whatever was written after the game's last move. A player
+	// who disconnects mid-turn, sits idle, and is then caught by a hard
+	// kill -9 (no graceful shutdown, so no shutdown-time flush ever runs)
+	// would resume on restart with extra time it shouldn't have: the elapsed
+	// gap between the last move and the disconnect was never recorded.
+	// Persisting here — at the moment of disconnect, not at shutdown — is
+	// what actually closes that gap and is what PHASE_1.md acceptance
+	// criterion #3 ("killing the server process ... resumes correctly")
+	// depends on. See also PersistActiveClockState, which is a complementary,
+	// not overlapping, fix for the *still-connected-at-graceful-shutdown*
+	// case.
 	if session.clock.IsStarted() {
 		session.clock.Pause()
+
+		whiteMs := session.clock.TimeRemaining(store.ColorWhite).Milliseconds()
+		blackMs := session.clock.TimeRemaining(store.ColorBlack).Milliseconds()
+		session.UpdateClocks(whiteMs, blackMs)
+
+		// Deliberately NOT using ctx directly here. During graceful shutdown,
+		// main.go's shutdown() cancels the ADR-018 server-lifetime context
+		// BEFORE calling ws.Registry.CloseAll() (required so in-flight
+		// HandleMessage calls observe cancellation before connections are
+		// force-closed). CloseAll then triggers this exact code path for
+		// every connected player via each connection's onClose callback — if
+		// this call used ctx directly, it would fail with "context canceled"
+		// on every single graceful shutdown, not as a rare edge case. Confirmed
+		// by real E2E testing (PHASE_1.md Step 14): the first version of this
+		// fix logged this exact error on every Ctrl+C.
+		//
+		// This write is a bounded, best-effort cleanup operation, not
+		// something that should be aborted just because the broader
+		// connection-lifetime context was cancelled — context.WithoutCancel
+		// detaches it from that cancellation while still bounding it with its
+		// own short timeout so a truly stuck DB call can't hang shutdown.
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		if err := m.gameStore.UpdateClocks(persistCtx, gameID, whiteMs, blackMs); err != nil {
+			slog.Error("Manager.HandleDisconnect: failed to persist clock state on pause",
+				"gameID", gameID, "color", color, "error", err)
+		}
+		cancel()
 	}
 
 	m.startAbandonTimer(gameID, color)
 	slog.Debug("player disconnected", "gameID", gameID, "color", color)
+}
+
+// PersistActiveClockState flushes every currently-registered game's live
+// clock reading to the database. Called once, during graceful shutdown
+// (Step 13's "persist clock state" requirement), after ws.Registry.CloseAll
+// has forced every connection closed.
+//
+// With HandleDisconnect's clock-persist fix in place, this is largely
+// redundant for the common case: CloseAll disconnects every connected
+// player, and each of those disconnects now self-persists via
+// HandleDisconnect before CloseAll's wait returns. This method exists as
+// defense-in-depth (a connection whose cleanup didn't complete before
+// CloseAll's wait timeout would otherwise be missed) and, more importantly,
+// as an explicit, auditable step in main.go's shutdown sequence that maps
+// directly onto PHASE_1.md's checklist wording — the requirement shouldn't
+// only be an emergent side effect of connection-cleanup ordering.
+//
+// This does not eliminate clock drift on an ungraceful kill -9: no signal is
+// delivered in that case, so neither this method nor HandleDisconnect's own
+// disconnect-triggered path ever runs for still-connected players. What
+// HandleDisconnect's fix does guarantee is that drift is bounded by "time
+// since the game's last move or last disconnect event," not by "time since
+// the game's last move," regardless of how the process ends. That residual
+// bound is an accepted Phase 1 limitation alongside TD-002, not something
+// addressable without a periodic clock-persist ticker — out of Phase 1 scope.
+func (m *Manager) PersistActiveClockState(ctx context.Context) {
+	sessions := m.registry.AllActive()
+	for _, session := range sessions {
+		whiteMs := session.clock.TimeRemaining(store.ColorWhite).Milliseconds()
+		blackMs := session.clock.TimeRemaining(store.ColorBlack).Milliseconds()
+		if err := m.gameStore.UpdateClocks(ctx, session.ID, whiteMs, blackMs); err != nil {
+			slog.Error("Manager.PersistActiveClockState: failed to persist clock state",
+				"gameID", session.ID, "error", err)
+		}
+	}
+	slog.Info("PersistActiveClockState complete", "count", len(sessions))
 }
 
 // HandleMessage parses and routes an incoming WebSocket message from a player.
@@ -638,6 +721,14 @@ func (m *Manager) onAbandonTimeout(gameID string, color store.Color) {
 // Without this, completed/abandoned sessions remain in GameRegistry for the
 // lifetime of the process — unbounded memory growth, not a goroutine leak
 // (the EventBus subscriber already self-terminates on GAME_OVER).
+//
+// Deliberately does NOT close player WebSocket connections — do not add that
+// here. finalizeGame runs on a different goroutine than whichever goroutine
+// sent GAME_OVER (the EventBus subscriber, or publishGameOver's fallback),
+// and closing connections from here would race the close frame against
+// GAME_OVER's own delivery through the same per-connection outbound queue.
+// See GameSession.CloseConnections' doc comment for the full reasoning and
+// the two correct call sites.
 func (m *Manager) finalizeGame(gameID string) {
 	m.cancelAbandonTimer(gameID, store.ColorWhite)
 	m.cancelAbandonTimer(gameID, store.ColorBlack)
@@ -664,6 +755,10 @@ func (m *Manager) publishGameOver(ctx context.Context, session *GameSession, out
 		slog.Error("Manager.publishGameOver: EventBus publish failed — sending directly",
 			"gameID", session.ID, "error", err)
 		session.SendToBothPlayers(payload)
+		// Same-goroutine, immediately-after ordering as startEventSubscriber's
+		// GAME_OVER branch — see CloseConnections' doc comment for why this
+		// can't safely be done from finalizeGame instead.
+		session.CloseConnections(wsCloseNormal, "game ended")
 	}
 }
 
@@ -673,6 +768,18 @@ func (m *Manager) startEventSubscriber(session *GameSession, ch <-chan GameEvent
 		for event := range ch {
 			session.SendToBothPlayers(event.Payload)
 			if event.Type == MsgTypeGameOver {
+				// GAME_OVER is terminal. Close both players' connections now,
+				// in this same goroutine, immediately after the send above —
+				// not from finalizeGame, which runs on a different goroutine
+				// and would race this close frame against GAME_OVER's
+				// delivery through the shared per-connection outbound queue
+				// (LocalEventBus.Publish's channel send only guarantees the
+				// event was enqueued for this goroutine to pick up, not that
+				// this goroutine has run yet — see eventbus.go). Same-goroutine
+				// program order is what actually guarantees GAME_OVER reaches
+				// the wire before the close frame. See CloseConnections' doc
+				// comment for the full reasoning.
+				session.CloseConnections(wsCloseNormal, "game ended")
 				return
 			}
 		}

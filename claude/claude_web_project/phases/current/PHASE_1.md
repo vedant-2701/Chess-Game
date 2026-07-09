@@ -376,13 +376,13 @@ When the timer fires, the outcome depends on whether the *opponent* is connected
 Items must be completed in order within each section. Do not skip ahead.
 
 ### Step 1: Project Scaffold
-- [ ] `go mod init github.com/<username>/chess-server`
-- [ ] Add all dependencies to go.mod and run `go mod tidy`
-- [ ] Create directory structure as defined in ARCHITECTURE.md
-- [ ] Create `docker-compose.yml` (PostgreSQL 16, Redis placeholder commented out)
-- [ ] Create `.env.example` with all required environment variables
-- [ ] Create `Makefile` with: run, build, test, test-race, migrate-up, migrate-down, docker-up, docker-down, lint
-- [ ] Verify `make docker-up` starts PostgreSQL successfully
+- [x] `go mod init github.com/<username>/chess-server`
+- [x] Add all dependencies to go.mod and run `go mod tidy`
+- [x] Create directory structure as defined in ARCHITECTURE.md
+- [x] Create `docker-compose.yml` (PostgreSQL 16, Redis placeholder commented out)
+- [x] Create `.env.example` with all required environment variables
+- [x] Create `Makefile` with: run, build, test, test-race, migrate-up, migrate-down, docker-up, docker-down, lint
+- [x] Verify `make docker-up` starts PostgreSQL successfully
 
 **Dependencies to add:**
 ```
@@ -398,108 +398,108 @@ github.com/stretchr/testify v1.x.x
 ---
 
 ### Step 2: Database Migrations
-- [ ] Migration 001 up/down: `users` table
-- [ ] Migration 002 up/down: `games` table with all columns and constraints
-- [ ] Migration 003 up/down: `moves` table with indexes
-- [ ] Verify `make migrate-up` applies all three migrations cleanly
-- [ ] Verify `make migrate-down` rolls back one migration at a time
-- [ ] Verify `make migrate-up` is idempotent (run twice, no error)
+- [x] Migration 001 up/down: `users` table
+- [x] Migration 002 up/down: `games` table with all columns and constraints
+- [x] Migration 003 up/down: `moves` table with indexes
+- [x] Verify `make migrate-up` applies all three migrations cleanly
+- [x] Verify `make migrate-down` rolls back one migration at a time
+- [x] Verify `make migrate-up` is idempotent (run twice, no error)
 
 Schema is defined in ARCHITECTURE.md. Do not deviate from it without updating ARCHITECTURE.md.
 
 ---
 
 ### Step 3: Store Layer
-- [ ] `internal/store/postgres.go`: `NewPool(ctx, databaseURL)` returning `*pgxpool.Pool`
-- [ ] `internal/store/game_store.go`:
-  - [ ] `CreateGame(ctx, game *Game) error`
-  - [ ] `GetGame(ctx, id string) (*Game, error)` — returns `ErrGameNotFound` if not found
-  - [ ] `UpdateGameStatus(ctx, id string, status GameStatus, outcome *Outcome) error`
-  - [ ] `UpdateCurrentFEN(ctx, id string, fen string) error`
-  - [ ] `UpdatePlayerBlack(ctx, id string, playerBlackID string) error`
-  - [ ] `GetActiveGames(ctx) ([]*Game, error)` — for server restart recovery
-  - [ ] `UpdateClocks(ctx, id string, whiteMs, blackMs int64) error`
-- [ ] `internal/store/move_store.go`:
-  - [ ] `SaveMove(ctx, move *Move) error`
-  - [ ] `GetMovesForGame(ctx, gameID string) ([]*Move, error)`
-- [ ] `internal/store/user_store.go`:
-  - [ ] `CreateOrGetUser(ctx, userID string) (*User, error)` — upsert: inserts the user record if the userID does not exist, returns the existing record if it does
-  - [ ] `GetUser(ctx, id string) (*User, error)` — returns `ErrUserNotFound` if not found
-- [ ] Unit tests for all store methods (integration tag, real PostgreSQL)
-- [ ] Verify error wrapping: all errors include function name and relevant IDs
+- [x] `internal/store/postgres.go`: `NewPool(ctx, databaseURL)` returning `*pgxpool.Pool`
+- [x] `internal/store/game_store.go`:
+  - [x] `CreateGame(ctx, game *Game) error`
+  - [x] `GetGame(ctx, id string) (*Game, error)` — returns `ErrGameNotFound` if not found
+  - [x] `UpdateGameStatus(ctx, id string, status GameStatus, outcome *Outcome) error`
+  - [x] `UpdateCurrentFEN(ctx, id string, fen string) error`
+  - [x] `UpdatePlayerBlack(ctx, id string, playerBlackID string) error`
+  - [x] `GetActiveGames(ctx) ([]*Game, error)` — for server restart recovery
+  - [x] `UpdateClocks(ctx, id string, whiteMs, blackMs int64) error`
+- [x] `internal/store/move_store.go`:
+  - [x] `SaveMove(ctx, move *Move) error`
+  - [x] `GetMovesForGame(ctx, gameID string) ([]*Move, error)`
+- [x] `internal/store/user_store.go`:
+  - [x] `CreateOrGetUser(ctx, userID string) (*User, error)` — upsert: inserts the user record if the userID does not exist, returns the existing record if it does
+  - [x] `GetUser(ctx, id string) (*User, error)` — returns `ErrUserNotFound` if not found
+- [x] Unit tests for all store methods (integration tag, real PostgreSQL)
+- [x] Verify error wrapping: all errors include function name and relevant IDs
 
 ---
 
 ### Step 4: Auth Layer
-- [ ] `internal/auth/token.go`:
-  - [ ] `PlayerClaims` struct: `{ GameID, UserID, Color, RegisteredClaims }`
-  - [ ] `SignPlayerToken(claims PlayerClaims, secret string) (string, error)`
-  - [ ] `VerifyPlayerToken(token string, secret string) (*PlayerClaims, error)`
-- [ ] Unit tests:
-  - [ ] Valid token signs and verifies correctly
-  - [ ] Expired token returns error
-  - [ ] Tampered token returns error
-  - [ ] Wrong secret returns error
+- [x] `internal/auth/token.go`:
+  - [x] `PlayerClaims` struct: `{ GameID, UserID, Color, RegisteredClaims }`
+  - [x] `SignPlayerToken(claims PlayerClaims, secret string) (string, error)`
+  - [x] `VerifyPlayerToken(token string, secret string) (*PlayerClaims, error)`
+- [x] Unit tests:
+  - [x] Valid token signs and verifies correctly
+  - [x] Expired token returns error
+  - [x] Tampered token returns error
+  - [x] Wrong secret returns error
 
 ---
 
 ### Step 5: Chess Layer
-- [ ] `internal/chess/validator.go`:
-  - [ ] `NewValidator() *Validator`
-  - [ ] `NewGame() *chess.Game` — returns starting position
-  - [ ] `GameFromFEN(fen string) (*chess.Game, error)`
-  - [ ] `GameFromMoves(moves []string) (*chess.Game, error)` — replay move history
-  - [ ] `ValidateAndApply(game *chess.Game, san string) (*chess.Game, error)`
-  - [ ] DetectOutcome: given a game state, return whether the game is over, who won (or draw), and the reason (checkmate/stalemate). Exact signature decided at implementation time.
-  - [ ] `CurrentFEN(game *chess.Game) string`
-  - [ ] `MoveHistory(game *chess.Game) []string`
-- [ ] Unit tests:
-  - [ ] Valid moves apply correctly
-  - [ ] Illegal moves return error (wrong turn, illegal piece movement)
-  - [ ] Checkmate detected on Scholar's mate position
-  - [ ] Stalemate detected
-  - [ ] En passant validates correctly
-  - [ ] Castling validates correctly
-  - [ ] FEN round-trips (GameFromFEN then CurrentFEN returns same FEN)
+- [x] `internal/chess/validator.go`:
+  - [x] `NewValidator() *Validator`
+  - [x] `NewGame() *chess.Game` — returns starting position
+  - [x] `GameFromFEN(fen string) (*chess.Game, error)`
+  - [x] `GameFromMoves(moves []string) (*chess.Game, error)` — replay move history
+  - [x] `ValidateAndApply(game *chess.Game, san string) (*chess.Game, error)`
+  - [x] DetectOutcome: given a game state, return whether the game is over, who won (or draw), and the reason (checkmate/stalemate). Exact signature decided at implementation time.
+  - [x] `CurrentFEN(game *chess.Game) string`
+  - [x] `MoveHistory(game *chess.Game) []string`
+- [x] Unit tests:
+  - [x] Valid moves apply correctly
+  - [x] Illegal moves return error (wrong turn, illegal piece movement)
+  - [x] Checkmate detected on Scholar's mate position
+  - [x] Stalemate detected
+  - [x] En passant validates correctly
+  - [x] Castling validates correctly
+  - [x] FEN round-trips (GameFromFEN then CurrentFEN returns same FEN)
 
 ---
 
 ### Step 6: Game Session and Registry
-- [ ] `internal/game/session.go`:
-  - [ ] `GameSession` struct (see ARCHITECTURE.md for fields)
-  - [ ] `NewGameSession(id string, whiteID string) *GameSession`
-  - [ ] `SetPlayerBlack(userID string)`
-  - [ ] `RegisterConnection(color Color, conn *ws.Connection) error`
-  - [ ] `ReplaceConnection(color Color, conn *ws.Connection)` — for reconnection
-  - [ ] `ClearConnection(color Color)` — on disconnect
-  - [ ] `BothPlayersConnected() bool`
-  - [ ] `Transition(newState GameState) error` — validates legal transitions
-  - [ ] `CurrentStateSnapshot() GameStateSnapshot` — thread-safe read of full state
-- [ ] `internal/game/registry.go`:
-  - [ ] `GameRegistry` struct
-  - [ ] `NewGameRegistry() *GameRegistry`
-  - [ ] `Register(session *GameSession)`
-  - [ ] `Get(gameID string) (*GameSession, error)`
-  - [ ] `Unregister(gameID string)`
-  - [ ] `AllActive() []*GameSession` — for server restart / clock recovery
-- [ ] Unit tests for state machine transitions (all valid and invalid transitions)
+- [x] `internal/game/session.go`:
+  - [x] `GameSession` struct (see ARCHITECTURE.md for fields)
+  - [x] `NewGameSession(id string, whiteID string) *GameSession`
+  - [x] `SetPlayerBlack(userID string)`
+  - [x] `RegisterConnection(color Color, conn *ws.Connection) error`
+  - [x] `ReplaceConnection(color Color, conn *ws.Connection)` — for reconnection
+  - [x] `ClearConnection(color Color)` — on disconnect
+  - [x] `BothPlayersConnected() bool`
+  - [x] `Transition(newState GameState) error` — validates legal transitions
+  - [x] `CurrentStateSnapshot() GameStateSnapshot` — thread-safe read of full state
+- [x] `internal/game/registry.go`:
+  - [x] `GameRegistry` struct
+  - [x] `NewGameRegistry() *GameRegistry`
+  - [x] `Register(session *GameSession)`
+  - [x] `Get(gameID string) (*GameSession, error)`
+  - [x] `Unregister(gameID string)`
+  - [x] `AllActive() []*GameSession` — for server restart / clock recovery
+- [x] Unit tests for state machine transitions (all valid and invalid transitions)
 
 ---
 
 ### Step 7: EventBus
-- [ ] `internal/game/eventbus.go`:
-  - [ ] `GameEvent` struct: `{ GameID string, Type string, Payload []byte }`
-  - [ ] `EventBus` interface: `Publish`, `Subscribe`
-  - [ ] `LocalEventBus` implementation (in-process, for Phase 1)
-  - [ ] `NewLocalEventBus() *LocalEventBus`
-- [ ] Unit tests: publish then subscribe receives event, unsubscribe stops delivery
+- [x] `internal/game/eventbus.go`:
+  - [x] `GameEvent` struct: `{ GameID string, Type string, Payload []byte }`
+  - [x] `EventBus` interface: `Publish`, `Subscribe`
+  - [x] `LocalEventBus` implementation (in-process, for Phase 1)
+  - [x] `NewLocalEventBus() *LocalEventBus`
+- [x] Unit tests: publish then subscribe receives event, unsubscribe stops delivery
 
 ---
 
 ### Step 8: Move Pipeline
-- [ ] `internal/game/move.go`:
-  - [ ] `MoveProcessor` struct (depends on: chess.Validator, store.GameStore, store.MoveStore, EventBus)
-  - [ ] `ProcessMove(ctx context.Context, session *GameSession, color Color, san string) error`
+- [x] `internal/game/move.go`:
+  - [x] `MoveProcessor` struct (depends on: chess.Validator, store.GameStore, store.MoveStore, EventBus)
+  - [x] `ProcessMove(ctx context.Context, session *GameSession, color Color, san string) error`
     - Validates it is the correct player's turn
     - Validates move legality
     - Persists move to database
@@ -507,51 +507,51 @@ Schema is defined in ARCHITECTURE.md. Do not deviate from it without updating AR
     - Publishes MOVE_APPLIED event via EventBus
     - Checks for game outcome
     - If outcome: updates game status in DB, publishes GAME_OVER event
-- [ ] Integration tests:
-  - [ ] Full move pipeline: receive → persist → broadcast
-  - [ ] Wrong turn: rejected with correct error
-  - [ ] Illegal move: rejected, board state unchanged
-  - [ ] Database failure during persist: move rejected, board state unchanged
-  - [ ] Checkmate detected and GAME_OVER published
+- [x] Integration tests:
+  - [x] Full move pipeline: receive → persist → broadcast
+  - [x] Wrong turn: rejected with correct error
+  - [x] Illegal move: rejected, board state unchanged
+  - [x] Database failure during persist: move rejected, board state unchanged
+  - [x] Checkmate detected and GAME_OVER published
 
 ---
 
 ### Step 9: Clock
-- [ ] `internal/game/clock.go`:
-  - [ ] `Clock` struct: per-player timers, active color tracking
-  - [ ] `NewClock(initialMs int64) *Clock`
-  - [ ] `Start(color Color)` — begins counting down for that color
-  - [ ] `Switch()` — stops active color's clock, starts opponent's
-  - [ ] `Pause()` — stops active clock without switching (on disconnect)
-  - [ ] `Resume(color Color)` — resumes paused clock for given color
-  - [ ] `TimeRemaining(color Color) time.Duration`
-  - [ ] `SetTimeoutCallback(fn func(Color))` — called when a clock hits zero
-  - [ ] Clock goroutine runs independently, fires callback on timeout
-  - [ ] `Stop()` — terminates clock goroutine cleanly
-- [ ] Unit tests:
-  - [ ] Clock counts down correctly
-  - [ ] Switch updates active player
-  - [ ] Timeout callback fires at correct time
-  - [ ] Pause/resume preserves remaining time
-  - [ ] Stop terminates goroutine (no goroutine leak — verify with goleak or manual check)
+- [x] `internal/game/clock.go`:
+  - [x] `Clock` struct: per-player timers, active color tracking
+  - [x] `NewClock(initialMs int64) *Clock`
+  - [x] `Start(color Color)` — begins counting down for that color
+  - [x] `Switch()` — stops active color's clock, starts opponent's
+  - [x] `Pause()` — stops active clock without switching (on disconnect)
+  - [x] `Resume(color Color)` — resumes paused clock for given color
+  - [x] `TimeRemaining(color Color) time.Duration`
+  - [x] `SetTimeoutCallback(fn func(Color))` — called when a clock hits zero
+  - [x] Clock goroutine runs independently, fires callback on timeout
+  - [x] `Stop()` — terminates clock goroutine cleanly
+- [x] Unit tests:
+  - [x] Clock counts down correctly
+  - [x] Switch updates active player
+  - [x] Timeout callback fires at correct time
+  - [x] Pause/resume preserves remaining time
+  - [x] Stop terminates goroutine (no goroutine leak — verify with goleak or manual check)
 
 ---
 
 ### Step 10: Game Manager
-- [ ] `internal/game/manager.go`:
-  - [ ] `Manager` struct (depends on: GameRegistry, MoveProcessor, store.GameStore, store.MoveStore, auth.TokenService, EventBus)
-  - [ ] `NewManager(...) *Manager`
-  - [ ] `CreateGame(ctx, userID string) (*GameSession, string, error)` — returns session + playerToken
-  - [ ] `JoinGame(ctx, gameID, userID string) (string, error)` — returns playerToken
-  - [ ] `HandleConnect(ctx, gameID string, color Color, conn *ws.Connection) error`
-  - [ ] `HandleDisconnect(gameID string, color Color)`
-  - [ ] `HandleMessage(ctx, gameID string, color Color, raw []byte) error`
-  - [ ] `RestoreActiveGames(ctx) error` — called on server startup, hydrates GameRegistry from DB
-- [ ] Message routing in HandleMessage:
-  - [ ] MOVE → MoveProcessor.ProcessMove
-  - [ ] RESIGN → update game status, broadcast GAME_OVER
-  - [ ] PING → send PONG to sender only
-  - [ ] Unknown type → send ERROR to sender
+- [x] `internal/game/manager.go`:
+  - [x] `Manager` struct (depends on: GameRegistry, MoveProcessor, store.GameStore, store.MoveStore, auth.TokenService, EventBus)
+  - [x] `NewManager(...) *Manager`
+  - [x] `CreateGame(ctx, userID string) (*GameSession, string, error)` — returns session + playerToken
+  - [x] `JoinGame(ctx, gameID, userID string) (string, error)` — returns playerToken
+  - [x] `HandleConnect(ctx, gameID string, color Color, conn *ws.Connection) error`
+  - [x] `HandleDisconnect(gameID string, color Color)`
+  - [x] `HandleMessage(ctx, gameID string, color Color, raw []byte) error`
+  - [x] `RestoreActiveGames(ctx) error` — called on server startup, hydrates GameRegistry from DB
+- [x] Message routing in HandleMessage:
+  - [x] MOVE → MoveProcessor.ProcessMove
+  - [x] RESIGN → update game status, broadcast GAME_OVER
+  - [x] PING → send PONG to sender only
+  - [x] Unknown type → send ERROR to sender
 
 ---
 
@@ -593,17 +593,17 @@ Schema is defined in ARCHITECTURE.md. Do not deviate from it without updating AR
 ---
 
 ### Step 13: Main and Wiring
-- [ ] `cmd/server/main.go`:
-  - [ ] Load config from environment (DATABASE_URL, JWT_SECRET, SERVER_PORT, LOG_LEVEL)
-  - [ ] Initialize pgxpool
-  - [ ] Run pending migrations on startup
-  - [ ] Initialize all layers in dependency order
-  - [ ] Call `manager.RestoreActiveGames(ctx)` — hydrate in-memory state from DB
-  - [ ] Register routes
-  - [ ] Start HTTP server
-  - [ ] Listen for OS signals (SIGTERM, SIGINT)
-  - [ ] On signal: stop accepting new games, wait for in-progress moves to complete, persist clock state, graceful shutdown of WebSocket registry, close DB pool
-- [ ] Verify server starts and `GET /health` returns 200
+- [x] `cmd/server/main.go`:
+  - [x] Load config from environment (DATABASE_URL, JWT_SECRET, SERVER_PORT, LOG_LEVEL)
+  - [x] Initialize pgxpool
+  - [x] Run pending migrations on startup
+  - [x] Initialize all layers in dependency order
+  - [x] Call `manager.RestoreActiveGames(ctx)` — hydrate in-memory state from DB
+  - [x] Register routes
+  - [x] Start HTTP server
+  - [x] Listen for OS signals (SIGTERM, SIGINT)
+  - [x] On signal: stop accepting new games, wait for in-progress moves to complete, persist clock state, graceful shutdown of WebSocket registry, close DB pool
+- [x] Verify server starts and `GET /health` returns 200
 
 ---
 
@@ -611,13 +611,13 @@ Schema is defined in ARCHITECTURE.md. Do not deviate from it without updating AR
 
 These are manual tests run against the running server before Phase 1 is declared complete.
 
-- [ ] Two browser tabs complete a full game from first move to checkmate
-- [ ] Player closes browser mid-game, reopens, game resumes with correct board state
-- [ ] Player closes browser mid-game, reopens, opponent receives OPPONENT_RECONNECTED
-- [ ] Server is killed (`kill -9`) and restarted, in-progress game resumes correctly
-- [ ] Illegal move sent via WebSocket client (wscat): rejected with MOVE_REJECTED
-- [ ] Both players connected, one reaches timeout: GAME_OVER broadcast with reason TIMEOUT
-- [ ] Player resigns: opponent receives GAME_OVER with reason RESIGNATION
+- [x] Two browser tabs complete a full game from first move to checkmate
+- [x] Player closes browser mid-game, reopens, game resumes with correct board state
+- [x] Player closes browser mid-game, reopens, opponent receives OPPONENT_RECONNECTED
+- [x] Server is killed (`kill -9`) and restarted, in-progress game resumes correctly
+- [x] Illegal move sent via WebSocket client (wscat): rejected with MOVE_REJECTED
+- [x] Both players connected, one reaches timeout: GAME_OVER broadcast with reason TIMEOUT
+- [x] Player resigns: opponent receives GAME_OVER with reason RESIGNATION
 
 ---
 

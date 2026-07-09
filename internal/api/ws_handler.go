@@ -174,7 +174,7 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		func() {
-			h.manager.HandleDisconnect(gameID, color)
+			h.manager.HandleDisconnect(h.ctx, gameID, color)
 			h.wsRegistry.Unregister(connID)
 		},
 	)

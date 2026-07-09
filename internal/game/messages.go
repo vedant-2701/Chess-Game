@@ -38,3 +38,11 @@ const (
 	ErrCodeGameFull      = "GAME_FULL"
 	ErrCodeInternalError = "INTERNAL_ERROR"
 )
+
+// wsCloseNormal is the RFC 6455 "normal closure" WebSocket status code, used
+// when the server proactively closes a connection after its game has ended
+// (see GameSession.CloseConnections). Kept here, as a bare int, rather than
+// importing gorilla/websocket into this package for one constant — internal/game
+// stays ignorant of WebSocket framing details per ARCHITECTURE.md's stated
+// internal/ws / internal/game boundary; it only needs the integer value.
+const wsCloseNormal = 1000
