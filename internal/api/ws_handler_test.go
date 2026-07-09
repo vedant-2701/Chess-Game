@@ -239,3 +239,90 @@ func TestWSHandler_Reconnect_ReceivesCurrentGameState(t *testing.T) {
 	// Black should also observe White's second connection as a reconnection.
 	assertMessageType(t, blackConn, "OPPONENT_RECONNECTED")
 }
+
+// assertConnectionClosedNormally reads the next frame and requires it to be
+// a normal-closure (RFC 6455 code 1000) close frame, not another data
+// message. Used to prove a connection was actually closed by the server,
+// not merely that reading it eventually times out.
+func assertConnectionClosedNormally(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	_, _, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatal("expected connection to be closed after GAME_OVER, but ReadMessage returned another message instead")
+	}
+	if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		t.Errorf("expected a normal-closure close frame (code %d), got: %v", websocket.CloseNormalClosure, err)
+	}
+}
+
+// TestWSHandler_GameOver_ClosesConnectionsAfterDelivery is a regression test
+// for a bug found via manual E2E testing (PHASE_1.md Step 14): after a game
+// ended, both players' WebSocket connections stayed open indefinitely —
+// GAME_OVER was sent, but nothing ever closed the socket. A client sending
+// further messages after that got silent non-responses, since
+// Manager.HandleMessage's registry lookup fails once finalizeGame has
+// unregistered the session, and the resulting error was only logged, never
+// reported back to the client.
+//
+// This test asserts two things, not just one: (1) both connections actually
+// receive a close frame, and (2) GAME_OVER is the message immediately before
+// it, for both players — not just "eventually closed," but "closed only
+// after GAME_OVER was delivered." The second assertion is what actually
+// exercises this session's fix: GameSession.CloseConnections is called from
+// the same goroutine, immediately after the GAME_OVER send (Manager's
+// startEventSubscriber), rather than from Manager.finalizeGame on a
+// different goroutine. A version of the fix that closed connections from
+// finalizeGame instead would still make this test's first assertion pass
+// (the connection does eventually close) while having a real chance of
+// failing the second (the close frame racing GAME_OVER's own delivery
+// through the same per-connection outbound queue) — this is why both
+// assertions matter, not just proof of eventual closure.
+func TestWSHandler_GameOver_ClosesConnectionsAfterDelivery(t *testing.T) {
+	truncateAll(t)
+	manager := newTestManager(t)
+	srv := newTestServer(t, manager)
+
+	whiteID := uuid.NewString()
+	blackID := uuid.NewString()
+	mustCreateUser(t, whiteID)
+	mustCreateUser(t, blackID)
+
+	ctx := context.Background()
+	session, whiteToken, err := manager.CreateGame(ctx, whiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+	blackToken, err := manager.JoinGame(ctx, session.ID, blackID)
+	if err != nil {
+		t.Fatalf("JoinGame: %v", err)
+	}
+
+	whiteConn := dial(t, srv, session.ID, whiteToken)
+	defer whiteConn.Close()
+	assertMessageType(t, whiteConn, "GAME_STATE") // WAITING_FOR_PLAYER
+
+	blackConn := dial(t, srv, session.ID, blackToken)
+	defer blackConn.Close()
+	assertMessageType(t, blackConn, "GAME_STATE") // Black's connect activates the game
+
+	assertMessageType(t, whiteConn, "OPPONENT_CONNECTED")
+
+	// White resigns. Black wins; either side ending the game exercises the
+	// same finalizeGame/CloseConnections path, so which side resigns is not
+	// significant to this test.
+	if err := whiteConn.WriteMessage(websocket.TextMessage, []byte(`{"type":"RESIGN"}`)); err != nil {
+		t.Fatalf("write RESIGN: %v", err)
+	}
+
+	// Both players receive GAME_OVER ...
+	assertMessageType(t, whiteConn, "GAME_OVER")
+	assertMessageType(t, blackConn, "GAME_OVER")
+
+	// ... and, strictly after that, both connections are closed by the server
+	// with a normal-closure frame — not left open indefinitely.
+	assertConnectionClosedNormally(t, whiteConn)
+	assertConnectionClosedNormally(t, blackConn)
+}
