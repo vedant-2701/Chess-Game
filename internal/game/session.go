@@ -313,6 +313,53 @@ func (s *GameSession) SendToBothPlayers(msg []byte) {
 	}
 }
 
+// CloseConnections sends a WebSocket close frame to both players and clears
+// their connection slots.
+//
+// Callers: this must only be called immediately after, and from the same
+// goroutine as, the call that sent the terminal GAME_OVER message —
+// Manager.startEventSubscriber's GAME_OVER branch and Manager.publishGameOver's
+// EventBus-failure fallback branch are the two (and only) correct call sites.
+// It must never be called from Manager.finalizeGame: finalizeGame runs on a
+// different goroutine than whichever goroutine actually sent GAME_OVER, and
+// LocalEventBus.Publish's buffered channel send only guarantees the event was
+// enqueued for the subscriber goroutine to eventually pick up — not that the
+// subscriber has run yet (see eventbus.go). Closing from finalizeGame would
+// race the close frame against GAME_OVER's delivery through this session's
+// shared per-connection outbound queue, with a real chance of the close frame
+// winning and the client never receiving GAME_OVER at all. Calling this from
+// the same goroutine that just sent GAME_OVER, immediately after, relies on
+// nothing but Go's program-order guarantee within a single goroutine plus the
+// outbound queue's FIFO draining by that connection's single WriteLoop —
+// both already-relied-upon guarantees elsewhere in this codebase, not a new
+// assumption.
+//
+// Without this at all, a client that keeps sending messages after its game
+// ends gets silent non-responses instead of a real protocol-level close:
+// Manager.HandleMessage's registry lookup fails once finalizeGame has
+// unregistered the session, and the resulting error is only logged, never
+// reported back to the client. Found via manual E2E testing (PHASE_1.md
+// Step 14), not by any automated test — flagged as a real coverage gap.
+func (s *GameSession) CloseConnections(statusCode int, reason string) {
+	s.mu.Lock()
+	white, black := s.playerWhite, s.playerBlack
+	s.playerWhite, s.playerBlack = nil, nil
+	s.mu.Unlock()
+
+	if white != nil {
+		if err := white.SendCloseFrame(statusCode, reason); err != nil {
+			slog.Warn("GameSession.CloseConnections: failed to close white connection",
+				"gameID", s.ID, "error", err)
+		}
+	}
+	if black != nil {
+		if err := black.SendCloseFrame(statusCode, reason); err != nil {
+			slog.Warn("GameSession.CloseConnections: failed to close black connection",
+				"gameID", s.ID, "error", err)
+		}
+	}
+}
+
 // boardTurn maps the notnil/chess position turn to a store.Color.
 // Called under the session read lock — g must not be mutated concurrently.
 func boardTurn(g *notnil.Game) store.Color {
