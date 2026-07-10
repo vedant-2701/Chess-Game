@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"go.uber.org/goleak"
 
 	internalchess "github.com/vedant-2701/chess/internal/chess"
 	"github.com/vedant-2701/chess/internal/game"
@@ -325,4 +326,136 @@ func TestWSHandler_GameOver_ClosesConnectionsAfterDelivery(t *testing.T) {
 	// with a normal-closure frame — not left open indefinitely.
 	assertConnectionClosedNormally(t, whiteConn)
 	assertConnectionClosedNormally(t, blackConn)
+}
+
+// TestWSHandler_GameOver_NoGoroutineLeaks closes PHASE_1.md acceptance
+// criterion #7 ("No goroutine leaks after a completed game"). Prior to this
+// test, goleak.VerifyNone existed ONLY in internal/game/clock_test.go, wrapped
+// around isolated *Clock unit tests — nothing exercised the composite
+// teardown of an actual completed game driven through the real stack:
+// Manager's EventBus subscriber goroutine (started in CreateGame, must exit
+// after forwarding GAME_OVER — see startEventSubscriber), and both players'
+// three per-connection goroutines each (ws.Connection.WriteLoop, ReadLoop,
+// StartHeartbeatMonitor, started by Connection.Start). Reasoning in code
+// comments that these all exit correctly is not the same as PHASE_1.md's
+// explicit requirement to verify it with goleak or pprof — this test is that
+// verification, not a restatement of the reasoning.
+//
+// This deliberately reuses TestWSHandler_GameOver_ClosesConnectionsAfterDelivery's
+// setup rather than being a lighter variant of it: the leak surface this test
+// checks is a property of the exact same resign-to-GAME_OVER-to-close
+// sequence, not a different code path.
+func TestWSHandler_GameOver_NoGoroutineLeaks(t *testing.T) {
+	// goleak.VerifyNone is deferred FIRST so it executes LAST (defers run
+	// LIFO) — see clock_test.go's verifyNoLeaks for the same pattern. By the
+	// time it runs, every statement below (including the explicit
+	// conn.Close() and srv.Close() calls near the end of this function) has
+	// already executed as part of the function body returning.
+	//
+	// goleak.VerifyNone retries internally with backoff before reporting a
+	// failure (this is a library-provided bounded wait, not a manual
+	// time.Sleep added here — CODING_GUIDELINES.md §6 forbids the latter as
+	// a test-synchronization mechanism, not the former), which is what makes
+	// it safe to call immediately after triggering asynchronous goroutine
+	// teardown (WriteLoop/ReadLoop/StartHeartbeatMonitor all exit in
+	// response to a closed TCP connection, which is not instantaneous)
+	// rather than racing the check against still-unwinding goroutines.
+	// DELIBERATELY SCOPED TO THIS TEST, NOT TestMain: this package's other
+	// tests (e.g. TestWSHandler_ValidToken_ReceivesGameState,
+	// TestWSHandler_Reconnect_ReceivesCurrentGameState, several in
+	// game_handler_test.go) correctly leave a game non-terminal, which leaves
+	// their EventBus subscriber and/or Clock goroutines legitimately still
+	// running when this test's own goroutines are inspected. That's not a
+	// leak — it's tested behavior belonging to a different game session, and
+	// `go test` runs every test in this package sequentially inside ONE
+	// process, so those goroutines are genuinely still alive when this test
+	// runs, regardless of which test file or TestMain scope goleak is called
+	// from. A package-wide check (TestMain) was tried and reverted for this
+	// exact reason; scoping the goleak.VerifyNone call to only this test
+	// function is necessary but NOT sufficient on its own — confirmed by a
+	// real run: even scoped to just this test, VerifyNone still flagged the
+	// prior tests' leftover goroutines, because VerifyNone with no ignore
+	// options inspects the WHOLE PROCESS's live goroutines, not \"goroutines
+	// created since this test began.\"
+	//
+	// goleak.IgnoreCurrent() is the actual fix: it snapshots which goroutines
+	// already exist at the moment it is called and excludes them from the
+	// later comparison. Because Go evaluates a deferred call's ARGUMENTS
+	// immediately at the `defer` statement (only the call itself is
+	// deferred), `goleak.IgnoreCurrent()` runs right here, before
+	// truncateAll/newTestManager/newTestServer below — capturing every
+	// leftover goroutine from every earlier test as the baseline, so only
+	// goroutines created and not cleaned up DURING this test's own body are
+	// flagged when VerifyNone actually runs at function return.
+	defer goleak.VerifyNone(t,
+		goleak.IgnoreCurrent(),
+		// Redundant with IgnoreCurrent() in the common case (the pgxpool
+		// health-check goroutine already exists by the time this test runs,
+		// so IgnoreCurrent() already covers it) but kept as an explicit,
+		// self-documenting belt-and-suspenders in case pgxpool ever recycles
+		// that goroutine mid-run — same exemption used by
+		// internal/game/clock_test.go's verifyNoLeaks.
+		goleak.IgnoreTopFunction("github.com/jackc/pgx/v5/pgxpool.(*Pool).backgroundHealthCheck"),
+	)
+
+	truncateAll(t)
+	manager := newTestManager(t)
+	srv := newTestServer(t, manager)
+
+	whiteID := uuid.NewString()
+	blackID := uuid.NewString()
+	mustCreateUser(t, whiteID)
+	mustCreateUser(t, blackID)
+
+	ctx := context.Background()
+	session, whiteToken, err := manager.CreateGame(ctx, whiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+	blackToken, err := manager.JoinGame(ctx, session.ID, blackID)
+	if err != nil {
+		t.Fatalf("JoinGame: %v", err)
+	}
+
+	whiteConn := dial(t, srv, session.ID, whiteToken)
+	assertMessageType(t, whiteConn, "GAME_STATE") // WAITING_FOR_PLAYER
+
+	blackConn := dial(t, srv, session.ID, blackToken)
+	assertMessageType(t, blackConn, "GAME_STATE") // Black's connect activates the game
+
+	assertMessageType(t, whiteConn, "OPPONENT_CONNECTED")
+
+	if err := whiteConn.WriteMessage(websocket.TextMessage, []byte(`{"type":"RESIGN"}`)); err != nil {
+		t.Fatalf("write RESIGN: %v", err)
+	}
+
+	assertMessageType(t, whiteConn, "GAME_OVER")
+	assertMessageType(t, blackConn, "GAME_OVER")
+
+	assertConnectionClosedNormally(t, whiteConn)
+	assertConnectionClosedNormally(t, blackConn)
+
+	// Close the client sides explicitly now, rather than deferring them (as
+	// the sibling ordering test does). gorilla's client-side ReadMessage
+	// already auto-responds to the server's close frame with its own close
+	// frame per RFC 6455, which should let the server's ReadLoop observe the
+	// closure and exit on its own — but closing explicitly here, before the
+	// goleak check below rather than after (a deferred Close would run AFTER
+	// the deferred goleak.VerifyNone above, since defers are LIFO relative
+	// to registration order), removes any dependency on that auto-response
+	// actually having reached the server by the time this function returns.
+	whiteConn.Close()
+	blackConn.Close()
+
+	// Close the httptest.Server itself before goleak inspects the process.
+	// httptest.NewServer runs its own Accept-loop goroutine for the life of
+	// the server; newTestServer's t.Cleanup(srv.Close) alone is not early
+	// enough here, since t.Cleanup callbacks run AFTER the test function
+	// (and therefore after its deferred goleak.VerifyNone) returns — an
+	// uncleaned server at that point would false-positive as a "leak" that
+	// has nothing to do with the game/WebSocket code actually under test.
+	// Calling Close() here is redundant with, not a replacement for,
+	// newTestServer's Cleanup registration: httptest.Server.Close() is
+	// idempotent, so the later Cleanup-triggered call is a safe no-op.
+	srv.Close()
 }

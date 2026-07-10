@@ -954,3 +954,89 @@ Consequences:
 - This is a narrow, documented exception to CODING_GUIDELINES.md section 2 and must be called out as such at the Handler struct's field declaration, not left implicit.
 
 ---
+
+## ADR-019: Detached-Context Pattern for HandleDisconnect's Clock-Persist Write
+
+**Date:** 2026-07-09
+**Status:** ACCEPTED
+
+**Context:**
+
+`Manager.HandleDisconnect` was extended this session to persist the paused clock reading to the database at the moment of disconnect, closing a real gap against PHASE_1.md acceptance criterion #3 (a player who disconnects mid-turn and is then caught by a hard `kill -9`, with no graceful shutdown ever running, would otherwise resume with time that was never actually theirs). Per CODING_GUIDELINES.md section 2, `HandleDisconnect` now takes `ctx context.Context` as its first argument, since it performs I/O.
+
+The natural choice — using that `ctx` parameter directly for the new `gameStore.UpdateClocks` call — fails on **100% of graceful shutdowns**, not as a rare race. ADR-018 established that `WSHandler` holds a server-lifetime context (the same `ctx` threaded into every `onClose` callback, and therefore into every `HandleDisconnect` call), and `cmd/server/main.go`'s Step 13 shutdown sequence cancels that context *before* calling `ws.Registry.CloseAll()` — this ordering is itself required by ADR-018, so that in-flight `HandleMessage` calls observe cancellation before their connections are force-closed. But `CloseAll()` is exactly what triggers `HandleDisconnect` for every still-connected player. By the time any of those `HandleDisconnect` calls reach the new clock-persist code, `ctx` is already cancelled — so `gameStore.UpdateClocks(ctx, ...)` fails immediately with `"context canceled"` for every player still connected at shutdown time. This was not caught by `go test -race -tags integration`; it was caught by real E2E testing (PHASE_1.md Step 14, a real process, real `Ctrl+C`) during this session, confirmed reproducible on every run, not intermittent.
+
+**Options Considered:**
+
+**Option A: Reorder shutdown — call `ws.Registry.CloseAll()` before cancelling the server-lifetime context.**
+Swap the order of steps 2 and 3 in `main.go`'s `shutdown()` sequence so connections are force-closed (and their disconnect-driven clock persists run) while `ctx` is still live, then cancel afterward.
+- Pros: `HandleDisconnect`'s persist call can use `ctx` directly, no new pattern introduced.
+- Cons: Directly reopens the exact race ADR-018 was written to close on the `HandleMessage` side. If a connection is mid-`HandleMessage` (e.g. processing a `MOVE`) when `CloseAll()` force-closes it, that goroutine's context would still be live and its I/O would continue racing against a connection that has already been torn down. Fixing one gap by reopening a previously-closed one is not a fix.
+
+**Option B: Detach the clock-persist write from the parent context's cancellation, bound it with its own short timeout (CHOSEN).**
+Use `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)` for the `UpdateClocks` call specifically, leaving `ctx` itself, and every other use of it in `HandleDisconnect`/`HandleMessage`, untouched.
+- Pros: Does not touch ADR-018's shutdown ordering at all. The detached context is still bounded (5s), so a genuinely stuck DB call cannot hang shutdown indefinitely; it is not an unbounded escape hatch. Scoped to exactly the one call site that needs it.
+- Cons: `context.WithoutCancel` is a pattern that, if applied carelessly elsewhere, could silently defeat cancellation propagation the codebase otherwise relies on (CODING_GUIDELINES.md section 2, Non-Negotiable Constraint #7). Requires being called out explicitly at the call site — a future reader skimming `HandleDisconnect` could reasonably assume `ctx` is used directly, as it is everywhere else in the function.
+
+**Option C: Give the clock-persist write its own dedicated context, independent of the WSHandler-supplied `ctx` entirely (e.g. `context.Background()` with a timeout).**
+- Pros: Superficially simpler — no `WithoutCancel` unwrapping, just a fresh context.
+- Cons: Functionally identical to Option B in cancellation behavior, but loses whatever request-scoped values might one day be attached to `ctx` and would otherwise want to survive detachment. `context.WithoutCancel(ctx)` preserves values while only stripping cancellation and deadline — the more precise tool for "detach from cancellation, keep everything else." Option C achieves the same cancellation-detachment with a blunter instrument for no benefit at Phase 1's current feature set, but with a real (if currently latent) cost if request-scoped values are ever added to this context in a later phase.
+
+**Decision:** Option B — `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`, scoped to `HandleDisconnect`'s clock-persist write only.
+
+**Rationale:**
+
+The correctness requirement is narrow: this one write must survive the exact cancellation-timing sequence ADR-018 deliberately created for an unrelated, already-correct reason (protecting in-flight `HandleMessage` calls). Reordering shutdown (Option A) fixes this gap by reopening a different, previously-solved one — an unacceptable trade. Detaching only this call from cancellation (Option B) while bounding it with its own timeout gives the write a real chance to complete during shutdown without weakening ADR-018's guarantee anywhere else. Option C achieves the same practical effect with a less precise primitive and no offsetting advantage.
+
+This decision also generalizes into Non-Negotiable Constraint #12 (CLAUDE.md): a context's cancellation timing, correctly chosen for one operation, must be re-verified — not assumed safe by inheritance — for every other operation later wired through the same context. `HandleDisconnect` already took a `ctx` parameter for an unrelated reason (satisfying CODING_GUIDELINES.md section 2 once it started doing I/O), and the new clock-persist code was added to that existing parameter without re-examining what actually cancels it or when — exactly the failure mode Constraint #12 now requires checking for explicitly.
+
+**Consequences:**
+- `Manager.HandleDisconnect`'s clock-persist block uses `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)`, not `ctx` directly, for the `gameStore.UpdateClocks` call. Called out explicitly in a comment at the call site and in CLAUDE.md's Known Sharp Edges.
+- No change to `main.go`'s shutdown ordering — ADR-018's Consequences (cancel before `CloseAll()`) remain exactly as specified.
+- `Manager.PersistActiveClockState` (the separate, explicit shutdown-time flush called from `main.go`'s `shutdown()` step 4) is unaffected — it already receives `shutdownCtx`, a freshly-created context with its own timeout, not the ADR-018 server-lifetime context, so it was never subject to this bug.
+- This is the third instance this project has hit of "a context's cancellation semantics, correct in isolation, produce a bug once a second concern is wired through the same context" — ADR-014 and ADR-018 itself are the other two. Treated as a recurring category of bug worth a standing constraint (#12), not a one-off patch.
+
+---
+
+## ADR-020: GameSession.CloseConnections Same-Goroutine Ordering Requirement
+
+**Date:** 2026-07-09
+**Status:** ACCEPTED
+
+**Context:**
+
+Manual E2E testing (PHASE_1.md Step 14) found that WebSocket connections were never closed after a game ended — observed directly via resignation testing: both players' `wscat` sessions stayed open indefinitely after receiving `GAME_OVER`, and any further message sent by a client produced silent non-responses (`Manager.HandleMessage`'s registry lookup fails once `finalizeGame` has unregistered the session, and the resulting error was only logged, never reported back to the client). `Manager.finalizeGame` — the single centralized cleanup function called from every terminal-state path — never touched connections at all; it only cancels abandonment timers and unregisters the session from `GameRegistry`.
+
+The naive fix — close both players' connections from inside `finalizeGame`, alongside the rest of its cleanup — was drafted first and rejected before implementation, after reading `eventbus.go` directly rather than assuming synchronous-like behavior from `LocalEventBus`. `finalizeGame` is called synchronously from the same goroutine that is about to publish (or has just published) `GAME_OVER` via `Manager.publishGameOver`, which calls `m.eventBus.Publish(ctx, GameEvent{...})`. `LocalEventBus.Publish`'s buffered-channel send (buffer size 8) only guarantees the event was *enqueued* for the subscriber goroutine (`Manager.startEventSubscriber`'s loop) to eventually pick up and forward to the players — it does not guarantee that goroutine has run yet by the time `Publish` returns. If `finalizeGame` closed connections immediately after `publishGameOver` returns, the close frame (written through the same connection's single-writer outbound queue) could reach the wire before the subscriber goroutine gets scheduled and forwards `GAME_OVER` through that same queue — a real, not theoretical, chance of the client receiving a close frame and never receiving `GAME_OVER` at all.
+
+**Options Considered:**
+
+**Option A: Close connections from `finalizeGame`, centralizing all terminal-state cleanup in one place.**
+- Pros: Single call site for all terminal-state bookkeeping.
+- Cons: Races the close frame against `GAME_OVER`'s own delivery, as described above. This is not a corner case reachable only under load — it is a structural race present on every single game completion, since `finalizeGame` and the `EventBus` subscriber's forwarding of `GAME_OVER` are always on different goroutines with no ordering guarantee between them via the buffered channel alone. Rejected as incorrect, not merely suboptimal.
+
+**Option B: Close connections from the same goroutine, immediately after, whichever call actually sent GAME_OVER (CHOSEN).**
+Two call sites, both already goroutines that perform the `GAME_OVER` send itself: `Manager.startEventSubscriber`'s loop (the common path), and `Manager.publishGameOver`'s `EventBus`-failure fallback branch (the degraded path, taken only if `eventBus.Publish` itself returns an error).
+- Pros: Relies on nothing but Go's program-order guarantee within a single goroutine, plus the outbound queue's FIFO draining by that connection's single `WriteLoop` — both guarantees already relied upon elsewhere in this codebase (CODING_GUIDELINES.md section 3), not a new assumption. Same-goroutine, immediately-after ordering is the only mechanism in this design that actually guarantees `GAME_OVER` reaches the wire before the close frame.
+- Cons: Two call sites instead of one, both of which must independently remember to call `CloseConnections` and must never be "simplified" back into `finalizeGame`. Requires an explicit warning comment at `finalizeGame` itself to prevent a future session from reintroducing Option A as a well-intentioned refactor.
+
+**Option C: Make `LocalEventBus.Publish` synchronous — block until the subscriber goroutine has actually processed the event before returning.**
+- Pros: Would make `finalizeGame`-based centralization (Option A) safe again.
+- Cons: Changes `EventBus`'s fundamental contract (ADR-010 — fire-and-forget, buffered, decoupled from subscriber scheduling) for every event type, not just `GAME_OVER`, to fix a problem specific to one event type's cleanup ordering. Also directly conflicts with ROADMAP.md's Phase 2 seam: `RedisEventBus` is pub/sub over the network — "synchronous until the subscriber has processed it" is not a property Redis pub/sub can offer without inventing an acknowledgment protocol on top of it. Rejected as solving a narrow problem by weakening a broader, deliberately-chosen abstraction (ADR-010).
+
+**Decision:** Option B — `GameSession.CloseConnections` called only from the same goroutine as, and immediately after, whichever call sent the terminal `GAME_OVER` message; never from `finalizeGame`.
+
+**Rationale:**
+
+The actual guarantee needed — "the close frame must not precede `GAME_OVER` on the wire" — has exactly one mechanism available in the current architecture that provides it for free: same-goroutine program order. `LocalEventBus`'s buffered-channel handoff (ADR-010's chosen design) does not provide a delivery guarantee, by design, and changing that (Option C) would be a disproportionate fix that also collides with the Phase 2 Redis seam. Reordering within `finalizeGame` cannot help either, since the problem is which goroutine performs the close, not when within a single goroutine's sequence it happens. Option B is the only one of the three that produces the guarantee using mechanisms already trusted elsewhere in the codebase, at the cost of two call sites instead of one.
+
+This is now generalized as Non-Negotiable Constraint #13 (CLAUDE.md): a message-delivery-then-connection-close sequence must happen in the same goroutine that performed the delivery, in program order — never split across goroutines relying on a queue/channel's "accepted" signal as a proxy for "processed."
+
+**Consequences:**
+- `GameSession.CloseConnections(statusCode int, reason string)` added, with a doc comment stating explicitly which two call sites are correct and why `finalizeGame` must never be one of them.
+- `Manager.finalizeGame` gained a doc comment warning against adding connection-closing logic there, specifically to prevent a future "simplification" from reintroducing this race.
+- `Manager.startEventSubscriber`'s `GAME_OVER` branch and `Manager.publishGameOver`'s `EventBus`-failure fallback branch both now call `session.CloseConnections(wsCloseNormal, "game ended")` immediately after their respective `GAME_OVER` sends.
+- Regression test `TestWSHandler_GameOver_ClosesConnectionsAfterDelivery` (`internal/api/ws_handler_test.go`) uses real dialed WebSocket connections specifically to prove both that connections close **and** that `GAME_OVER` is strictly delivered before the close frame for both players — the second assertion is what actually exercises this fix; a version of the fix using Option A would still pass a weaker test that only checked eventual closure.
+- No change to `EventBus`'s interface or `LocalEventBus`'s buffered-channel semantics (ADR-010 stands unmodified) — Option C was rejected specifically to avoid this.
+
+---
