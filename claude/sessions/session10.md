@@ -1,3 +1,58 @@
+# PART 1 — Session Summary
+
+## What Was Done
+
+**Phase 1 completion review conducted** against all 10 PHASE_1.md acceptance criteria, verified by direct source reading (not assumed from CLAUDE.md's prior claims) via filesystem MCP across `main.go`, `manager.go`, `session.go`, `ws_handler.go`, `connection.go`, `registry.go`, `routes.go`, `game_handler.go`, `clock_test.go`, `manager_test.go`, `eventbus_test.go`, `ws_handler_test.go`, `testmain_test.go`.
+
+**Result of that review:** 9/10 criteria MET. Criterion #7 ("No goroutine leaks after a completed game, verify with goleak or pprof") was **NOT MET** — the only existing `goleak` coverage was scoped to isolated `Clock` unit tests, with no check verifying the composite teardown of a real completed game (EventBus subscriber goroutine + all three per-connection goroutines for both players + Clock).
+
+**Two ADRs formally logged**, closing CLAUDE.md's "Pending ADRs" section:
+- **ADR-019** — Detached-context pattern for `HandleDisconnect`'s clock-persist write (`context.WithTimeout(context.WithoutCancel(ctx), 5s)`), including full alternatives analysis (reorder shutdown vs. detach vs. fresh background context).
+- **ADR-020** — `GameSession.CloseConnections` same-goroutine, immediately-after-`GAME_OVER` ordering requirement, including why centralizing in `finalizeGame` is a structural race, not a style preference.
+
+Both appended to `claude/claude_web_project/DECISIONS_LOG_PHASE_1.md`.
+
+**`TestWSHandler_GameOver_NoGoroutineLeaks` written, debugged, and confirmed passing** — this took three iterations, each surfacing a real, distinct lesson about `goleak` in a shared-process test binary, not a real production bug at any point:
+
+1. **First attempt** (scoped `goleak.VerifyNone` in the new test, no `IgnoreCurrent()`): failed. You independently moved the check into `TestMain` via `goleak.VerifyTestMain`, reasoning it would run automatically for all tests without needing to repeat it — a reasonable instinct, but wrong for this specific criterion, because `TestMain`-level checking inspects the whole binary after *every* test has run, and most tests in this package correctly leave a game non-terminal (they're testing something else — token validation, reconnect state, etc.) — so their `EventBus` subscriber and `Clock` goroutines are legitimately still alive by design, not leaked.
+2. **Reverted** `TestMain` change, restored the scoped per-test check — same failure. This ruled out "wrong scope" as the *complete* explanation and pointed at something more specific: `goleak.VerifyNone` inspects the *entire live process*, not "goroutines created since this test's body started." Since `go test` runs all tests in a package sequentially inside one process, every earlier test's intentionally-unfinished game's goroutines were still present and getting flagged by the later test's check — even though that check was correctly scoped to one test function.
+3. **Fix:** added `goleak.IgnoreCurrent()` to the `VerifyNone` call. Because Go evaluates a deferred call's arguments immediately (only the call itself is deferred), `IgnoreCurrent()` snapshots the process's live goroutines at the moment the `defer` statement is reached — right at test start — and excludes all of them from the later comparison. This is the correct, standard pattern for a scoped leak check inside a test binary with other, legitimately-long-lived background state. Confirmed passing by you.
+
+**Net result:** Criterion #7 is now genuinely MET, with a test that actually proves the specific claim ("no leak after a completed game") rather than a broader, noisier claim the test suite was never designed to satisfy.
+
+## Decisions Made
+
+- **`goleak.IgnoreCurrent()` is now the required pattern for any future scoped, per-test goroutine-leak check added to this codebase**, wherever the check runs inside a test binary alongside other tests that intentionally leave background goroutines running (which is the normal case for this project's WebSocket/EventBus/Clock architecture). Documented directly in the test's own comments and in CLAUDE.md below.
+- **Package-wide (`TestMain`-level) `goleak` checking is explicitly rejected for `internal/api`**, with the reasoning recorded in both `ws_handler_test.go` and `testmain_test.go` so it isn't reintroduced by a future session under the same reasonable-sounding "automatic for all tests" instinct.
+
+## Tradeoffs Considered
+
+- Per-test scoped check with `IgnoreCurrent()` vs. package-wide check: chose per-test, because the acceptance criterion's claim is about one specific lifecycle (a completed game), and a package-wide check conflates that with unrelated tests' intentionally-incomplete games — already covered above, included here because it's the central technical tradeoff of this session's second half.
+
+## Problems Encountered
+
+- Two consecutive `goleak` false positives, both root-caused precisely rather than worked around — see above. Neither was a production bug; both were test-infrastructure scoping issues specific to how `goleak.VerifyNone` determines its baseline.
+
+## Checklist Progress
+
+- ✅ Phase 1 completion review conducted, all 10 acceptance criteria checked individually
+- ✅ ADR-019, ADR-020 formally logged in `DECISIONS_LOG_PHASE_1.md`
+- ✅ `TestWSHandler_GameOver_NoGoroutineLeaks` added, debugged, confirmed passing — **closes acceptance criterion #7**
+- ✅ **Phase 1 is now complete — all 10/10 acceptance criteria MET**
+
+## Technical Debt
+
+No new technical debt introduced this session. TD-008 (automatic migrations on startup) remains the sole open item, correctly deferred to pre-Phase-2 work.
+
+## Next Recommended Step
+
+Begin Phase 2 (Horizontal Scaling) per ROADMAP.md — first task is standing up `RedisEventBus` behind the existing `EventBus` interface (ADR-010's seam) and running two server instances behind nginx. Recommend starting the next session by re-reading ROADMAP.md's Phase 2 section in full before writing any code, per this project's own session-start discipline.
+
+---
+
+# PART 2 — CLAUDE.md (Full Replacement)
+
+```markdown
 # CLAUDE.md — Session Context Document
 
 This file is the authoritative context document for AI-assisted development sessions on this project.
@@ -329,3 +384,8 @@ func TestX_NoGoroutineLeaks(t *testing.T) {
 | 10 | 2026-07-02 to 2026-07-06 | ADR-017, ADR-018. Handler relocated to `internal/api`. Steps 11–12 complete |
 | 11 | 2026-07-08 to 2026-07-09 | Step 12 test gap closed, `/health` confirmed, Step 13 complete, `HandleDisconnect` clock-persist fix, manual E2E testing found and fixed two real bugs (later formalized as ADR-019, ADR-020) |
 | 12 | 2026-07-09 to 2026-07-10 | **Phase 1 completion review conducted** — 9/10 criteria initially MET, criterion #7 (goroutine leaks) found NOT MET and required new work. **ADR-019 and ADR-020 formally logged**, closing prior session's Pending ADRs. **`TestWSHandler_GameOver_NoGoroutineLeaks` written** — required three iterations to get right: (1) scoped-but-no-`IgnoreCurrent()` failed; (2) a `TestMain`-level attempt was tried by the user and correctly reverted after diagnosing it would conflate real leaks with other tests' intentionally-unfinished games; (3) `goleak.IgnoreCurrent()` added to the scoped per-test check, confirmed passing. Neither failure was a production bug — both were `goleak`-in-shared-test-binary scoping issues, now documented as a standing pattern in Known Sharp Edges. **Phase 1 formally declared COMPLETE — all 10/10 acceptance criteria MET.** No production code changed this session; work was entirely test infrastructure and documentation (ADR logging). |
+```
+
+---
+
+**Phase 1 is complete.** All 10 acceptance criteria are met, both pending ADRs are formally logged, and the one gap found during review (`goleak` coverage) is closed with a test that actually proves the specific claim it needs to prove. Recommend starting the next session with a fresh read of ROADMAP.md's Phase 2 section before any Redis/EventBus work begins.
