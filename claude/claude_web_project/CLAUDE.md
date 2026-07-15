@@ -23,7 +23,9 @@ Update this file at the end of every session. Stale context is worse than no con
 
 **Phase 1 — MVP: ✅ COMPLETE**
 
-All 10 PHASE_1.md acceptance criteria verified MET as of this session's formal completion review. See "Phase 1 Completion Record" below for the criterion-by-criterion account. **Phase 2 (Horizontal Scaling) is the next phase.** Per ROADMAP.md, the first task is standing up `RedisEventBus` behind the existing `EventBus` interface and running two server instances behind nginx.
+All 10 PHASE_1.md acceptance criteria verified MET as of this session's formal completion review. See "Phase 1 Completion Record" below for the criterion-by-criterion account.
+
+**Phase 2 (Horizontal Scaling) is the next phase — design is now complete, implementation has not started.** The originally-planned approach (`RedisEventBus` behind the `EventBus` interface) was audited before implementation and rejected — see `DECISIONS_LOG_PHASE_2.md` ADR-021 for why. The accepted design is co-located sessions routed via a Redis-backed ownership/liveness directory, with a resolve-then-connect connection flow — full spec in `phases/current/PHASE_2.md`, full reasoning in `DECISIONS_LOG_PHASE_2.md` ADR-021 through ADR-025. **`RedisEventBus` is not built, in this phase or any other.** `LocalEventBus` remains the permanent implementation. First implementation task per `PHASE_2.md`'s checklist: Step 1, Redis infrastructure (routing directory, not an event bus).
 
 ---
 
@@ -154,6 +156,8 @@ Full rationale in DECISIONS_LOG_PHASE_1.md. This is the quick-reference list.
 | ADR-019 | HandleDisconnect clock-persist context cancellation | Detached context: `context.WithTimeout(context.WithoutCancel(ctx), 5s)` |
 | ADR-020 | CloseConnections ordering | Same-goroutine, immediately after the GAME_OVER send; never from `finalizeGame` |
 
+**Phase 2 ADRs (ADR-021 through ADR-025) live in `DECISIONS_LOG_PHASE_2.md`, not this file's log (`DECISIONS_LOG_PHASE_1.md`) — numbering is global and continuous across both files, split by phase for readability only.** Summary: ADR-021 co-located sessions over cross-instance state sync (supersedes this table's ADR-010 entry's "RedisEventBus in Phase 2" half); ADR-022 resolve-then-connect over connect-then-relay; ADR-023 two-key Redis ownership/liveness split over one combined key or active HTTP probing; ADR-024 drop eager `RestoreActiveGames`-at-startup for Phase 2; ADR-025 TD-008 resolved via one-shot pre-deploy migration service.
+
 ### Implementation Decisions (No ADR Required)
 
 (Unchanged from prior session — see full table in project history. No new implementation-decision-level entries this session; both new decisions were architecturally significant enough to warrant full ADRs, not table entries.)
@@ -172,9 +176,11 @@ TD-006: DetectOutcome maps ThreefoldRepetition/FiftyMoveRule/InsufficientMateria
 TD-007: GameFromFEN loses position history — threefold repetition blind after server restart | Phase 1 | Fix by: Phase 4
 TD-008: Migrations run automatically on server startup | Phase 1 (Step 13) | Fix by: Phase 2
         Must be revisited before Phase 2 ships multiple concurrent instances — advisory-lock
-        contention during startup, DDL-privilege blast radius. Likely fix: separate deploy-step
-        migration (CI job or `make migrate-up` pre-deploy gate), decoupled from application boot.
-        STILL OPEN — this is the only carried-forward technical debt into Phase 2.
+        contention during startup, DDL-privilege blast radius. Resolution mechanism now DECIDED
+        (not just "likely"), per DECISIONS_LOG_PHASE_2.md ADR-025: one-shot pre-deploy `migrate`
+        service in docker-compose.yml, server replicas gated on
+        `depends_on: condition: service_completed_successfully`. STILL OPEN — decided, not yet
+        implemented. Closes when PHASE_2.md's Step 9/Step 10 checklist items are done.
 ```
 
 ---
@@ -186,7 +192,7 @@ These decisions are locked. Do not revisit without a new ADR.
 1. **Server is authoritative for all game state.** Client validation is for UX only.
 2. **No client timers for time controls.** Server-side clock only.
 3. **Every move is persisted before being broadcast.** Persistence is on the critical path.
-4. **No Redis in Phase 1.** EventBus interface must be used so Phase 2 swap is clean.
+4. **No Redis in Phase 1.** EventBus interface exists as a seam regardless of what, if anything, sits behind it later — good architecture on its own merits, not contingent on any specific future swap. (Note: Phase 2 does introduce Redis, but as a routing directory, not as `EventBus`'s implementation — `LocalEventBus` remains permanent. See `DECISIONS_LOG_PHASE_2.md` ADR-021.)
 5. **No ORM.** Raw SQL via pgx/v5 only.
 6. **No global state.** All state passed via dependency injection.
 7. **Every I/O function takes context.Context as its first argument.**

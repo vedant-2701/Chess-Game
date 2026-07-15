@@ -42,7 +42,7 @@ These are locked decisions. Do not suggest alternatives to these unless I explic
 7. Logging: log/slog only — no fmt.Println, no log.Printf
 8. No global state — all dependencies injected via constructors
 9. Every I/O function takes context.Context as first argument
-10. No Redis in Phase 1 — EventBus interface must be used for the Phase 2 swap
+10. No Redis in Phase 1 — EventBus interface exists as a seam on its own architectural merits, not contingent on a future Redis swap (Phase 2 does introduce Redis, but as a routing/ownership directory, not as EventBus's implementation — LocalEventBus is permanent; see DECISIONS_LOG_PHASE_2.md ADR-021)
 11. Every move is persisted to PostgreSQL before being broadcast — persistence is on the critical path
 12. Client is never trusted for game state — server validates everything
 
@@ -62,8 +62,8 @@ WHEN MAKING ARCHITECTURAL DECISIONS
 If a decision arises mid-session that affects system structure, technology choice, or design pattern:
 1. Present the options with honest pros and cons — do not default to what seems easiest
 2. State the recommended option with specific technical justification
-3. Generate the full ADR entry in DECISIONS_LOG.md format, ready to append
-4. Flag it in the session summary so I remember to update DECISIONS_LOG.md
+3. Generate the full ADR entry in DECISIONS_LOG_PHASE_N.md format, ready to append to the **current phase's** log file (numbering is global and continuous across all phase log files — do not restart at ADR-001 for a new phase's file)
+4. Flag it in the session summary so I remember to update DECISIONS_LOG_PHASE_N.md
 
 WHEN REVIEWING CODE I SHARE
 Review as a senior engineer in a design review. Check for:
