@@ -2,7 +2,14 @@
 
 This document defines the phased build plan for the chess server. Each phase builds on the previous one and is designed to teach a specific system design concept. Phases are not time-boxed. A phase is complete only when all acceptance criteria are met and the system is demonstrably working, not when the code is written.
 
-**Current Phase: Phase 1 — MVP**
+**Current Phase: Phase 2 — Horizontal Scaling**
+
+> Phase 2's design was substantially reworked after the originally-planned Redis
+> pub/sub approach was audited against the actual codebase and found to have
+> critical bugs before implementation began. See `DECISIONS_LOG_PHASE_2.md`
+> (ADR-021 through ADR-025) for the full reasoning, and `phases/current/PHASE_2.md`
+> for the current design. `phases/current/PHASE_2-deferred.md` preserves the
+> original plan for history.
 
 ---
 
@@ -10,12 +17,14 @@ This document defines the phased build plan for the chess server. Each phase bui
 
 | Phase | Name | Core Concept | Status |
 |-------|------|-------------|--------|
-| 1 | MVP | WebSocket state management, server authority, session recovery | 🔄 In Progress |
-| 2 | Horizontal Scaling | WebSocket scaling problem, Redis pub/sub | ⬜ Not Started |
+| 1 | MVP | WebSocket state management, server authority, session recovery | ✅ Complete |
+| 2 | Horizontal Scaling | Instance co-location, ownership/liveness routing directory | 🔄 In Progress (design complete, implementation not started) |
 | 3 | Matchmaking | Queue design, distributed locking, race conditions | ⬜ Not Started |
 | 4 | ELO + Game History | Async processing, database indexing, deferred computation | ⬜ Not Started |
 | 5 | Spectators | Fan-out write problem, broadcast at scale | ⬜ Not Started |
 | 6 | Observability | Structured metrics, distributed tracing, operational readiness | ⬜ Not Started |
+| 7 | Frontend | Browser WebSocket lifecycle, client-server state sync | ⬜ Not Started |
+| 8 | Container Orchestration | Kubernetes, consensus-backed service discovery | ⬜ Not Started |
 
 ---
 
@@ -63,38 +72,77 @@ See [PHASE_1.md](./PHASE_1.md) for the complete checklist.
 - An illegal move sent directly via WebSocket is rejected by the server
 - A player running out of time results in a loss, detected server-side
 
+**Status: ✅ COMPLETE.** All 10 acceptance criteria met — see `CLAUDE.md`'s Phase 1
+Completion Record for the criterion-by-criterion account.
+
 ---
 
 ## Phase 2 — Horizontal Scaling
 
-**System Design Concept: The WebSocket Scaling Problem**
+**System Design Concept: Routing Stateful Sessions to Their One Correct Owner**
 
-This is the most important distributed systems lesson in this project.
+This is the most important distributed systems lesson in this project — the
+specific lesson changed during design, and it's worth being explicit about why.
 
-WebSocket connections are stateful. Player A is connected to Server Instance 1. Player B is connected to Server Instance 2. When Player A sends a move, Server 1 has no way to push it to Player B on Server 2 without an intermediary.
+The originally-planned lesson was "Redis pub/sub lets two independent processes
+share one game's state." That framing was wrong. A chess game is a 1:1,
+turn-based session with exactly one legitimate owner at a time — there is no
+correctness benefit to two processes each holding live state for the same game,
+only correctness *risk*. This was discovered by auditing the original design
+against the actual codebase before writing any implementation: the two-owner
+model produced a deterministic cross-instance activation deadlock and several
+other critical bugs (full list: `DECISIONS_LOG_PHASE_2.md` ADR-021). The
+corrected lesson: **co-locate a game's two connections on one instance always,
+and solve routing — getting a connection to the right owner — as a separate,
+simpler problem from state synchronization.**
 
 **The Problem You Will Hit:**
-Deploy two instances of the Phase 1 server behind a load balancer. Two players connect. There is approximately a 50% chance they land on different instances. Their game breaks silently. Moves from one player never reach the other.
+Deploy two instances of the Phase 1 server behind a load balancer with no
+routing awareness. Two players connect. There is roughly a 50% chance they land
+on different instances. Their game breaks silently.
+
+The naive fix — encode routing into the gameID, or hash-route at the load
+balancer — trades this for a subtler failure: it works until an instance
+crashes, fails over, and then *recovers*. The recovered instance has no memory
+of the failover and will happily reconstruct its own independent copy of a game
+that already migrated elsewhere — splitting a live game via the very mechanism
+meant to prevent that. Both of these were found and rejected during design
+(`DECISIONS_LOG_PHASE_2.md` ADR-021) before being built.
 
 **What Is Built:**
-- Redis pub/sub as the cross-server event bus
-- Each server instance subscribes to game channels: `game:{gameID}`
-- Move from Player A → Server 1 → validate → persist → publish to Redis channel
-- Redis delivers to Server 2 → Server 2 pushes to Player B
-- `EventBus` interface introduced in Phase 1 makes this a clean swap
-- Sticky sessions considered and explicitly rejected (single point of failure per user)
-- Load balancer configuration for WebSocket connections (connection upgrades, timeouts)
+- Redis-backed routing directory: two keys per game/instance —
+  `game:{gameID} → instanceID` (ownership, stable) and
+  `instance_alive:{instanceID}` (liveness, the actual failure-detection signal)
+  — deliberately decoupled, not one combined key (ADR-023)
+- Resolve-then-connect: a stateless `GET /games/:id/resolve` call determines
+  the correct instance and issues a short-lived, masked routing credential
+  *before* the WebSocket upgrade is attempted — no server-side connection
+  relay/proxy code exists anywhere (ADR-022)
+- `LocalEventBus` (from Phase 1) remains the permanent implementation.
+  `RedisEventBus` is not built — there is never a second process holding state
+  for the same game that needs cross-instance notification
+- nginx: plain round-robin for REST; a static label→upstream map for the
+  WebSocket Edge Proxy — mechanical dereference only, no routing decisions made
+  at the proxy layer
+- TD-008 (automatic migrations racing under multiple instances, open since
+  Phase 1) closed via a one-shot pre-deploy migration step (ADR-025)
 
 **What This Teaches:**
-- Why stateful services cannot be naively horizontally scaled
-- Redis pub/sub semantics: fire-and-forget, at-most-once delivery
-- The difference between stateful infrastructure (WebSocket servers) and stateless infrastructure
-- What happens when Redis goes down: graceful degradation design
+- Why stateful services cannot be naively horizontally scaled — and why the
+  right response is routing to a single owner, not synchronizing multiple owners
+- Lease-based ownership and liveness: TTLs, heartbeats, and the concrete
+  false-positive/false-negative tradeoff every lease design has to make
+  explicitly (ADR-023) — and why that tradeoff is deliberately left as a
+  documented, bounded limitation (TD-P2-001) rather than fully solved by hand
+- The difference between a stateless routing decision (resolve) and a stateful
+  long-lived session (connect) — and why separating them removes a whole class
+  of implementation risk
+- What happens when the routing store goes down: already-connected players are
+  unaffected; only new routing decisions fail, and they fail cleanly
 
-**Phase 2 is complete when:**
-- Two server instances run behind nginx
-- Players on different instances can play a complete game
-- Killing one server instance mid-game: player reconnects to remaining instance, game resumes
+**Phase 2 is complete when:** see `phases/current/PHASE_2.md`'s Acceptance
+Criteria table — in particular, criterion 4: a failed-over game's original
+instance recovering must never cause a split game, under any timing.
 
 ---
 
@@ -231,6 +279,47 @@ Next.js on Vercel (free tier). Go server on VPS (existing). WebSocket connects d
 - Two players on different machines complete a full game via the browser UI
 - Reconnection works in production: close tab, reopen, game resumes
 - All functionality works on production Vercel + VPS URLs, not just localhost
+
+---
+
+## Phase 8 — Container Orchestration
+
+**System Design Concept: Hand-Rolled Primitive vs. Platform-Provided Primitive**
+
+Added during Phase 2's design, not part of the original plan — deliberately
+deferred rather than pulled into Phase 2 itself. See `DECISIONS_LOG_PHASE_2.md`
+ADR-021's context section for why: the lesson Phase 2 teaches (how lease-based
+ownership routing works) is best learned on the simplest tool that teaches it
+(Redis, two commands) before adopting a platform that solves it more completely
+but requires learning the platform's own machinery at the same time.
+
+**What Is Built:**
+- Redeploy the Phase 2 fleet onto Kubernetes (local cluster — kind or minikube;
+  no cloud provider)
+- Replace nginx's static Edge Proxy map with a `Service` + `ingress-nginx`
+- Replace the hand-rolled Redis ownership/liveness directory with Kubernetes'
+  native `Lease` API object — same TTL/claim concept as Phase 2, now
+  Raft-backed via etcd instead of a single Redis instance, with
+  `resourceVersion`-based fencing closing Phase 2's TD-P2-001
+- `StatefulSet` for stable per-instance identity, replacing Phase 2's manually
+  assigned `INSTANCE_ID`
+- Liveness/readiness probes replacing nginx's passive health checks
+- `ConfigMap`/`Secret` replacing `.env`-file configuration
+
+**What This Teaches:**
+- Hand-rolled lease (Phase 2, Redis) vs. consensus-backed lease (k8s `Lease`/etcd)
+  — same concept, stronger guarantee, understood in depth because the weaker
+  version was built by hand first
+- Declarative reconciliation vs. imperative deployment
+- Fencing tokens: why Phase 2 explicitly accepted a bounded correctness risk
+  instead of hand-building this, and what closing it with the right primitive
+  actually looks like
+
+**Explicitly Out of Scope:** service mesh (Istio/Linkerd), multi-cluster/
+multi-region, autoscaling policy tuning.
+
+**Phase 8 is complete when:** see `phases/future/Phase_8.md`'s full acceptance
+criteria, in particular TD-P2-001's closure test.
 
 ---
 

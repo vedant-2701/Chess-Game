@@ -19,7 +19,7 @@ Claude never directly modifies your files — it generates the updated content a
 | `CLAUDE.md` | Claude generates, you apply | End of every session | Replace entire file with Claude's output |
 | `PHASE_N.md` (current) | Claude generates checkboxes, you apply | During and after each session | Check off completed items, paste new content |
 | `ARCHITECTURE.md` | Claude generates, you apply | When structure changes | Replace changed sections |
-| `DECISIONS_LOG.md` | Claude generates, you apply | When a new decision is made | Append new ADR to bottom of file |
+| `DECISIONS_LOG_PHASE_N.md` (current phase's log) | Claude generates, you apply | When a new decision is made | Append new ADR to bottom of the **current phase's** log file |
 | `ROADMAP.md` | You | When a phase is completed | Update phase status manually |
 | `CODING_GUIDELINES.md` | Claude generates, you apply | When new patterns are established | Append new rules |
 | `README.md` | You | When setup steps change | Update manually |
@@ -83,26 +83,28 @@ The next session starts with stale context. Claude will confidently describe the
 - A component interface changes
 - The DB schema changes
 - The state machine gains a new state or transition
-- The EventBus is swapped (Phase 2)
 - A new service is extracted (Phase 3+)
+- (Note: "the EventBus is swapped" was listed here as a Phase 2 trigger in an earlier draft of this file. It will not happen — see `DECISIONS_LOG_PHASE_2.md` ADR-021. `LocalEventBus` is permanent. Left this note rather than silently deleting the line, since the absence of an expected trigger is exactly the kind of thing worth being explicit about.)
 
 **Rule:** Architecture changes and ARCHITECTURE.md updates happen in the same session. Never let the code drift from the architecture document.
 
 ---
 
-### DECISIONS_LOG.md
+### DECISIONS_LOG_PHASE_N.md
 **Purpose:** Append-only record of every architectural decision with the alternatives that were rejected.
 
-**Read by Claude:** When a new decision needs to be made (to check for prior related decisions) and when explaining past decisions.
+**File structure (updated — no longer a single file):** The log is split into one file per phase (`DECISIONS_LOG_PHASE_1.md`, `DECISIONS_LOG_PHASE_2.md`, ...) purely for readability as the project grows, but **ADR numbering is one continuous, global sequence across every file** — ADR-021 exists exactly once, in `DECISIONS_LOG_PHASE_2.md`, not renumbered from 1 in each new file. When starting a new phase's log file, continue the number from wherever the previous file left off; do not reset to ADR-001. `CLAUDE.md`'s ADR summary table always points to whichever file(s) actually contain each entry.
 
-**Updated:** Only by appending. Never edit existing ADRs. If a decision is reversed, write a new ADR that supersedes the old one and references it.
+**Read by Claude:** When a new decision needs to be made (to check for prior related decisions across *all* log files, not just the current phase's) and when explaining past decisions.
+
+**Updated:** Only by appending, and only to the **current phase's** log file. Never edit existing ADRs, in this file or any earlier phase's file. If a decision is reversed — including a decision from an earlier phase's file — write a new ADR in the current file that supersedes the old one and references it explicitly by ID and filename. The old ADR is not deleted or edited, even if it lives in a different file than the one superseding it.
 
 **What triggers an update:**
 - Any decision is made that affects system architecture, technology choice, or design pattern
-- A previously rejected option is now being adopted (write a new ADR, reference the old one)
-- A Phase 1 decision needs to change for Phase 2
+- A previously rejected option is now being adopted (write a new ADR, reference the old one, even across files)
+- A prior phase's decision needs to change for the current phase (common at phase boundaries — see `DECISIONS_LOG_PHASE_2.md` ADR-021's supersession of `DECISIONS_LOG_PHASE_1.md` ADR-010's Phase 2 half, as the reference example of how this should read)
 
-**Format:** Always use the ADR format defined in the file. ADR numbers are sequential and never reused.
+**Format:** Always use the ADR format defined in the file. ADR numbers are sequential and never reused, globally, not per-file.
 
 **Value of this file:** When an interviewer asks "why did you use X instead of Y?" the answer is in this file with the exact reasoning. Do not let this file become a rubber-stamp. Every ADR must include genuine alternatives that were actually considered.
 
@@ -207,7 +209,7 @@ Not all files need to be read every session. Claude Projects allows you to have 
 **Attach as reference (Claude reads when relevant):**
 - `ARCHITECTURE.md` — referenced for structural decisions
 - `CODING_GUIDELINES.md` — referenced when writing code
-- `DECISIONS_LOG.md` — referenced when making new decisions
+- `DECISIONS_LOG_PHASE_N.md` (all files, not just the current phase's — a new decision may need to check or supersede an earlier phase's ADR) — referenced when making new decisions
 
 **Attach once, rarely referenced:**
 - `ROADMAP.md` — context for phase boundaries

@@ -3,31 +3,84 @@
 **Status: ⬜ Not Started**
 **Prerequisite: Phase 1 all acceptance criteria met**
 
+This design supersedes the original Redis-pub/sub cross-instance plan (see
+`PHASE_2-deferred.md`) and the ID-prefix and consistent-hash-ring sticky-session
+variants considered and rejected during design. Full reasoning trail:
+`DECISIONS_LOG_PHASE_2.md`, ADR-021 through ADR-025.
+
 ---
 
 ## Objective
 
-Solve the WebSocket horizontal scaling problem. Run two instances of the chess server behind a load balancer. Players connected to different instances must be able to play a complete game with no degradation in behavior.
+Run multiple instances of the chess server behind a load balancer. Players
+connected via different resolve calls must always land on the same instance as
+their opponent, with no degradation in behavior, and no silent breakage when an
+instance crashes mid-game.
 
 **The single most important learning outcome of Phase 2:**
-Understanding *why* stateful WebSocket servers cannot be naively horizontally scaled, and why Redis pub/sub is the correct solution at this scale.
+A 1:1, turn-based, stateful session has exactly one correct owner at a time.
+Cross-instance work for this class of problem is *routing* — getting a connection
+to the right owner — not *state synchronization* across independent copies.
+Confusing the two is what produces split-brain bugs; keeping them separate is what
+avoids them.
 
 ---
 
 ## The Problem This Phase Solves
 
-In Phase 1, all state lives in one process. Player A and Player B are both connected to Server Instance 1. Everything works.
+In Phase 1, all state lives in one process. Player A and Player B are both
+connected to Server Instance 1. Everything works.
 
-Now run two instances:
+Run two instances and the naive version breaks in two different ways depending on
+how you try to fix it:
 
-```
-Player A ──► Server Instance 1
-Player B ──► Server Instance 2
-```
+- **Do nothing:** Player A and Player B may land on different instances with no
+  way for one to reach the other. The game breaks silently.
+- **Fix it with an ID scheme or a hash ring that decides routing from the gameID
+  alone:** this works until an instance crashes, fails over, and then *recovers*.
+  At that point the ID/ring still points new connection attempts back at the
+  recovered instance, which has no memory of the failover and will happily
+  reconstruct its own independent, diverging copy of the game — the same "game is
+  silently broken" failure, just reintroduced by the fix instead of by the
+  original problem. This was found and rejected during design (see ADR-021).
 
-Player A sends a move. Server 1 validates it, persists it, and tries to broadcast `MOVE_APPLIED` to Player B. But Player B's `*ws.Connection` is on Server 2. Server 1 has no pointer to it. The move is persisted to the database correctly but Player B never receives the event.
+The correct fix routes based on **who currently, actually owns the game** — a
+fact that only changes on deliberate reassignment (creation, genuine failover),
+never as a side effect of which instances happen to be alive at a given moment.
 
-**The game is silently broken.** This is the exact failure mode that Redis pub/sub solves.
+---
+
+## Architecture Summary
+
+**Co-location, not state sync.** Both players of a game are always served by the
+same instance. There is only ever one live `GameSession` for a game, on one
+process, at any moment. Cross-instance work is limited to answering "which
+instance is that" — never synchronizing board state, clocks, or connections
+across processes.
+
+**Two Redis keys per game, decoupled on purpose:**
+- `game:{gameID} → instanceID`, `EX 30`, renewed every 10s — the **ownership**
+  record. Stable by design; not the failure-detection signal.
+- `instance_alive:{instanceID}`, `EX 10`, renewed every 3s — the **liveness**
+  record, one per instance regardless of how many games it hosts. This is the
+  actual failure-detection signal, checked before a resolve call acts on an
+  ownership record it can't otherwise verify. See ADR-023 for why these are two
+  keys, not one, and why the liveness TTL is deliberately not tighter than this
+  (false-positive risk — see "Known Limitations" below).
+
+**Resolve-then-connect, not connect-then-relay.** The client never dials an
+instance blind. It resolves the correct instance first via a plain REST call,
+gets back a short-lived, masked routing credential, and only then opens the
+WebSocket — to the right instance on the first attempt in the overwhelming
+majority of cases. See "Connection Flow" below.
+
+**No Postgres schema change.** Ownership lives entirely in Redis. `games.id`
+remains a plain, unencoded `UUID` — no prefix, no suffix, no embedded routing
+information of any kind.
+
+**No `RedisEventBus`.** `LocalEventBus` (Phase 1) remains correct indefinitely
+under co-location — there is never a second process holding state for the same
+game that needs to be notified. ADR-010's Phase 2 half is superseded by ADR-021.
 
 ---
 
@@ -35,231 +88,202 @@ Player A sends a move. Server 1 validates it, persists it, and tries to broadcas
 
 ### In Scope
 
-- Redis pub/sub as cross-instance event bus
-- `RedisEventBus` implementation of the existing `EventBus` interface
-- Nginx or Caddy load balancer configuration for WebSocket connections
-- Two server instances running locally via docker-compose
-- Graceful handling of Redis connection failure
-- Deployment configuration: docker-compose with two server replicas + load balancer
+- `internal/game/directory.go`: `RoutingDirectory` interface + `RedisDirectory`
+  implementation (mirrors how `EventBus`/`LocalEventBus` already live together)
+- New short-lived `ConnectClaims` JWT type in `internal/auth`, alongside the
+  existing long-lived `PlayerClaims` (unchanged)
+- New endpoint: `GET /games/:id/resolve`
+- Per-instance heartbeat ticker (ownership renewal + liveness renewal, one loop,
+  two Redis writes) started in `main.go`, stopped in the shutdown sequence
+- `GameRegistry.GetOrHydrate`: atomic single-flight hydrate-on-miss, closing the
+  double-registration race a naive registry-miss check would reopen (same class of
+  bug ADR-017 already fixed once for first-connect)
+- nginx: plain round-robin for REST; a static label→upstream `map` for the WS Edge
+  Proxy (mechanical dereference only — no Redis/DB access at the proxy layer)
+- One-shot pre-deploy migration service in `docker-compose.yml`, closing TD-008
+  (see ADR-025)
+- Graceful-shutdown release of an instance's own Redis directory entries (don't
+  make a deliberate scale-down wait out a TTL)
+- `GameStore.UpdateGameStatus`'s missing status predicate fixed (pre-existing bug,
+  independent of this design, found during the Phase 2 code audit)
 
 ### Explicitly Out of Scope
 
 | Feature | Why |
 |---------|-----|
-| Redis persistence (AOF/RDB) | Pub/sub is fire-and-forget; durability is PostgreSQL's job |
-| Redis Cluster | Single Redis instance is sufficient for this scale |
-| Sticky sessions | This is the anti-pattern being replaced — must not be used |
-| Redis as a cache | Not needed yet |
-| Kubernetes | Operational complexity with no learning benefit at this stage |
-| Multiple Redis instances / Redis Sentinel | Over-engineering for a learning project |
+| Kubernetes, etcd, Consul | Deferred to Phase 8 — see that file for reasoning. Redis is the deliberately simpler tool for learning the lease/ownership concept itself; the stronger-consistency versions are a good *second* pass, not the first. |
+| Fencing tokens / ownership epochs | The textbook-complete fix for the residual false-positive liveness risk (see "Known Limitations"). Not built now — narrow, TTL-bounded window, real complexity, matches this project's standing discipline against solving races that aren't demonstrated to matter (ADR-014, ADR-016). Candidate for Phase 8, where k8s `Lease` gives this almost for free. |
+| Active liveness probing (instance-to-instance HTTP health checks) | Considered and rejected in favor of the two-key Redis design — see ADR-023. |
+| Eager `RestoreActiveGames`-at-startup | Deliberately dropped for Phase 2 — see ADR-024. Lazy hydrate-on-miss already has to exist; a second, overlapping "restore everything at boot" path adds nothing. |
+| Deterministic/eager game rebalancing on instance death | Statistical spread via round-robin is judged sufficient; a reverse index (`instance:{id} → set of gameIDs`) would be needed to build this later if it's ever shown to matter. Not built speculatively. |
 
 ---
 
-## Prerequisites from Phase 1
+## Connection Flow
 
-Before Phase 2 begins, verify:
+Every WS connect or reconnect — first connect after creation and every later
+reconnect — uses the **identical path**, deliberately, with no special-casing:
 
-- [ ] `EventBus` interface exists in `internal/game/eventbus.go`
-- [ ] `LocalEventBus` is the current implementation
-- [ ] `LocalEventBus` is injected via `main.go`, not hardcoded in game logic
-- [ ] All game events go through the EventBus, not via direct `*ws.Connection` writes
-- [ ] PostgreSQL is the source of truth for all game state
-- [ ] Server restart recovery works (Phase 1 acceptance criterion 3)
+1. Client calls `GET /games/:id/resolve` with its existing `playerToken`
+   (long-lived, from creation/join, unchanged). Round-robins to any instance Z.
+2. Z verifies `playerToken` (`auth.VerifyPlayerToken`, unchanged).
+3. Z reads `game:{id}` from Redis.
+   - **Hit, and `instance_alive:{owner}` present** → mint
+     `ConnectClaims{gameID, userID, color, instanceLabel: owner, exp: +10s}`,
+     return it plus the masked WS URL `wss://mygame.com/connect/{owner}`.
+   - **Miss, expired, or `instance_alive:{owner}` absent (owner confirmed dead
+     even if its 30s ownership record hasn't technically lapsed yet)** → Z
+     atomically claims ownership (idempotent whether or not it already held it),
+     hydrates via `GetGame` + `GetMovesForGame` + `chess.GameFromMoves` +
+     `NewGameSessionFromDB` (the same machinery Phase 1's `RestoreActiveGames`
+     already has), registers locally through `GetOrHydrate`'s single-flight lock,
+     mints `ConnectClaims{instanceLabel: Z}`.
+4. Client dials the masked URL. The **Edge Proxy** (nginx) mechanically maps
+   `{instanceLabel}` to an internal upstream via Docker Compose service DNS — no
+   Redis, no DB, no decision-making at this layer.
+5. Target instance verifies `ConnectClaims`, then runs **unmodified Phase 1
+   code**: `registry.Get` (should hit), `RegisterConnection` (ADR-017,
+   untouched), `GAME_STATE`/`OPPONENT_RECONNECTED`, clock start/resume. If
+   `registry.Get` still misses (narrow race inside the 10s window, or a
+   fast-restart gap — see ADR-024), the same `GetOrHydrate` path runs as a
+   safety net, regardless of cause.
 
-If the EventBus interface was not properly built in Phase 1, fix it before writing any Phase 2 code. Phase 2's entire design depends on this seam.
-
----
-
-## Architecture Change
-
-### Phase 1 Architecture (Single Instance)
-```
-Player A ──WS──► Server ──► LocalEventBus ──► Player B (same process)
-```
-
-### Phase 2 Architecture (Multi-Instance)
-```
-Player A ──WS──► Server 1 ──► RedisEventBus ──► Redis ──► Server 2 ──WS──► Player B
-                                    │                          │
-                              Publish to                  Subscribe to
-                            game:{gameID}               game:{gameID}
-```
-
-Every server instance subscribes to game channels it is currently hosting. When a move arrives:
-1. Server 1 receives the move from Player A
-2. Validates, persists to PostgreSQL (unchanged from Phase 1)
-3. Publishes `MOVE_APPLIED` event to Redis channel `game:{gameID}`
-4. Redis delivers the event to all subscribers — including Server 2
-5. Server 2 receives the event, looks up Player B's local `*ws.Connection`, and sends the message
+`POST /games/:id/join` and `GET /games/:id` are pure DB operations that never
+touch a live `GameSession` — round-robin, no affinity needed, no resolve step
+involved.
 
 ---
 
-## Key Technical Challenges
+## Server-Dies-Mid-Game — Three Scenarios (all must be covered by tests)
 
-### Challenge 1: Redis pub/sub is fire-and-forget
-
-Redis pub/sub has **at-most-once delivery**. If a subscriber is not connected when a message is published, the message is lost.
-
-**Implication:** If Server 2 restarts between the publish and the subscribe, the message is lost. The client will not receive `MOVE_APPLIED`. The client must handle this by requesting a full state sync (`GAME_STATE`) if it detects a gap.
-
-**What this teaches:** The difference between at-most-once (pub/sub), at-least-once (persistent queues), and exactly-once delivery. Understanding which guarantee is appropriate for each use case.
-
-### Challenge 2: Server restart during an active game
-
-When Server 2 restarts:
-1. Player B's WebSocket connection drops
-2. Player B reconnects (reconnection logic from Phase 1 handles this)
-3. Player B may reconnect to Server 1 or Server 2 depending on load balancer
-4. The new server instance must subscribe to `game:{gameID}` when Player B reconnects
-5. `RestoreActiveGames` from Phase 1 must also restore Redis subscriptions
-
-### Challenge 3: Load balancer WebSocket configuration
-
-WebSocket upgrade requires specific load balancer configuration:
-- `Upgrade` and `Connection` headers must be proxied, not consumed
-- Timeout must be significantly longer than HTTP (WebSockets are long-lived)
-- Health checks must target `/health`, not `/`
-
-Nginx requires explicit WebSocket proxy configuration. This is not automatic.
-
-### Challenge 4: What happens when Redis goes down
-
-Redis pub/sub going down means inter-instance communication fails. Players on different instances stop receiving moves from each other.
-
-**Phase 2 approach:** Detect Redis unavailability, log it, and degrade gracefully. Games where both players happen to be on the same instance continue working. Games across instances fail silently from the player's perspective — which is a bad experience but acceptable for a learning project at this stage.
-
-**What this teaches:** Thinking about failure modes, not just the happy path.
+1. **Failover, both players eventually reconnect.** First reconnect may hit a
+   stale ownership record but a missing liveness key, triggering immediate
+   failover rather than waiting out the ownership TTL. Second player resolves
+   fresh, lands directly on the correct instance, hits the ordinary Phase 1
+   reconnect branch unmodified.
+2. **Failover, origin instance recovers afterward.** Must be a non-event.
+   Ownership is Redis-truth; the recovered instance has no path to receiving
+   traffic for this specific game unless it legitimately re-wins the claim. This
+   is the direct test for the split-brain bug the original ID-prefix and
+   consistent-hash designs both had.
+3. **Failover for one player, the other never reconnects.** Indistinguishable
+   from an ordinary Phase 1 single-player disconnect from the new instance's
+   perspective. Existing 60s abandon timer and ADR-015's asymmetric outcome logic
+   apply unmodified.
 
 ---
 
-## New Components
+## Known Limitations (documented honestly, not silently solved)
 
-### `internal/game/redis_eventbus.go`
+**False-positive liveness signal can, in a narrow window, split a genuinely live
+game.** If an instance's `instance_alive` key transiently lapses (GC pause, brief
+Redis hiccup) while it's actually still serving live connections, and a *different*
+player's independent reconnect attempt lands on another instance during that exact
+window, that instance will incorrectly conclude the original is dead and hydrate a
+second, competing `GameSession`. The 3s/10s heartbeat/TTL numbers are chosen
+specifically to make this window narrow (comfortably longer than a GC pause or a
+momentary Redis blip), not to make it disappear. The complete fix is a fencing
+token / ownership epoch, deliberately deferred — see "Explicitly Out of Scope"
+above.
 
-Drop-in replacement for `LocalEventBus`. Implements the same `EventBus` interface.
+**Redis being down blocks new routing decisions, not live gameplay.** Already-
+connected players are unaffected — ongoing gameplay never touches Redis, only
+resolve calls do. Materially better degradation than the original Redis-pub/sub
+design, where a Redis outage broke live cross-instance delivery directly.
 
-```go
-type RedisEventBus struct {
-    client *redis.Client
-    // each gameID maps to its subscription goroutine
-    subscriptions map[string]func()  // gameID -> cancel func
-    mu            sync.Mutex
-}
-
-func (b *RedisEventBus) Publish(ctx context.Context, event GameEvent) error {
-    payload, err := json.Marshal(event)
-    if err != nil {
-        return fmt.Errorf("RedisEventBus.Publish marshal: %w", err)
-    }
-    return b.client.Publish(ctx, "game:"+event.GameID, payload).Err()
-}
-
-func (b *RedisEventBus) Subscribe(ctx context.Context, gameID string) (<-chan GameEvent, func(), error) {
-    // Subscribe to Redis channel, return a Go channel and an unsubscribe function
-}
-```
-
-**Startup injection (main.go):**
-```go
-// Phase 1:
-// eventBus := game.NewLocalEventBus()
-
-// Phase 2:
-redisClient := redis.NewClient(&redis.Options{Addr: os.Getenv("REDIS_URL")})
-eventBus := game.NewRedisEventBus(redisClient)
-```
-
-Zero changes to game logic. Only `main.go` changes.
-
-### Updated `docker-compose.yml`
-
-```yaml
-services:
-  postgres:
-    image: postgres:16-alpine
-    # ... unchanged
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
-  server-1:
-    build: .
-    environment:
-      - SERVER_PORT=8080
-      - DATABASE_URL=...
-      - REDIS_URL=redis:6379
-    ports:
-      - "8080:8080"
-
-  server-2:
-    build: .
-    environment:
-      - SERVER_PORT=8081
-      - DATABASE_URL=...
-      - REDIS_URL=redis:6379
-    ports:
-      - "8081:8081"
-
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
-```
+**Static Edge Proxy config.** Adding an instance requires an nginx config change
+and reload. No dynamic service discovery at the proxy layer in this phase — that
+capability is part of what Phase 8 (Kubernetes + ingress) buys.
 
 ---
 
 ## Implementation Checklist
 
 ### Step 1: Redis Infrastructure
-- [ ] Uncomment Redis service in docker-compose.yml
-- [ ] Add `go-redis/v9` dependency
-- [ ] Implement Redis client initialization in main.go
-- [ ] Verify Redis connection on startup, fail fast if unavailable
-- [ ] Add REDIS_URL to .env.example
+- [ ] Add Redis service to `docker-compose.yml`
+- [ ] Add Redis client dependency
+- [ ] `INSTANCE_ID` config value per replica
+- [ ] Verify Redis connection on startup; instance can still serve *already-owned,
+      already-hydrated* games if Redis is briefly unavailable — new resolves fail
+      cleanly, not a crash
 
-### Step 2: RedisEventBus Implementation
-- [ ] `internal/game/redis_eventbus.go`: full implementation
-- [ ] `Publish`: serialize GameEvent to JSON, publish to `game:{gameID}` channel
-- [ ] `Subscribe`: create Redis subscription, forward messages to Go channel, return unsubscribe func
-- [ ] Goroutine management: subscription goroutines must be tracked and cleaned up on game completion
-- [ ] Error handling: Redis publish failure must not crash the server
-- [ ] Unit tests: publish + subscribe delivers message (requires running Redis — integration tag)
+### Step 2: Routing Directory
+- [ ] `internal/game/directory.go`: `RoutingDirectory` interface
+- [ ] `RedisDirectory`: `ClaimOwnership`, `GetOwner`, `RenewOwnership`,
+      `ReleaseOwnership`, `SetAlive`, `IsAlive`, `RenewAlive`
+- [ ] Unit tests against a real Redis (integration tag), including a simulated
+      concurrent-claim race proving exactly one winner
 
-### Step 3: EventBus Swap in main.go
-- [ ] Replace `LocalEventBus` with `RedisEventBus` in main.go
-- [ ] Run existing Phase 1 tests against RedisEventBus — all must still pass
+### Step 3: GetOrHydrate
+- [ ] `GameRegistry.GetOrHydrate(gameID, hydrateFn)`: single-flight per-key lock,
+      closing the double-hydration race
+- [ ] Regression test: two goroutines racing a miss on the same gameID, verify
+      exactly one hydration occurs and both callers get the same session pointer
 
-### Step 4: Load Balancer Configuration
-- [ ] Create `nginx.conf` with WebSocket proxy configuration
-- [ ] WebSocket-specific headers: `Upgrade`, `Connection`
-- [ ] Upstream configuration with both server instances
-- [ ] Long timeout configuration (3600s for WebSocket)
-- [ ] Health check endpoint: `/health`
-- [ ] Test: both server instances receive traffic
+### Step 4: Auth — ConnectClaims
+- [ ] `internal/auth`: `ConnectClaims` type, `SignConnectToken`,
+      `VerifyConnectToken` (short expiry, same signing key as `PlayerClaims`)
+- [ ] Unit tests: expiry enforcement, tamper rejection, gameID/color match check
 
-### Step 5: Multi-Instance Testing
-- [ ] `make docker-up` starts all services: postgres, redis, server-1, server-2, nginx
-- [ ] Manually verify Player A connects to server-1 and Player B connects to server-2
-- [ ] (Check logs to confirm different instances)
-- [ ] Play a complete game — verify all moves arrive correctly on both sides
-- [ ] Kill server-2 mid-game, verify Player B can reconnect to server-1 and resume
+### Step 5: Resolve Endpoint
+- [ ] `GET /games/:id/resolve` handler: verify `playerToken`, directory lookup,
+      claim-and-hydrate on miss, mint `ConnectClaims`, return masked URL
+- [ ] Handler tests (httptest)
+- [ ] Test: `ConnectClaims` expiring in the gap between resolve returning and the
+      client actually dialing the WS — `WSHandler` must reject cleanly (not
+      panic, not hang), and the expected client behavior (re-call resolve, not
+      retry the stale masked URL) should be documented in the WS error response
+      itself
+- [ ] Test: resolving/reconnecting to a game already in a terminal status
+      (`COMPLETED`/`ABANDONED`) through the hydrate-on-miss path — confirm this
+      still returns the correct final `GAME_STATE` rather than erroring, since
+      hydration is new code that Phase 1's reconnect-to-finished-game behavior
+      was never previously exercised against
 
-### Step 6: Failure Mode Testing
-- [ ] Kill Redis mid-game
-- [ ] Verify server does not crash
-- [ ] Verify error is logged with gameID
-- [ ] Verify players receive appropriate disconnection/error messages
-- [ ] Restart Redis — verify new games work (existing games may need reconnection)
+### Step 6: Heartbeat Ticker
+- [ ] Per-instance ticker in `Manager`/`main.go`: batched ownership renewal
+      (`registry.AllActive()`) + liveness renewal, every 3s
+- [ ] Graceful shutdown: release owned entries proactively before exit
+- [ ] Goroutine-leak test for the ticker itself (this codebase's standing
+      discipline — see CLAUDE.md Known Sharp Edges on `goleak.IgnoreCurrent()`)
 
-### Step 7: Update Documentation
-- [ ] Update ARCHITECTURE.md: new architecture diagram, RedisEventBus section
-- [ ] Add ADR-013: Redis pub/sub chosen over sticky sessions
-- [ ] Add ADR-014: At-most-once delivery accepted for Phase 2 (vs at-least-once)
-- [ ] Update CLAUDE.md
+### Step 7: Edge Proxy / nginx
+- [ ] `nginx.conf`: round-robin upstream for REST; static `map` + named upstream
+      per instance label for `/connect/{instanceLabel}`
+- [ ] WebSocket upgrade headers (`Upgrade`, `Connection`), long timeouts
+- [ ] Health checks on `/health`
+
+### Step 8: WSHandler Changes
+- [ ] Accept `ConnectClaims` instead of `PlayerClaims` on the WS upgrade path
+- [ ] `registry.Get` → `GetOrHydrate` fallback on miss, regardless of cause
+
+### Step 9: TD-008 Resolution
+- [ ] One-shot `migrate` service in `docker-compose.yml`; server replicas
+      `depends_on: condition: service_completed_successfully`
+
+### Step 10: Bug Fix Carried In From Audit
+- [ ] `GameStore.UpdateGameStatus`: add status predicate to the `WHERE` clause
+
+### Step 11: Multi-Instance Testing (all three scenarios from above, explicitly)
+- [ ] Two players resolve to different instances via round-robin creation/join,
+      confirm both land on the same instance for gameplay
+- [ ] Kill an instance mid-game; reconnecting player fails over correctly
+      (Scenario 1)
+- [ ] Kill an instance, let it restart, confirm it does **not** re-acquire a game
+      that already failed over (Scenario 2 — the split-brain regression test)
+- [ ] Kill an instance where only one player ever reconnects; confirm normal
+      Phase 1 abandonment fires (Scenario 3)
+- [ ] Kill Redis mid-game; confirm no crash, confirm already-connected players are
+      unaffected, confirm new resolves fail cleanly
+- [ ] Reconnect to an already-completed game via the resolve → hydrate path;
+      confirm correct terminal `GAME_STATE` delivery, no error
+
+### Step 12: Documentation
+- [ ] `ARCHITECTURE.md`: routing directory section, corrected EventBus section
+- [ ] `DECISIONS_LOG_PHASE_2.md`: ADR-021 through ADR-025 (already logged during
+      design — verify against final implementation, amend Consequences if reality
+      diverges from the design)
+- [ ] Update `CLAUDE.md`
 
 ---
 
@@ -267,24 +291,23 @@ services:
 
 | # | Criterion |
 |---|-----------|
-| 1 | Two players connected to different server instances complete a full game |
-| 2 | All Phase 1 acceptance criteria still pass with the multi-instance setup |
-| 3 | Killing one server instance mid-game: player reconnects to remaining instance, game resumes |
-| 4 | Redis going down does not crash either server instance |
-| 5 | Load balancer correctly proxies WebSocket upgrade (Connection and Upgrade headers) |
-| 6 | All tests pass: `go test -race ./...` |
-| 7 | Server logs show correct gameID and instance identification on every event |
+| 1 | Two players, connecting independently, always end up co-located on the same instance |
+| 2 | All Phase 1 acceptance criteria still pass under the multi-instance setup |
+| 3 | Scenario 1 (failover, both reconnect): game resumes correctly on the new owner |
+| 4 | Scenario 2 (failover, origin recovers): recovered instance never re-hydrates a migrated game — no split game under any timing |
+| 5 | Scenario 3 (failover, one player never returns): normal abandonment semantics apply, unmodified |
+| 6 | Redis going down does not crash any instance; live gameplay is unaffected; new resolves fail cleanly |
+| 7 | Edge Proxy correctly proxies the WebSocket upgrade for a masked-URL connection |
+| 8 | All tests pass: `go test -race ./...`, including the `GetOrHydrate` single-flight regression test |
+| 9 | `TD-008` closed: concurrent replica startup never double-runs migrations |
+| 10 | `GameStore.UpdateGameStatus`'s status predicate fix verified with a regression test |
 
 ---
-
-## Technical Debt Carried From Phase 1
-
-Review CLAUDE.md for TD items that must be resolved before or during Phase 2.
 
 ## Technical Debt This Phase May Introduce
 
 | ID | Description | Must Fix By |
 |----|-------------|-------------|
-| TD-P2-001 | At-most-once Redis delivery — missed messages cause client desync | Phase 5 or when spectators need reliable delivery |
-| TD-P2-002 | No Redis health check or circuit breaker | Phase 6 |
-| TD-P2-003 | Subscription goroutine leak if unsubscribe not called on game completion | Verify in Phase 2 tests |
+| TD-P2-001 | No fencing token — narrow, TTL-bounded false-positive liveness window can theoretically split a live game | Phase 8 (k8s `Lease` gives this near-free) |
+| TD-P2-002 | Static Edge Proxy config — scaling requires a config edit + reload | Phase 8 (dynamic service discovery) |
+| TD-P2-003 | No active liveness probing — detection is purely TTL-based | Revisit only if TD-P2-001's window is shown to matter in practice |

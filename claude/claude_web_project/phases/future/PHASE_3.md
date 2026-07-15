@@ -179,6 +179,16 @@ When a match is found, both players receive:
 
 Players who were waiting in the queue should maintain a WebSocket connection to the matchmaking endpoint to receive this notification without polling.
 
+**Note (added post-Phase-2 redesign):** `MATCH_FOUND`'s `playerToken` is the same
+long-lived `PlayerClaims` type Phase 1/2 already use — it is *not* sufficient on
+its own to open the game's WebSocket connection under the Phase 2 routing design.
+After receiving `MATCH_FOUND`, the client follows the same `resolve → connect`
+flow used everywhere else (`GET /games/:id/resolve` with `playerToken`, then
+connect to the returned masked URL with the short-lived `ConnectClaims` it
+returns) — see `phases/current/PHASE_2.md`'s Connection Flow section. This is
+deliberate: match-found-then-connect and ordinary-reconnect should be the same
+code path, not two.
+
 **Design decision to make:** Should matchmaking use the same WebSocket connection as gameplay, or a separate one? Evaluate at phase start.
 
 ---

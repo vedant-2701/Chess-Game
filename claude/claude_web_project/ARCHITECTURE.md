@@ -2,6 +2,16 @@
 
 This document describes how the chess server is built, why it is built that way, and what the contracts between components are. It reflects the current implemented state, not aspirational plans. When the architecture changes, this document is updated in the same commit.
 
+> **Note on Phase 2:** as of this revision, Phase 2 is fully designed
+> (`phases/current/PHASE_2.md`, `DECISIONS_LOG_PHASE_2.md` ADR-021 through
+> ADR-025) but not yet implemented — the system below is still accurately
+> single-instance Phase 1. The one exception is the "EventBus Interface" section
+> further down, which is corrected now because it currently asserts a specific
+> forward plan (`RedisEventBus`) that has been superseded by design work, and an
+> incorrect stated plan is worse than no stated plan. The rest of this document
+> will be updated in the same commit as Phase 2's actual implementation, per this
+> file's own rule above — not before.
+
 ---
 
 ## System Overview (Phase 1)
@@ -284,9 +294,23 @@ When a player reconnects, their connectionID changes. The `GameSession` holds po
 
 ---
 
-## EventBus Interface (Phase 2 Seam)
+## EventBus Interface
 
-Phase 1 does not use Redis. But the architecture is designed so that Phase 2 (horizontal scaling) requires changing one concrete type, not restructuring the application.
+**Corrected — see note at top of this document.** This section originally read
+"(Phase 2 Seam)" and stated that Phase 2 would inject a `RedisEventBus` in place
+of `LocalEventBus`. That plan is superseded: Phase 2's design (co-located
+sessions, routed via a Redis-backed ownership/liveness directory — see
+`phases/current/PHASE_2.md`) never has two processes holding live state for the
+same game simultaneously, so there is nothing for a cross-instance event bus to
+synchronize. `LocalEventBus` is the permanent implementation, not a Phase-1
+placeholder. Full reasoning: `DECISIONS_LOG_PHASE_2.md` ADR-021, which supersedes
+the Phase 2 half of ADR-010 below (ADR-010 itself is not edited, per this
+project's append-only ADR discipline — it is superseded, not rewritten).
+
+Phase 1 does not use Redis. Redis is introduced in Phase 2, but not for the
+EventBus — it is used solely as a routing directory (which instance currently
+owns a given game), a different component with a different interface,
+unrelated to `EventBus`/`GameEvent` below.
 
 ```go
 // internal/game/eventbus.go
@@ -302,19 +326,15 @@ type EventBus interface {
     Subscribe(ctx context.Context, gameID string) (<-chan GameEvent, func(), error)
 }
 
-// Phase 1: in-process, no external dependency
+// Permanent implementation — not a Phase-1 placeholder (see correction above)
 type LocalEventBus struct {
     mu          sync.RWMutex
     subscribers map[string][]chan GameEvent
 }
-
-// Phase 2: drop-in replacement
-// type RedisEventBus struct {
-//     client *redis.Client
-// }
 ```
 
-In Phase 1, `LocalEventBus` is used. In Phase 2, `RedisEventBus` is injected at startup. No other code changes.
+`LocalEventBus` is used in Phase 1 and remains in use indefinitely. There is no
+`RedisEventBus` — see the correction above for why.
 
 ---
 
