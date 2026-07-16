@@ -423,3 +423,59 @@ migration-as-part-of-boot) and requires no new tooling beyond what
   hardening step but is not itself required to close TD-008.
 
 ---
+
+## ADR-026: Redis Client Library — redis/go-redis/v9
+
+**Date:** 2026-07-16
+**Status:** ACCEPTED
+
+**Context:**
+
+PHASE_2.md Step 1 requires a Redis client dependency for the routing directory
+(ownership + liveness keys, ADR-021/ADR-023) — not an EventBus, not a cache in
+the general sense. Two mainstream Go Redis clients exist.
+
+**Options Considered:**
+
+**Option A: `redis/go-redis/v9`**
+- Pros: Most widely used Go Redis client, native `context.Context` support on
+  every command (matches Non-Negotiable Constraint #7 — every I/O function
+  takes context first), built-in connection pooling comparable in spirit to
+  `pgxpool`, straightforward `Options{Addr: ...}` construction mirroring
+  `store.NewPool`'s shape, actively maintained, typed command results reduce
+  the same `interface{}`/`any` concerns ADR-011/CODING_GUIDELINES.md §8
+  already flag for other dependencies.
+- Cons: None specific to this project's needs.
+
+**Option B: `gomodule/redigo`**
+- Pros: Simpler, lower-level, smaller API surface.
+- Cons: `context.Context` support is bolted on rather than native to the core
+  API in the same way as go-redis/v9, and command results are largely
+  untyped (`interface{}`), pushing more manual type-assertion boilerplate
+  onto every call site — directly working against CODING_GUIDELINES.md §8's
+  "no `interface{}`/`any` without justification" rule for no offsetting
+  benefit here.
+
+**Decision:** `github.com/redis/go-redis/v9`.
+
+**Rationale:**
+
+Same category of decision as ADR-002 (gorilla/websocket) and ADR-005
+(pgx/v5): pick the client whose API shape matches this codebase's existing
+discipline (explicit context propagation, typed results, no ad hoc
+`interface{}` handling) rather than the more minimal option. This does not
+rise to the weight of a full architecture ADR — it is a library selection
+with one clearly dominant option — logged here only for the same
+completeness convention Phase 1's client/library choices (ADR-002 through
+ADR-006) already established.
+
+**Consequences:**
+- `github.com/redis/go-redis/v9` added to `go.mod`.
+- `internal/game/directory.go`'s `NewRedisClient` (PHASE_2.md Step 1) returns
+  `*redis.Client` from this package; Step 2's `RedisDirectory` will build on
+  the same client.
+- No transaction/pipelining strategy decided yet — deferred to Step 2, where
+  `RoutingDirectory`'s actual Redis command usage (`SET ... EX`, `GET`, etc.)
+  is designed.
+
+---

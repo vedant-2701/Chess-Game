@@ -231,7 +231,11 @@ func (p *MoveProcessor) handleGameOver(
 	storeReason := store.OutcomeReason(outcome.Reason)
 	session.SetOutcome(storeOutcome, storeReason)
 
-	if err := p.gameStore.UpdateGameStatus(ctx, session.ID, store.GameStatusCompleted, &store.GameOutcome{
+	// fromStatus is always ACTIVE: session.Transition(COMPLETED) just
+	// succeeded above, and validTransitions' only edge into COMPLETED is from
+	// ACTIVE — a successful in-memory transition is proof of the prior DB
+	// status.
+	if err := p.gameStore.UpdateGameStatus(ctx, session.ID, store.GameStatusActive, store.GameStatusCompleted, &store.GameOutcome{
 		Outcome: storeOutcome,
 		Reason:  storeReason,
 	}); err != nil {

@@ -241,7 +241,10 @@ func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.
 		// transitioned the session to ACTIVE.
 
 		// Persist status change. Non-fatal: in-memory state is authoritative.
-		if err := m.gameStore.UpdateGameStatus(ctx, gameID, store.GameStatusActive, nil); err != nil {
+		// fromStatus is always WAITING here — RegisterConnection only returns
+		// activated=true via the WAITING→ACTIVE edge (session.go's
+		// validTransitions has no other edge into ACTIVE).
+		if err := m.gameStore.UpdateGameStatus(ctx, gameID, store.GameStatusWaiting, store.GameStatusActive, nil); err != nil {
 			slog.Error("failed to persist ACTIVE status", "gameID", gameID, "error", err)
 		}
 
@@ -516,7 +519,13 @@ func (m *Manager) restoreGame(ctx context.Context, game *store.Game) error {
 			"gameID", game.ID, "outcome", outcome.Winner, "reason", outcome.Reason)
 		storeOutcome := store.Outcome(outcome.Winner)
 		storeReason := store.OutcomeReason(outcome.Reason)
-		if dbErr := m.gameStore.UpdateGameStatus(ctx, game.ID, store.GameStatusCompleted, &store.GameOutcome{
+		// fromStatus is game.Status (not hardcoded ACTIVE): this correction runs
+		// against a row freshly read via GetActiveGames, so game.Status is the
+		// authoritative known-current value, whether WAITING or ACTIVE. In
+		// practice a zombie terminal board can only occur for a game that was
+		// ACTIVE (WAITING games have no moves), but using the actual field here
+		// rather than assuming is the more defensive, self-documenting choice.
+		if dbErr := m.gameStore.UpdateGameStatus(ctx, game.ID, game.Status, store.GameStatusCompleted, &store.GameOutcome{
 			Outcome: storeOutcome,
 			Reason:  storeReason,
 		}); dbErr != nil {
@@ -560,7 +569,11 @@ func (m *Manager) handleResign(ctx context.Context, session *GameSession, color 
 	storeReason := store.OutcomeReasonResignation
 	session.SetOutcome(winnerOutcome, storeReason)
 
-	if err := m.gameStore.UpdateGameStatus(ctx, session.ID, store.GameStatusCompleted, &store.GameOutcome{
+	// fromStatus is always ACTIVE: session.Transition(COMPLETED) just
+	// succeeded above, and validTransitions' only edge into COMPLETED is
+	// from ACTIVE — a successful in-memory transition is proof of the prior
+	// DB status, no separate snapshot needed.
+	if err := m.gameStore.UpdateGameStatus(ctx, session.ID, store.GameStatusActive, store.GameStatusCompleted, &store.GameOutcome{
 		Outcome: winnerOutcome,
 		Reason:  storeReason,
 	}); err != nil {
@@ -600,7 +613,9 @@ func (m *Manager) handleTimeout(gameID string, timedOut store.Color) {
 	storeReason := store.OutcomeReasonTimeout
 	session.SetOutcome(winnerOutcome, storeReason)
 
-	if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusCompleted, &store.GameOutcome{
+	// fromStatus is always ACTIVE — same reasoning as handleResign: a
+	// successful Transition(COMPLETED) is only reachable from ACTIVE.
+	if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusActive, store.GameStatusCompleted, &store.GameOutcome{
 		Outcome: winnerOutcome,
 		Reason:  storeReason,
 	}); err != nil {
@@ -662,7 +677,12 @@ func (m *Manager) onAbandonTimeout(gameID string, color store.Color) {
 
 		winnerOutcome := store.Outcome(opponent)
 		session.SetOutcome(winnerOutcome, store.OutcomeReasonAbandoned)
-		if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusCompleted, &store.GameOutcome{
+		// fromStatus is always ACTIVE: Transition(COMPLETED) just succeeded, and
+		// that edge only exists from ACTIVE. Note this means a WAITING game
+		// whose sole creator disconnects and never returns can never reach this
+		// branch's Transition call successfully in the first place — see the
+		// separate, pre-existing gap flagged in this session's summary.
+		if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusActive, store.GameStatusCompleted, &store.GameOutcome{
 			Outcome: winnerOutcome,
 			Reason:  store.OutcomeReasonAbandoned,
 		}); err != nil {
@@ -689,7 +709,10 @@ func (m *Manager) onAbandonTimeout(gameID string, color store.Color) {
 	}
 
 	session.SetOutcome(store.OutcomeDraw, store.OutcomeReasonAbandoned)
-	if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusAbandoned, &store.GameOutcome{
+	// fromStatus is always ACTIVE: Transition(ABANDONED) just succeeded, and
+	// that edge only exists from ACTIVE (same pre-existing WAITING-game gap
+	// noted above applies here too).
+	if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusActive, store.GameStatusAbandoned, &store.GameOutcome{
 		Outcome: store.OutcomeDraw,
 		Reason:  store.OutcomeReasonAbandoned,
 	}); err != nil {

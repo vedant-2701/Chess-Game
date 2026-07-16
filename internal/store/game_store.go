@@ -118,11 +118,30 @@ func (s *GameStore) GetGame(ctx context.Context, id string) (*Game, error) {
 	return game, nil
 }
 
-// UpdateGameStatus sets the game's status. When the game is transitioning to a
-// terminal state (COMPLETED or ABANDONED), pass a non-nil outcome carrying both
-// the outcome and reason. For non-terminal transitions (e.g. WAITING → ACTIVE),
-// pass nil — outcome and outcome_reason in the DB remain NULL.
-func (s *GameStore) UpdateGameStatus(ctx context.Context, id string, status GameStatus, outcome *GameOutcome) error {
+// UpdateGameStatus performs an atomic conditional transition: the row's status
+// is only changed from fromStatus to status if the row's current status still
+// equals fromStatus at the moment PostgreSQL evaluates the WHERE clause. This
+// is a compare-and-swap, not an unconditional write — the original version of
+// this method had no status predicate at all, which was found during the
+// Phase 2 design audit to contradict the safe-concurrent-terminal-write
+// assumptions the Phase 2 walkthrough had been built on (see
+// DECISIONS_LOG_PHASE_2.md ADR-021). This fix is independent of Phase 2's
+// architecture and closes a real gap even under Phase 1's single-instance
+// model — e.g. two goroutines racing a resign against a timeout.
+//
+// When the game is transitioning to a terminal state (COMPLETED or ABANDONED),
+// pass a non-nil outcome carrying both the outcome and reason. For non-terminal
+// transitions (WAITING → ACTIVE), pass nil — outcome and outcome_reason in the
+// DB remain NULL.
+//
+// Every current call site already knows the row exists — it was just read from
+// the DB (GetGame/GetActiveGames) or is backing an in-memory GameSession that
+// was itself hydrated from a DB row — so RowsAffected() == 0 here always means
+// the predicate failed (status no longer equals fromStatus), never a missing
+// row. Mirrors the reasoning already established for
+// UpdatePlayerBlack/ErrGameNotJoinable (ADR-016): the atomic write, not a
+// prior application-level check, is the actual correctness guarantee.
+func (s *GameStore) UpdateGameStatus(ctx context.Context, id string, fromStatus, status GameStatus, outcome *GameOutcome) error {
 	var outcomeVal, outcomeReasonVal *string
 	if outcome != nil {
 		o := string(outcome.Outcome)
@@ -134,14 +153,14 @@ func (s *GameStore) UpdateGameStatus(ctx context.Context, id string, status Game
 	const q = `
 		UPDATE games
 		SET status = $1, outcome = $2, outcome_reason = $3, updated_at = NOW()
-		WHERE id = $4`
+		WHERE id = $4 AND status = $5`
 
-	tag, err := s.pool.Exec(ctx, q, string(status), outcomeVal, outcomeReasonVal, id)
+	tag, err := s.pool.Exec(ctx, q, string(status), outcomeVal, outcomeReasonVal, id, string(fromStatus))
 	if err != nil {
-		return fmt.Errorf("GameStore.UpdateGameStatus gameID=%s status=%s: %w", id, status, err)
+		return fmt.Errorf("GameStore.UpdateGameStatus gameID=%s fromStatus=%s status=%s: %w", id, fromStatus, status, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("GameStore.UpdateGameStatus gameID=%s: %w", id, ErrGameNotFound)
+		return fmt.Errorf("GameStore.UpdateGameStatus gameID=%s fromStatus=%s status=%s: %w", id, fromStatus, status, ErrGameStatusConflict)
 	}
 	return nil
 }
