@@ -88,6 +88,7 @@ func TestGameStore_UpdateGameStatus(t *testing.T) {
 
 	tests := []struct {
 		name          string
+		fromStatus    GameStatus
 		newStatus     GameStatus
 		outcome       *GameOutcome
 		wantStatus    GameStatus
@@ -96,6 +97,7 @@ func TestGameStore_UpdateGameStatus(t *testing.T) {
 	}{
 		{
 			name:          "WAITING to ACTIVE (no outcome)",
+			fromStatus:    GameStatusWaiting,
 			newStatus:     GameStatusActive,
 			outcome:       nil,
 			wantStatus:    GameStatusActive,
@@ -104,6 +106,7 @@ func TestGameStore_UpdateGameStatus(t *testing.T) {
 		},
 		{
 			name:          "ACTIVE to COMPLETED with checkmate",
+			fromStatus:    GameStatusActive,
 			newStatus:     GameStatusCompleted,
 			outcome:       &GameOutcome{Outcome: OutcomeWhite, Reason: OutcomeReasonCheckmate},
 			wantStatus:    GameStatusCompleted,
@@ -112,6 +115,7 @@ func TestGameStore_UpdateGameStatus(t *testing.T) {
 		},
 		{
 			name:          "ACTIVE to COMPLETED with timeout",
+			fromStatus:    GameStatusActive,
 			newStatus:     GameStatusCompleted,
 			outcome:       &GameOutcome{Outcome: OutcomeBlack, Reason: OutcomeReasonTimeout},
 			wantStatus:    GameStatusCompleted,
@@ -120,6 +124,7 @@ func TestGameStore_UpdateGameStatus(t *testing.T) {
 		},
 		{
 			name:          "ACTIVE to ABANDONED",
+			fromStatus:    GameStatusActive,
 			newStatus:     GameStatusAbandoned,
 			outcome:       &GameOutcome{Outcome: OutcomeDraw, Reason: OutcomeReasonAbandoned},
 			wantStatus:    GameStatusAbandoned,
@@ -134,7 +139,19 @@ func TestGameStore_UpdateGameStatus(t *testing.T) {
 			mustCreateUser(t, testWhiteID)
 			mustCreateGame(t, testGameID, testWhiteID)
 
-			err := gs.UpdateGameStatus(ctx, testGameID, tt.newStatus, tt.outcome)
+			// mustCreateGame leaves the row in WAITING_FOR_PLAYER. Advance it to
+			// ACTIVE first for any case whose fromStatus is ACTIVE, so the
+			// conditional UPDATE under test has a true starting state to match
+			// against — otherwise every ACTIVE-fromStatus case would spuriously
+			// hit the new ErrGameStatusConflict path instead of exercising a
+			// genuine transition.
+			if tt.fromStatus == GameStatusActive {
+				if err := gs.UpdateGameStatus(ctx, testGameID, GameStatusWaiting, GameStatusActive, nil); err != nil {
+					t.Fatalf("setup: advance to ACTIVE: %v", err)
+				}
+			}
+
+			err := gs.UpdateGameStatus(ctx, testGameID, tt.fromStatus, tt.newStatus, tt.outcome)
 			if err != nil {
 				t.Fatalf("UpdateGameStatus: %v", err)
 			}
@@ -174,11 +191,110 @@ func TestGameStore_UpdateGameStatus(t *testing.T) {
 		})
 	}
 
-	t.Run("returns ErrGameNotFound for unknown ID", func(t *testing.T) {
+	t.Run("returns ErrGameStatusConflict for unknown ID", func(t *testing.T) {
+		// Per the new method's documented contract, a nonexistent row and a
+		// row whose status doesn't match fromStatus are indistinguishable from
+		// RowsAffected() alone, and every real call site already guarantees
+		// existence before calling — so a missing row also surfaces as
+		// ErrGameStatusConflict, not ErrGameNotFound. This is a deliberate
+		// contract choice (see the method's doc comment), not an oversight.
 		truncateAll(t)
-		err := gs.UpdateGameStatus(ctx, "cccccccc-cccc-cccc-cccc-cccccccccccc", GameStatusActive, nil)
-		if !errors.Is(err, ErrGameNotFound) {
-			t.Errorf("expected ErrGameNotFound, got: %v", err)
+		err := gs.UpdateGameStatus(ctx, "cccccccc-cccc-cccc-cccc-cccccccccccc", GameStatusWaiting, GameStatusActive, nil)
+		if !errors.Is(err, ErrGameStatusConflict) {
+			t.Errorf("expected ErrGameStatusConflict, got: %v", err)
+		}
+	})
+
+	t.Run("returns ErrGameStatusConflict when fromStatus does not match current row status", func(t *testing.T) {
+		// The actual regression case this fix exists for: a caller whose
+		// belief about the game's prior status (fromStatus) is stale — e.g. a
+		// second writer racing a terminal-state transition — must lose the
+		// race cleanly via the predicate, not silently overwrite the winner.
+		truncateAll(t)
+		mustCreateUser(t, testWhiteID)
+		mustCreateGame(t, testGameID, testWhiteID)
+		// Row is WAITING_FOR_PLAYER. Ask for an ACTIVE→COMPLETED transition
+		// (fromStatus=ACTIVE) against a row that is actually still WAITING.
+		err := gs.UpdateGameStatus(ctx, testGameID, GameStatusActive, GameStatusCompleted,
+			&GameOutcome{Outcome: OutcomeWhite, Reason: OutcomeReasonCheckmate})
+		if !errors.Is(err, ErrGameStatusConflict) {
+			t.Errorf("expected ErrGameStatusConflict, got: %v", err)
+		}
+
+		// Confirm the row was left untouched by the failed conditional write.
+		game, getErr := gs.GetGame(ctx, testGameID)
+		if getErr != nil {
+			t.Fatalf("GetGame: %v", getErr)
+		}
+		if game.Status != GameStatusWaiting {
+			t.Errorf("Status: got %q, want %q (write must not have applied)", game.Status, GameStatusWaiting)
+		}
+		if game.Outcome != nil {
+			t.Errorf("Outcome: expected nil (write must not have applied), got %v", *game.Outcome)
+		}
+	})
+
+	t.Run("concurrent racing writers: exactly one transition wins", func(t *testing.T) {
+		// Reproduces the class of bug this predicate closes: two goroutines
+		// both believing the game is ACTIVE and both racing a terminal
+		// transition (e.g. resign vs. timeout in Phase 1; two instances
+		// racing during TD-P2-001's window in Phase 2). Without the fromStatus
+		// predicate, whichever write commits last would silently overwrite
+		// the first writer's outcome. With it, exactly one of the two
+		// conditional UPDATEs should affect a row.
+		truncateAll(t)
+		mustCreateUser(t, testWhiteID)
+		mustCreateGame(t, testGameID, testWhiteID)
+		if err := gs.UpdateGameStatus(ctx, testGameID, GameStatusWaiting, GameStatusActive, nil); err != nil {
+			t.Fatalf("setup: advance to ACTIVE: %v", err)
+		}
+
+		type result struct {
+			err error
+		}
+		results := make(chan result, 2)
+
+		go func() {
+			err := gs.UpdateGameStatus(ctx, testGameID, GameStatusActive, GameStatusCompleted,
+				&GameOutcome{Outcome: OutcomeWhite, Reason: OutcomeReasonResignation})
+			results <- result{err: err}
+		}()
+		go func() {
+			err := gs.UpdateGameStatus(ctx, testGameID, GameStatusActive, GameStatusCompleted,
+				&GameOutcome{Outcome: OutcomeBlack, Reason: OutcomeReasonTimeout})
+			results <- result{err: err}
+		}()
+
+		r1, r2 := <-results, <-results
+
+		successes, conflicts := 0, 0
+		for _, r := range []result{r1, r2} {
+			switch {
+			case r.err == nil:
+				successes++
+			case errors.Is(r.err, ErrGameStatusConflict):
+				conflicts++
+			default:
+				t.Fatalf("unexpected error: %v", r.err)
+			}
+		}
+		if successes != 1 || conflicts != 1 {
+			t.Fatalf("expected exactly 1 success and 1 conflict, got %d successes, %d conflicts", successes, conflicts)
+		}
+
+		// The persisted outcome must belong to whichever writer actually won —
+		// not be some torn/mixed combination of both.
+		game, err := gs.GetGame(ctx, testGameID)
+		if err != nil {
+			t.Fatalf("GetGame: %v", err)
+		}
+		if game.Status != GameStatusCompleted {
+			t.Errorf("Status: got %q, want %q", game.Status, GameStatusCompleted)
+		}
+		validPair := (*game.Outcome == OutcomeWhite && *game.OutcomeReason == OutcomeReasonResignation) ||
+			(*game.Outcome == OutcomeBlack && *game.OutcomeReason == OutcomeReasonTimeout)
+		if !validPair {
+			t.Errorf("outcome/reason pair is not from either racing writer: outcome=%v reason=%v", *game.Outcome, *game.OutcomeReason)
 		}
 	})
 }
@@ -259,10 +375,10 @@ func TestGameStore_GetActiveGames(t *testing.T) {
 		mustCreateGame(t, doneID, testWhiteID)
 
 		// Advance active and done games to their respective statuses
-		if err := gs.UpdateGameStatus(ctx, activeID, GameStatusActive, nil); err != nil {
+		if err := gs.UpdateGameStatus(ctx, activeID, GameStatusWaiting, GameStatusActive, nil); err != nil {
 			t.Fatalf("set active: %v", err)
 		}
-		if err := gs.UpdateGameStatus(ctx, doneID, GameStatusCompleted,
+		if err := gs.UpdateGameStatus(ctx, doneID, GameStatusWaiting, GameStatusCompleted,
 			&GameOutcome{Outcome: OutcomeWhite, Reason: OutcomeReasonCheckmate}); err != nil {
 			t.Fatalf("set completed: %v", err)
 		}
