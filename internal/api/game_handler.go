@@ -5,10 +5,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/vedant-2701/chess/internal/auth"
 	"github.com/vedant-2701/chess/internal/game"
 	"github.com/vedant-2701/chess/internal/store"
 )
@@ -29,11 +31,19 @@ import (
 type GameHandler struct {
 	manager   *game.Manager
 	userStore *store.UserStore
+
+	// jwtSecret is needed to verify the PlayerClaims bearer token on
+	// Resolve (PHASE_2.md Step 5) — Manager already holds its own copy
+	// internally for signing, but that field is private, so this mirrors
+	// WSHandler's identical pattern (it also holds its own jwtSecret
+	// separately from Manager) rather than exposing Manager's internal
+	// field.
+	jwtSecret string
 }
 
 // NewGameHandler constructs a GameHandler.
-func NewGameHandler(manager *game.Manager, userStore *store.UserStore) *GameHandler {
-	return &GameHandler{manager: manager, userStore: userStore}
+func NewGameHandler(manager *game.Manager, userStore *store.UserStore, jwtSecret string) *GameHandler {
+	return &GameHandler{manager: manager, userStore: userStore, jwtSecret: jwtSecret}
 }
 
 type createGameResponseData struct {
@@ -55,6 +65,20 @@ type getGameResponseData struct {
 	CurrentFEN    string  `json:"currentFEN"`
 	Outcome       *string `json:"outcome"`
 	OutcomeReason *string `json:"outcomeReason"`
+}
+
+// resolveResponseData is PHASE_2.md Step 5/ADR-022's resolve response:
+// a short-lived ConnectClaims JWT plus enough for the client to construct
+// the actual WebSocket URL. WSPath is a relative path only ("/connect/
+// {instanceLabel}") — scheme and host are deployment-specific and
+// deliberately not hardcoded here; the client (or, once Step 7's Edge Proxy
+// exists, whatever fronts it) prepends its own. InstanceLabel is also
+// returned standalone since WSPath alone doesn't cleanly separate it back
+// out for a caller that wants it directly.
+type resolveResponseData struct {
+	ConnectToken  string `json:"connectToken"`
+	InstanceLabel string `json:"instanceLabel"`
+	WSPath        string `json:"wsPath"`
 }
 
 type healthResponseData struct {
@@ -172,6 +196,87 @@ func (h *GameHandler) JoinGame(w http.ResponseWriter, r *http.Request) {
 		GameID:      gameID,
 		PlayerToken: token,
 		Color:       string(store.ColorBlack),
+	})
+}
+
+// bearerToken extracts the token from an "Authorization: Bearer <token>"
+// header. Returns "" if absent or malformed.
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(h, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(h, prefix)
+}
+
+// Resolve implements GET /games/{id}/resolve (PHASE_2.md Step 5, ADR-022).
+//
+// Authentication differs deliberately from WSHandler's ?token= query
+// parameter: this endpoint reads the existing long-lived playerToken from an
+// Authorization: Bearer header instead. WSHandler's query-param approach
+// exists only because browser WebSocket APIs cannot send custom headers
+// before the upgrade completes (CLAUDE.md TD-001) — a plain REST GET has no
+// such constraint, and there is no reason for a brand-new endpoint to
+// compound TD-001's log-visibility concern (query params routinely end up in
+// access logs) when a header costs nothing extra here.
+//
+// Flow: verify the existing playerToken (same verification WSHandler already
+// does — signature, gameID match, valid color), then delegate the actual
+// ownership resolution to Manager.ResolveGame, which returns a short-lived
+// ConnectClaims token scoped to whichever instance legitimately owns (or has
+// just claimed) the game.
+func (h *GameHandler) Resolve(w http.ResponseWriter, r *http.Request) {
+	gameID := chi.URLParam(r, "id")
+	if gameID == "" {
+		writeError(w, http.StatusBadRequest, errCodeInvalidRequest, "missing game id in URL")
+		return
+	}
+
+	token := bearerToken(r)
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, game.ErrCodeInvalidToken, "missing Authorization: Bearer token")
+		return
+	}
+
+	claims, err := auth.VerifyPlayerToken(token, h.jwtSecret)
+	if err != nil {
+		slog.Warn("GameHandler.Resolve: token verification failed", "gameID", gameID, "error", err)
+		writeError(w, http.StatusUnauthorized, game.ErrCodeInvalidToken, "invalid or expired token")
+		return
+	}
+
+	if claims.GameID != gameID {
+		slog.Warn("GameHandler.Resolve: token gameID does not match URL",
+			"urlGameID", gameID, "tokenGameID", claims.GameID)
+		writeError(w, http.StatusUnauthorized, game.ErrCodeInvalidToken, "token does not match this game")
+		return
+	}
+
+	color := store.Color(claims.Color)
+	if color != store.ColorWhite && color != store.ColorBlack {
+		slog.Error("GameHandler.Resolve: token has an invalid color claim",
+			"gameID", gameID, "color", claims.Color)
+		writeError(w, http.StatusUnauthorized, game.ErrCodeInvalidToken, "token has invalid claims")
+		return
+	}
+
+	connectToken, instanceLabel, err := h.manager.ResolveGame(r.Context(), gameID, claims.UserID, color)
+	if err != nil {
+		if errors.Is(err, store.ErrGameNotFound) {
+			writeError(w, http.StatusNotFound, game.ErrCodeGameNotFound, "game not found")
+			return
+		}
+		slog.Error("GameHandler.Resolve: Manager.ResolveGame failed",
+			"gameID", gameID, "userID", claims.UserID, "error", err)
+		writeError(w, http.StatusInternalServerError, game.ErrCodeInternalError, "failed to resolve game")
+		return
+	}
+
+	writeData(w, http.StatusOK, resolveResponseData{
+		ConnectToken:  connectToken,
+		InstanceLabel: instanceLabel,
+		WSPath:        "/connect/" + instanceLabel,
 	})
 }
 
