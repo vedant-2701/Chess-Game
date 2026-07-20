@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"github.com/vedant-2701/chess/internal/store"
 )
 
@@ -15,6 +16,13 @@ import (
 // package. Initialised once in TestMain and closed after all tests complete.
 // Mirrors internal/game/testmain_test.go's pattern exactly.
 var testPool *pgxpool.Pool
+
+// testRedisClient is the shared Redis client for this package's resolve-
+// endpoint tests (PHASE_2.md Step 5+), isolated on DB 1 — same rationale and
+// same pattern as internal/game/testmain_test.go's testRedisClient. Most
+// tests in this package (WSHandler, GameHandler's non-resolve endpoints)
+// don't touch this at all; only resolve_test.go's helpers do.
+var testRedisClient *redis.Client
 
 func TestMain(m *testing.M) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
@@ -33,11 +41,34 @@ func TestMain(m *testing.M) {
 		os.Stderr.WriteString("  Is the database running? Set TEST_DATABASE_URL or run: make docker-up\n")
 		os.Exit(1)
 	}
-
 	testPool = pool
+
+	redisAddr := os.Getenv("TEST_REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr, DB: 1})
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		os.Stderr.WriteString("api integration tests: redis ping failed: " + err.Error() + "\n")
+		os.Stderr.WriteString("  Is redis running? Set TEST_REDIS_ADDR or run: make docker-up\n")
+		pool.Close()
+		os.Exit(1)
+	}
+	testRedisClient = redisClient
+
 	code := m.Run()
+
 	pool.Close()
+	redisClient.Close()
 	os.Exit(code)
+}
+
+// flushTestRedisDB wipes DB 1 only — see testRedisClient's doc comment.
+func flushTestRedisDB(t *testing.T) {
+	t.Helper()
+	if err := testRedisClient.FlushDB(context.Background()).Err(); err != nil {
+		t.Fatalf("flushTestRedisDB: %v", err)
+	}
 }
 
 // truncateAll removes all rows from every table in dependency order. Called

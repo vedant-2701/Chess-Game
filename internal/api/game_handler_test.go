@@ -29,12 +29,13 @@ import (
 func newTestGameServer(t *testing.T, manager *game.Manager) *httptest.Server {
 	t.Helper()
 	userStore := store.NewUserStore(testPool)
-	handler := NewGameHandler(manager, userStore)
+	handler := NewGameHandler(manager, userStore, testJWTSecret)
 
 	r := chi.NewRouter()
 	r.Post("/games", handler.CreateGame)
 	r.Post("/games/{id}/join", handler.JoinGame)
 	r.Get("/games/{id}", handler.GetGame)
+	r.Get("/games/{id}/resolve", handler.Resolve)
 	r.Get("/health", handler.Health)
 
 	srv := httptest.NewServer(r)

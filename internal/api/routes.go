@@ -25,7 +25,7 @@ import (
 // context.WithCancel call and its matching cancel func for the whole
 // process, instead of routes.go silently creating its own.
 func NewRouter(manager *game.Manager, userStore *store.UserStore, wsRegistry *ws.Registry, jwtSecret string, wsCtx context.Context) http.Handler {
-	gameHandler := NewGameHandler(manager, userStore)
+	gameHandler := NewGameHandler(manager, userStore, jwtSecret)
 	wsHandler := NewWSHandler(wsCtx, manager, wsRegistry, jwtSecret)
 
 	r := chi.NewRouter()
@@ -41,6 +41,7 @@ func NewRouter(manager *game.Manager, userStore *store.UserStore, wsRegistry *ws
 	r.Post("/games", gameHandler.CreateGame)
 	r.Post("/games/{id}/join", gameHandler.JoinGame)
 	r.Get("/games/{id}", gameHandler.GetGame)
+	r.Get("/games/{id}/resolve", gameHandler.Resolve)
 	r.Get("/health", gameHandler.Health)
 	r.Get("/ws/game/{id}", wsHandler.ServeHTTP)
 

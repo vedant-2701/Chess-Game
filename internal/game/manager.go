@@ -77,12 +77,28 @@ type Manager struct {
 	jwtSecret string
 	validator *internalchess.Validator
 
+	// directory and instanceID are PHASE_2.md Step 5's additions — the
+	// routing directory used by ResolveGame to determine game ownership, and
+	// this process's own identity within it. Both are nil-safe zero values
+	// (nil interface, empty string) for any caller that never calls
+	// ResolveGame — e.g. existing tests exercising CreateGame/JoinGame/
+	// RestoreActiveGames/HandleConnect are entirely unaffected by these
+	// fields being unset.
+	directory  RoutingDirectory
+	instanceID string
+
 	// mu protects: abandonTimers.
 	mu            sync.Mutex
 	abandonTimers map[string]*time.Timer // key: gameID+":"+string(color)
 }
 
 // NewManager constructs a Manager with all required dependencies.
+//
+// directory and instanceID are PHASE_2.md Step 5's additions, required for
+// ResolveGame only. Pass directory=nil, instanceID="" for any caller that
+// never calls ResolveGame (e.g. Phase 1 single-instance wiring, or tests
+// exercising only CreateGame/JoinGame/HandleConnect/RestoreActiveGames) —
+// ResolveGame is the only method that touches either field.
 func NewManager(
 	registry *GameRegistry,
 	processor *MoveProcessor,
@@ -91,6 +107,8 @@ func NewManager(
 	eventBus EventBus,
 	jwtSecret string,
 	validator *internalchess.Validator,
+	directory RoutingDirectory,
+	instanceID string,
 ) *Manager {
 	return &Manager{
 		registry:      registry,
@@ -100,6 +118,8 @@ func NewManager(
 		eventBus:      eventBus,
 		jwtSecret:     jwtSecret,
 		validator:     validator,
+		directory:     directory,
+		instanceID:    instanceID,
 		abandonTimers: make(map[string]*time.Timer),
 	}
 }

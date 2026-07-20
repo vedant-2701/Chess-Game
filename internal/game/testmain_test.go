@@ -8,12 +8,21 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"github.com/vedant-2701/chess/internal/store"
 )
 
 // testPool is the shared connection pool for all integration tests in this package.
 // Initialised once in TestMain and closed after all tests complete.
 var testPool *pgxpool.Pool
+
+// testRedisClient is the shared Redis client for internal/game's Step 2+
+// integration tests (RoutingDirectory). Isolated from whatever a developer
+// might have running against Redis DB 0 by using DB 1 instead — the Redis
+// equivalent of testPool connecting to a separate chess_dev Postgres database
+// rather than the default chess database. flushTestRedisDB (called at the
+// start of every directory test) only ever touches DB 1.
+var testRedisClient *redis.Client
 
 func TestMain(m *testing.M) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
@@ -32,11 +41,36 @@ func TestMain(m *testing.M) {
 		os.Stderr.WriteString("  Is the database running? Set TEST_DATABASE_URL or run: make docker-up\n")
 		os.Exit(1)
 	}
-
 	testPool = pool
+
+	redisAddr := os.Getenv("TEST_REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr, DB: 1})
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		os.Stderr.WriteString("game integration tests: redis ping failed: " + err.Error() + "\n")
+		os.Stderr.WriteString("  Is redis running? Set TEST_REDIS_ADDR or run: make docker-up\n")
+		pool.Close()
+		os.Exit(1)
+	}
+	testRedisClient = redisClient
+
 	code := m.Run()
+
 	pool.Close()
+	redisClient.Close()
 	os.Exit(code)
+}
+
+// flushTestRedisDB wipes DB 1 only (see testRedisClient's doc comment) — the
+// Redis analog of truncateAll, called at the start of every directory test to
+// guarantee a clean slate.
+func flushTestRedisDB(t *testing.T) {
+	t.Helper()
+	if err := testRedisClient.FlushDB(context.Background()).Err(); err != nil {
+		t.Fatalf("flushTestRedisDB: %v", err)
+	}
 }
 
 // truncateAll removes all rows from every table in dependency order.
@@ -79,7 +113,10 @@ func mustCreateActiveGame(t *testing.T, gameID, whiteID, blackID string) *GameSe
 	if err := gs.UpdatePlayerBlack(ctx, gameID, blackID); err != nil {
 		t.Fatalf("mustCreateActiveGame UpdatePlayerBlack: %v", err)
 	}
-	if err := gs.UpdateGameStatus(ctx, gameID, store.GameStatusActive, nil); err != nil {
+	// fromStatus is WAITING: this helper builds a freshly-created game up to
+	// ACTIVE, mirroring the only real edge into ACTIVE (session.go's
+	// validTransitions has no other one).
+	if err := gs.UpdateGameStatus(ctx, gameID, store.GameStatusWaiting, store.GameStatusActive, nil); err != nil {
 		t.Fatalf("mustCreateActiveGame UpdateGameStatus: %v", err)
 	}
 

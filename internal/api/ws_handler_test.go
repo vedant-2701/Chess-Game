@@ -37,7 +37,7 @@ func newTestManager(t *testing.T) *game.Manager {
 	validator := internalchess.NewValidator()
 	eventBus := game.NewLocalEventBus()
 	processor := game.NewMoveProcessor(validator, gameStore, moveStore, eventBus)
-	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator)
+	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator, nil, "")
 }
 
 // newTestServer wires WSHandler behind a chi router exactly as Step 12's
