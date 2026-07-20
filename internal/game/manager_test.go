@@ -29,7 +29,7 @@ func newTestManager(t *testing.T) *Manager {
 	validator := internalchess.NewValidator()
 	processor := NewMoveProcessor(validator, gameStore, moveStore, bus)
 
-	return NewManager(registry, processor, gameStore, moveStore, bus, "test-jwt-secret-not-for-prod", validator)
+	return NewManager(registry, processor, gameStore, moveStore, bus, "test-jwt-secret-not-for-prod", validator, nil, "")
 }
 
 // --- CreateGame ---------------------------------------------------------
@@ -289,7 +289,7 @@ func mustCreateActiveGameDBOnly(t *testing.T, gameID, whiteID, blackID string, s
 	if err := gs.UpdatePlayerBlack(ctx, gameID, blackID); err != nil {
 		t.Fatalf("mustCreateActiveGameDBOnly UpdatePlayerBlack: %v", err)
 	}
-	if err := gs.UpdateGameStatus(ctx, gameID, store.GameStatusActive, nil); err != nil {
+	if err := gs.UpdateGameStatus(ctx, gameID, store.GameStatusWaiting, store.GameStatusActive, nil); err != nil {
 		t.Fatalf("mustCreateActiveGameDBOnly UpdateGameStatus: %v", err)
 	}
 
@@ -505,7 +505,7 @@ func TestManager_RestoreActiveGames_SkipsCompletedGames(t *testing.T) {
 	gs := store.NewGameStore(testPool)
 	winner := store.OutcomeWhite
 	reason := store.OutcomeReasonResignation
-	if err := gs.UpdateGameStatus(ctx, gameID, store.GameStatusCompleted, &store.GameOutcome{
+	if err := gs.UpdateGameStatus(ctx, gameID, store.GameStatusActive,store.GameStatusCompleted, &store.GameOutcome{
 		Outcome: winner,
 		Reason:  reason,
 	}); err != nil {
@@ -683,7 +683,7 @@ func TestManager_RestoreActiveGames_MultipleGamesIndependentFailureIsolation(t *
 	if err := gs.UpdatePlayerBlack(ctx, badGameID, mgrTestBlackID); err != nil {
 		t.Fatalf("UpdatePlayerBlack badGame: %v", err)
 	}
-	if err := gs.UpdateGameStatus(ctx, badGameID, store.GameStatusActive, nil); err != nil {
+	if err := gs.UpdateGameStatus(ctx, badGameID, store.GameStatusWaiting, store.GameStatusActive, nil); err != nil {
 		t.Fatalf("UpdateGameStatus badGame: %v", err)
 	}
 	if err := ms.SaveMove(ctx, &store.Move{

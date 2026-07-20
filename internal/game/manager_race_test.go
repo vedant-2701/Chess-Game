@@ -49,7 +49,7 @@ func TestManager_JoinGame_ConcurrentJoins_ExactlyOneWins(t *testing.T) {
 	moveStore := store.NewMoveStore(testPool)
 	validator := internalchess.NewValidator()
 	processor := NewMoveProcessor(validator, gameStore, moveStore, bus)
-	m := NewManager(registry, processor, gameStore, moveStore, bus, "race-test-secret", validator)
+	m := NewManager(registry, processor, gameStore, moveStore, bus, "race-test-secret", validator, nil, "")
 
 	// Run many trials, each in a fresh game. A single trial can pass by luck
 	// if the goroutine scheduler happens to fully serialize the two calls —
