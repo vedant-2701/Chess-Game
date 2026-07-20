@@ -74,8 +74,11 @@ migrate-drop: ## Drop everything in the database — DESTRUCTIVE, dev only
 
 # ---- Docker ------------------------------------------------
 
-docker-up: ## Start PostgreSQL in Docker (detached)
-	docker compose up -d postgres
+docker-up: ## Start PostgreSQL + Redis in Docker (detached) — for local `go run` dev
+	docker compose up -d postgres redis
+
+docker-up-cluster: ## Start the full Phase 2 stack: postgres, redis, 2 server replicas, nginx Edge Proxy
+	docker compose --profile cluster up -d --build
 
 docker-down: ## Stop and remove Docker containers (data volume preserved)
 	docker compose down
