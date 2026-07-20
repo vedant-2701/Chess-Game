@@ -37,12 +37,15 @@ import (
 // exits.
 const shutdownTimeout = 15 * time.Second
 
-// config holds the environment-derived settings PHASE_1.md Step 13 requires.
+// config holds the environment-derived settings PHASE_1.md Step 13 and
+// PHASE_2.md Step 1 require.
 type config struct {
 	DatabaseURL string
 	JWTSecret   string
 	ServerPort  string
 	LogLevel    string
+	RedisAddr   string
+	InstanceID  string
 }
 
 // loadConfig reads and validates required environment variables. DATABASE_URL
@@ -60,12 +63,27 @@ func loadConfig() (config, error) {
 		JWTSecret:   os.Getenv("JWT_SECRET"),
 		ServerPort:  os.Getenv("SERVER_PORT"),
 		LogLevel:    os.Getenv("LOG_LEVEL"),
+		RedisAddr:   os.Getenv("REDIS_ADDR"),
+		InstanceID:  os.Getenv("INSTANCE_ID"),
 	}
 	if cfg.DatabaseURL == "" {
 		return config{}, errors.New("DATABASE_URL is required")
 	}
 	if cfg.JWTSecret == "" {
 		return config{}, errors.New("JWT_SECRET is required")
+	}
+	// REDIS_ADDR and INSTANCE_ID are fatal-if-missing, same treatment as
+	// DATABASE_URL/JWT_SECRET — not because Phase 1 needs Redis (it never
+	// will, per ARCHITECTURE.md's EventBus correction), but because as of
+	// Phase 2 wiring this config struct is no longer optional-Redis: a missing
+	// INSTANCE_ID in particular must fail loud at startup rather than silently
+	// default, since a default shared across multiple replicas would corrupt
+	// routing (see .env.example's comment on INSTANCE_ID).
+	if cfg.RedisAddr == "" {
+		return config{}, errors.New("REDIS_ADDR is required")
+	}
+	if cfg.InstanceID == "" {
+		return config{}, errors.New("INSTANCE_ID is required")
 	}
 	if cfg.ServerPort == "" {
 		cfg.ServerPort = "8080"
@@ -122,6 +140,29 @@ func main() {
 		os.Exit(1)
 	}
 
+	// PHASE_2.md Step 1: verify Redis connectivity at startup. Fatal here,
+	// same treatment as the Postgres pool above — there is no meaningful
+	// degraded startup mode for an instance that cannot reach its routing
+	// directory at all during boot. This is distinct from a Redis outage
+	// *after* the server is already serving traffic, which Step 2+'s
+	// RoutingDirectory call sites must handle without crashing (already-owned,
+	// already-hydrated games keep working; only new resolves fail). The
+	// RoutingDirectory itself is not constructed here yet — Step 2.
+	redisClient, err := game.NewRedisClient(ctx, cfg.RedisAddr)
+	if err != nil {
+		slog.Error("failed to connect to redis", "error", err)
+		os.Exit(1)
+	}
+	defer redisClient.Close() // safety net; not yet used by any call path (Step 2+).
+	slog.Info("redis connected", "addr", cfg.RedisAddr, "instanceID", cfg.InstanceID)
+
+	// PHASE_2.md Step 5: the routing directory built on top of the verified
+	// Redis client above. Constructed here (not deferred to first use) so
+	// Manager's constructor always receives a real, non-nil RoutingDirectory
+	// in production wiring — nil is only ever passed by tests that don't
+	// exercise ResolveGame at all (see NewManager's doc comment).
+	directory := game.NewRedisDirectory(redisClient)
+
 	// --- Dependency graph, built bottom-up per ARCHITECTURE.md's Dependency
 	// Graph: stores -> validator -> event bus -> move processor -> registry
 	// -> manager. Nothing above this line depends on anything constructed
@@ -134,10 +175,22 @@ func main() {
 	eventBus := game.NewLocalEventBus()
 	processor := game.NewMoveProcessor(validator, gameStore, moveStore, eventBus)
 	registry := game.NewGameRegistry()
-	manager := game.NewManager(registry, processor, gameStore, moveStore, eventBus, cfg.JWTSecret, validator)
+	manager := game.NewManager(registry, processor, gameStore, moveStore, eventBus, cfg.JWTSecret, validator, directory, cfg.InstanceID)
 
 	if err := manager.RestoreActiveGames(ctx); err != nil {
 		slog.Error("failed to restore active games", "error", err)
+		os.Exit(1)
+	}
+
+	// PHASE_2.md Step 6: start the per-instance heartbeat ticker (renews this
+	// instance's liveness key and, once any games exist, their ownership
+	// records) now that manager/directory/instanceID all exist. Fatal on
+	// failure to start, same treatment as every other Redis-dependent startup
+	// step above — SetAlive failing here means this instance cannot even
+	// establish its own liveness record, let alone serve traffic correctly.
+	stopHeartbeat, err := manager.StartHeartbeat(ctx)
+	if err != nil {
+		slog.Error("failed to start heartbeat", "error", err)
 		os.Exit(1)
 	}
 
@@ -183,11 +236,12 @@ func main() {
 		}
 	case sig := <-sigCh:
 		slog.Info("shutdown signal received", "signal", sig.String())
-		shutdown(httpServer, cancelWSCtx, wsRegistry, manager, pool)
+		shutdown(httpServer, cancelWSCtx, wsRegistry, manager, pool, stopHeartbeat)
 	}
 }
 
-// shutdown runs PHASE_1.md Step 13's ordered graceful-shutdown sequence:
+// shutdown runs PHASE_1.md Step 13's ordered graceful-shutdown sequence,
+// extended by PHASE_2.md Step 6's heartbeat release:
 //
 //  1. Stop accepting new HTTP connections and new WebSocket upgrade attempts.
 //  2. Cancel the ADR-018 server-lifetime context, so in-flight
@@ -203,17 +257,24 @@ func main() {
 //     depth for anything step 3 missed, and an explicit, auditable
 //     realization of PHASE_1.md's "persist clock state" checklist item
 //     rather than a purely implicit side effect of connection cleanup.
-//  5. Close the database pool.
+//  5. Stop the heartbeat ticker and proactively release this instance's
+//     Redis ownership/liveness entries (PHASE_2.md Step 6) — placed after
+//     step 4 so it reflects the final, post-drain set of games this
+//     instance actually still holds, not a stale snapshot from before
+//     WebSocket draining/finalizeGame calls removed some of them.
+//  6. Close the database pool.
 //
-// Every step is bounded by shutdownTimeout so a single stuck connection or
-// slow query cannot hang the process indefinitely during what is supposed to
-// be a graceful exit.
+// Every step is bounded by shutdownTimeout (or, for step 5's release calls,
+// its own independent 5s bound — see releaseHeartbeatEntries) so a single
+// stuck connection, slow query, or slow Redis call cannot hang the process
+// indefinitely during what is supposed to be a graceful exit.
 func shutdown(
 	httpServer *http.Server,
 	cancelWSCtx context.CancelFunc,
 	wsRegistry *ws.Registry,
 	manager *game.Manager,
 	pool *pgxpool.Pool,
+	stopHeartbeat func(),
 ) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
@@ -238,7 +299,14 @@ func shutdown(
 	// 4. Defense-in-depth clock flush for anything still registered.
 	manager.PersistActiveClockState(shutdownCtx)
 
-	// 5. Close the database pool as the final, explicit step.
+	// 5. Stop the heartbeat ticker and release this instance's directory
+	// entries (PHASE_2.md Step 6). stopHeartbeat internally detaches its own
+	// release calls from shutdownCtx's cancellation (ADR-019/ADR-027 pattern)
+	// since shutdownCtx itself will eventually be cancelled by this
+	// function's own deferred cancel() — the release must survive that.
+	stopHeartbeat()
+
+	// 6. Close the database pool as the final, explicit step.
 	pool.Close()
 
 	slog.Info("shutdown sequence complete")

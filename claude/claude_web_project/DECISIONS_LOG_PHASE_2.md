@@ -479,3 +479,112 @@ ADR-006) already established.
   is designed.
 
 ---
+
+## ADR-027: GetOrHydrate's Shared Hydration Uses a Detached, Independently-Bounded Context — Not the Triggering Caller's Own Context
+
+**Date:** 2026-07-17
+**Status:** ACCEPTED
+
+**Context:**
+
+`GameRegistry.GetOrHydrate` (PHASE_2.md Step 3) coalesces concurrent
+hydrate-on-miss calls for the same `gameID` via `golang.org/x/sync/singleflight`,
+so two goroutines racing a miss trigger exactly one hydration and both receive
+the same `*GameSession` pointer — closing the double-hydration race the same
+way ADR-017 closed first-connect's double-registration race.
+
+`singleflight.Group.Do(key, fn)` runs `fn` exactly once per in-flight key;
+every caller racing the same key — the one whose call happened to trigger
+`fn`, and every other one that arrived while it was running — blocks on and
+receives that single execution's result. `fn` itself, however, only ever runs
+with whatever state its actual triggering call closed over. If `hydrateFn`
+were invoked with the triggering caller's own request-scoped `context.Context`
+(e.g. an HTTP resolve handler's `r.Context()`), then that one caller's context
+cancelling — their client disconnecting, their request timing out — would
+abort the DB reads for every other caller silently piggybacking on the same
+hydration, even though those callers' own underlying requests are still live
+and waiting. This is the identical failure shape ADR-019 found for
+`HandleDisconnect`'s clock-persist write (a write whose effect is not scoped
+to the triggering call's own lifecycle, wired through a context that can be
+cancelled by something unrelated to that effect) — recurring here at a new
+call site Phase 2 introduces, not yet exercised by any test since Step 5 (the
+first real caller of `GetOrHydrate`) is not yet built. Caught during Step 3
+design, before implementation, rather than via a failing test.
+
+**Options Considered:**
+
+**Option A: Use the triggering caller's own `ctx` directly for `hydrateFn`.**
+- Pros: Simplest; no extra timeout management; a triggering caller's own
+  cancellation stops wasted work if *no one* still wants the result.
+- Cons: Under Phase 2 specifically, `GetOrHydrate` is the exact mechanism
+  that recovers a game after failover — the whole point of the phase. If the
+  one request that happens to win the singleflight race is abandoned
+  mid-flight (mobile network hiccup, tab closed), every other player or
+  instance racing for that same `gameID` sees hydration fail too, for a
+  reason that has nothing to do with their own connection. This directly
+  undermines the resilience property Phase 2 exists to provide, for a
+  possibly-common case (mobile clients), not a rare one.
+
+**Option B: Detach `hydrateFn`'s context from the triggering caller, bounded by its own independent timeout (CHOSEN).**
+`context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)`, exactly the
+pattern ADR-019 already established, applied at the `hydrateFn` call site
+inside the singleflight closure.
+- Pros: Hydration's outcome no longer depends on which particular caller
+  happened to trigger it — every piggybacking caller gets a
+  triggering-caller-independent result. Still bounded (10s), so a genuinely
+  stuck DB call cannot hang every racing caller indefinitely — not an
+  unbounded escape hatch, same discipline ADR-019 required of itself.
+- Cons: A hydration whose sole triggering request was abandoned still runs to
+  completion (or its own timeout) even in the rare case where every racing
+  caller has also gone away by then — bounded, accepted waste, identical
+  tradeoff ADR-019 already made for the clock-persist write.
+
+**Option C: No singleflight coalescing — let every caller hydrate independently.**
+- Pros: No shared-context problem, since no context is shared.
+- Cons: Directly reopens the exact problem PHASE_2.md Step 3 requires closed:
+  redundant concurrent DB round-trips for the same `gameID`, and a real risk
+  of two independently-constructed `*GameSession` objects (each with its own
+  `Clock` goroutine) for one game — the same double-registration race class
+  ADR-017 already closed once for first-connect, reopened here. Not a
+  serious contender; rejected outright.
+
+**Decision:** Option B — `context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)`,
+scoped to `GetOrHydrate`'s `hydrateFn` invocation only.
+
+**Rationale:**
+
+The correctness requirement is that hydration's success or failure must not
+depend on which of possibly-several racing callers happened to be the one
+whose call triggered `singleflight.Group.Do`'s single execution — that caller
+is an implementation-internal accident, not a meaningful authority over
+whether the shared result should exist. Option A makes every piggybacking
+caller's outcome hostage to a party they have no relationship with. Option C
+solves the context problem by reopening the exact race this method exists to
+close. Option B, already established by ADR-019 for the same underlying
+reason (an operation whose effect is shared beyond the triggering caller's own
+lifecycle must not be tied to that caller's cancellation), is the correct
+generalization: this is now the second call site this codebase has needed it
+at, reinforcing CLAUDE.md Non-Negotiable Constraint #12 rather than
+introducing a new pattern.
+
+**Consequences:**
+- `GameRegistry.GetOrHydrate`'s `hydrateFn` call is wrapped in
+  `context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)`, called
+  out explicitly in a comment at the call site (mirroring ADR-019's own
+  Consequences) and in CLAUDE.md's Known Sharp Edges.
+- `GetOrHydrate`'s own outer `ctx` parameter (CODING_GUIDELINES.md §2 — every
+  I/O function takes context first) is otherwise unused for the actual
+  hydration I/O — worth being explicit about so a future reader does not
+  assume it's threaded through directly, the same way ADR-019 flagged
+  `HandleDisconnect`'s parameter.
+- This is the second instance of the ADR-019 pattern (context whose
+  cancellation is correct for one caller but wrong once a second concern —
+  here, other racing callers — is wired through the same context). Continues
+  to reinforce Constraint #12 as a standing question for any new shared or
+  asynchronous operation, not just a one-off.
+- Step 5 (the resolve endpoint, not yet implemented) is the first real
+  caller of `GetOrHydrate` and should not need to reason about this at its
+  call site — the detachment is fully encapsulated inside `GetOrHydrate`
+  itself.
+
+---

@@ -10,6 +10,8 @@ func TestLoadConfig_MissingDatabaseURL(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	t.Setenv("SERVER_PORT", "")
 	t.Setenv("LOG_LEVEL", "")
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("INSTANCE_ID", "test-instance")
 
 	_, err := loadConfig()
 	if err == nil {
@@ -22,10 +24,40 @@ func TestLoadConfig_MissingJWTSecret(t *testing.T) {
 	t.Setenv("JWT_SECRET", "")
 	t.Setenv("SERVER_PORT", "")
 	t.Setenv("LOG_LEVEL", "")
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("INSTANCE_ID", "test-instance")
 
 	_, err := loadConfig()
 	if err == nil {
 		t.Fatal("expected error for missing JWT_SECRET, got nil")
+	}
+}
+
+func TestLoadConfig_MissingRedisAddr(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("SERVER_PORT", "")
+	t.Setenv("LOG_LEVEL", "")
+	t.Setenv("REDIS_ADDR", "")
+	t.Setenv("INSTANCE_ID", "test-instance")
+
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("expected error for missing REDIS_ADDR, got nil")
+	}
+}
+
+func TestLoadConfig_MissingInstanceID(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("SERVER_PORT", "")
+	t.Setenv("LOG_LEVEL", "")
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("INSTANCE_ID", "")
+
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("expected error for missing INSTANCE_ID, got nil")
 	}
 }
 
@@ -34,6 +66,8 @@ func TestLoadConfig_DefaultsAppliedForOptionalVars(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	t.Setenv("SERVER_PORT", "")
 	t.Setenv("LOG_LEVEL", "")
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("INSTANCE_ID", "test-instance")
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -52,6 +86,8 @@ func TestLoadConfig_ExplicitValuesPassThrough(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	t.Setenv("SERVER_PORT", "9090")
 	t.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("INSTANCE_ID", "test-instance")
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -68,6 +104,12 @@ func TestLoadConfig_ExplicitValuesPassThrough(t *testing.T) {
 	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel: got %q, want %q", cfg.LogLevel, "debug")
+	}
+	if cfg.RedisAddr != "localhost:6379" {
+		t.Errorf("RedisAddr: got %q, want %q", cfg.RedisAddr, "localhost:6379")
+	}
+	if cfg.InstanceID != "test-instance" {
+		t.Errorf("InstanceID: got %q, want %q", cfg.InstanceID, "test-instance")
 	}
 }
 
