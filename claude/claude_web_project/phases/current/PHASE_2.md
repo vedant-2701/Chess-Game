@@ -1,12 +1,16 @@
 # Phase 2 — Horizontal Scaling
 
-**Status: ⬜ Not Started**
+**Status: ✅ Complete — implemented, all bugs found via E2E testing fixed, Acceptance Criteria confirmed manually and via `e2e-phase2.sh` (scenarios 0–6)**
 **Prerequisite: Phase 1 all acceptance criteria met**
 
 This design supersedes the original Redis-pub/sub cross-instance plan (see
 `PHASE_2-deferred.md`) and the ID-prefix and consistent-hash-ring sticky-session
 variants considered and rejected during design. Full reasoning trail:
-`DECISIONS_LOG_PHASE_2.md`, ADR-021 through ADR-025.
+`DECISIONS_LOG_PHASE_2.md`, ADR-021 through ADR-031 — ADR-021–025 predate
+implementation (design phase); ADR-026–031 were written during implementation
+and E2E testing, correcting real bugs this design's own audit did not catch
+(see Implementation Checklist and Acceptance Criteria below for what each one
+fixed).
 
 ---
 
@@ -150,7 +154,11 @@ reconnect — uses the **identical path**, deliberately, with no special-casing:
 
 `POST /games/:id/join` and `GET /games/:id` are pure DB operations that never
 touch a live `GameSession` — round-robin, no affinity needed, no resolve step
-involved.
+involved. **This was violated in the initial implementation** (`JoinGame`
+called `registry.Get` and touched the live session) and is the root cause of
+CRITICAL-1 below — fixed by ADR-028, which brought the code in line with this
+already-correct design statement rather than changing the design to match the
+broken code.
 
 ---
 
@@ -200,114 +208,174 @@ capability is part of what Phase 8 (Kubernetes + ingress) buys.
 ## Implementation Checklist
 
 ### Step 1: Redis Infrastructure
-- [ ] Add Redis service to `docker-compose.yml`
-- [ ] Add Redis client dependency
-- [ ] `INSTANCE_ID` config value per replica
-- [ ] Verify Redis connection on startup; instance can still serve *already-owned,
+- [x] Add Redis service to `docker-compose.yml`
+- [x] Add Redis client dependency
+- [x] `INSTANCE_ID` config value per replica
+- [x] Verify Redis connection on startup; instance can still serve *already-owned,
       already-hydrated* games if Redis is briefly unavailable — new resolves fail
       cleanly, not a crash
 
 ### Step 2: Routing Directory
-- [ ] `internal/game/directory.go`: `RoutingDirectory` interface
-- [ ] `RedisDirectory`: `ClaimOwnership`, `GetOwner`, `RenewOwnership`,
+- [x] `internal/game/directory.go`: `RoutingDirectory` interface
+- [x] `RedisDirectory`: `ClaimOwnership`, `GetOwner`, `RenewOwnership`,
       `ReleaseOwnership`, `SetAlive`, `IsAlive`, `RenewAlive`
-- [ ] Unit tests against a real Redis (integration tag), including a simulated
+- [x] Unit tests against a real Redis (integration tag), including a simulated
       concurrent-claim race proving exactly one winner
 
 ### Step 3: GetOrHydrate
-- [ ] `GameRegistry.GetOrHydrate(gameID, hydrateFn)`: single-flight per-key lock,
+- [x] `GameRegistry.GetOrHydrate(gameID, hydrateFn)`: single-flight per-key lock,
       closing the double-hydration race
-- [ ] Regression test: two goroutines racing a miss on the same gameID, verify
+- [x] Regression test: two goroutines racing a miss on the same gameID, verify
       exactly one hydration occurs and both callers get the same session pointer
 
 ### Step 4: Auth — ConnectClaims
-- [ ] `internal/auth`: `ConnectClaims` type, `SignConnectToken`,
+- [x] `internal/auth`: `ConnectClaims` type, `SignConnectToken`,
       `VerifyConnectToken` (short expiry, same signing key as `PlayerClaims`)
-- [ ] Unit tests: expiry enforcement, tamper rejection, gameID/color match check
+- [x] Unit tests: expiry enforcement, tamper rejection, gameID/color match check
+      (the tamper-rejection test cases were themselves flaky for an unrelated
+      reason — base64's "don't-care" trailing bits on a last-character
+      corruption, fixed mid-Phase-2 by flipping a middle character instead;
+      test-only, no production risk)
 
 ### Step 5: Resolve Endpoint
-- [ ] `GET /games/:id/resolve` handler: verify `playerToken`, directory lookup,
+- [x] `GET /games/:id/resolve` handler: verify `playerToken`, directory lookup,
       claim-and-hydrate on miss, mint `ConnectClaims`, return masked URL
-- [ ] Handler tests (httptest)
-- [ ] Test: `ConnectClaims` expiring in the gap between resolve returning and the
+- [x] Handler tests (httptest)
+- [x] Test: `ConnectClaims` expiring in the gap between resolve returning and the
       client actually dialing the WS — `WSHandler` must reject cleanly (not
       panic, not hang), and the expected client behavior (re-call resolve, not
       retry the stale masked URL) should be documented in the WS error response
       itself
-- [ ] Test: resolving/reconnecting to a game already in a terminal status
-      (`COMPLETED`/`ABANDONED`) through the hydrate-on-miss path — confirm this
-      still returns the correct final `GAME_STATE` rather than erroring, since
-      hydration is new code that Phase 1's reconnect-to-finished-game behavior
-      was never previously exercised against
+- [x] Test: resolving/reconnecting to a game already in a terminal status
+      (`COMPLETED`/`ABANDONED`/`ABORTED`) through the hydrate-on-miss path —
+      confirms correct final `GAME_STATE` rather than erroring
+- [x] **Post-hoc fix (ADR-028):** `CreateGame` did not claim Redis ownership at
+      creation time, causing indefinite "lost ownership renewal" heartbeat log
+      spam for any created-but-never-resolved game. Fixed: best-effort
+      `ClaimOwnership` call immediately after local registration.
 
 ### Step 6: Heartbeat Ticker
-- [ ] Per-instance ticker in `Manager`/`main.go`: batched ownership renewal
+- [x] Per-instance ticker in `Manager`/`main.go`: batched ownership renewal
       (`registry.AllActive()`) + liveness renewal, every 3s
-- [ ] Graceful shutdown: release owned entries proactively before exit
-- [ ] Goroutine-leak test for the ticker itself (this codebase's standing
+- [x] Graceful shutdown: release owned entries proactively before exit
+- [x] Goroutine-leak test for the ticker itself (this codebase's standing
       discipline — see CLAUDE.md Known Sharp Edges on `goleak.IgnoreCurrent()`)
 
 ### Step 7: Edge Proxy / nginx
-- [ ] `nginx.conf`: round-robin upstream for REST; static `map` + named upstream
+- [x] `nginx.conf`: round-robin upstream for REST; static `map` + named upstream
       per instance label for `/connect/{instanceLabel}`
-- [ ] WebSocket upgrade headers (`Upgrade`, `Connection`), long timeouts
-- [ ] Health checks on `/health`
+- [x] WebSocket upgrade headers (`Upgrade`, `Connection`), long timeouts
+- [x] Health checks on `/health`
 
 ### Step 8: WSHandler Changes
-- [ ] Accept `ConnectClaims` instead of `PlayerClaims` on the WS upgrade path
-- [ ] `registry.Get` → `GetOrHydrate` fallback on miss, regardless of cause
+- [x] Accept `ConnectClaims` instead of `PlayerClaims` on the WS upgrade path
+- [x] `registry.Get` → `GetOrHydrate` fallback on miss, regardless of cause
+- [x] **Post-hoc fix (ADR-028):** `JoinGame` was missing the equivalent
+      cross-instance treatment `HandleConnect` got here — except the correct
+      fix was the opposite of what this step's pattern suggests. `JoinGame`
+      should never have touched `GameRegistry`/`GameSession` at all (see the
+      Connection Flow section above); giving it a `GetOrHydrate` fallback like
+      `HandleConnect`'s would have reintroduced split-brain risk on a code path
+      with no ownership-claim precondition. Fixed by removing the registry
+      touch entirely — pure DB operation, matching this document's own
+      original design statement.
 
 ### Step 9: TD-008 Resolution
-- [ ] One-shot `migrate` service in `docker-compose.yml`; server replicas
+- [x] One-shot `migrate` service in `docker-compose.yml`; server replicas
       `depends_on: condition: service_completed_successfully`
 
 ### Step 10: Bug Fix Carried In From Audit
-- [ ] `GameStore.UpdateGameStatus`: add status predicate to the `WHERE` clause
+- [x] `GameStore.UpdateGameStatus`: add status predicate to the `WHERE` clause
 
 ### Step 11: Multi-Instance Testing (all three scenarios from above, explicitly)
-- [ ] Two players resolve to different instances via round-robin creation/join,
+- [x] Two players resolve to different instances via round-robin creation/join,
       confirm both land on the same instance for gameplay
-- [ ] Kill an instance mid-game; reconnecting player fails over correctly
+- [x] Kill an instance mid-game; reconnecting player fails over correctly
       (Scenario 1)
-- [ ] Kill an instance, let it restart, confirm it does **not** re-acquire a game
+- [x] Kill an instance, let it restart, confirm it does **not** re-acquire a game
       that already failed over (Scenario 2 — the split-brain regression test)
-- [ ] Kill an instance where only one player ever reconnects; confirm normal
-      Phase 1 abandonment fires (Scenario 3)
-- [ ] Kill Redis mid-game; confirm no crash, confirm already-connected players are
+- [x] Kill an instance where only one player ever reconnects; confirm normal
+      Phase 1 abandonment fires (Scenario 3) — **required two additional fixes
+      beyond original scope to actually pass, ADR-029/030/031, see below**
+- [x] Kill Redis mid-game; confirm no crash, confirm already-connected players are
       unaffected, confirm new resolves fail cleanly
-- [ ] Reconnect to an already-completed game via the resolve → hydrate path;
+- [x] Reconnect to an already-completed game via the resolve → hydrate path;
       confirm correct terminal `GAME_STATE` delivery, no error
+- [x] **Added beyond original scope — Scenario 6:** opponent never joins at all,
+      creator disconnects → confirm `ABORTED`, not stuck in
+      `WAITING_FOR_PLAYER` forever and not a phantom win/draw (ADR-029)
+- [x] **Added beyond original scope — regression check:** `e2e-phase2.sh
+      regress N` — N rapid create+join cycles across both instances,
+      confirming CRITICAL-1/2 don't recur under real round-robin (a single
+      manual trial can pass by luck even with the bug present, since
+      round-robin only lands cross-instance ~50% of the time)
 
 ### Step 12: Documentation
-- [ ] `ARCHITECTURE.md`: routing directory section, corrected EventBus section
-- [ ] `DECISIONS_LOG_PHASE_2.md`: ADR-021 through ADR-025 (already logged during
-      design — verify against final implementation, amend Consequences if reality
-      diverges from the design)
-- [ ] Update `CLAUDE.md`
+- [x] `ARCHITECTURE.md`: System Overview, `internal/api` endpoints, WebSocket
+      Connection Lifecycle, Game State Machine (`ABORTED` added), Database
+      Schema (disconnect timestamp columns added), Dependency Graph
+- [x] `DECISIONS_LOG_PHASE_2.md`: ADR-021 through ADR-031
+- [x] Update `CLAUDE.md`
+- [x] `phase2_step11_e2e_walkthrough.md` and `e2e-phase2.sh`: Scenario 6 added
+
+### Critical Bugs Found During Step 11 and Fixed (not in original scope)
+
+Three separate rounds of real multi-instance E2E testing surfaced bugs this
+design's own upfront audit (ADR-021's design-phase review) did not catch —
+none of them were reachable by single-`Manager` integration tests, since a
+single `Manager` instance cannot reproduce what nginx's round-robin does
+across genuinely separate processes:
+
+- **CRITICAL-1/2 (ADR-028):** `JoinGame` touched `GameRegistry` and failed on
+  any cross-instance registry miss (~50% of joins under real round-robin,
+  and — found on closer reading — could leave a game permanently unjoinable
+  even on the failure path, since the DB write committed before the failure).
+  `CreateGame` never claimed Redis ownership, causing indefinite heartbeat log
+  spam. Both fixed; `JoinGame` is now a pure DB operation.
+- **ABORTED status gap (ADR-029):** a game whose opponent never joined at all
+  had no correct terminal outcome — `onAbandonTimeout` tried to run
+  `ACTIVE`-game logic (award a phantom win or a meaningless draw) against a
+  game that never started, and the state machine had no `WAITING→ABANDONED`
+  edge anyway (TD-P2-005). Fixed with a new `ABORTED` status: void, no
+  outcome, no reason.
+- **Abandonment-timer failover gap (ADR-030/ADR-031):** the 60s abandonment
+  timer is pure in-process memory and does not survive the owning instance
+  dying. First fix (ADR-030) persisted the individually-observed disconnect
+  moment to Postgres so a survivor could resume it — correct for "a player
+  disconnected while the instance was still alive," incomplete for "the
+  instance itself died while both players were still connected," which never
+  gets a persisted timestamp at all since nothing witnesses it. Second fix
+  (ADR-031, found by an independently-briefed review session, not this one)
+  closed that gap: assume disconnected as of the hydration moment when no
+  timestamp exists for a non-terminal game, rather than assuming fine.
 
 ---
 
 ## Acceptance Criteria
 
-| # | Criterion |
-|---|-----------|
-| 1 | Two players, connecting independently, always end up co-located on the same instance |
-| 2 | All Phase 1 acceptance criteria still pass under the multi-instance setup |
-| 3 | Scenario 1 (failover, both reconnect): game resumes correctly on the new owner |
-| 4 | Scenario 2 (failover, origin recovers): recovered instance never re-hydrates a migrated game — no split game under any timing |
-| 5 | Scenario 3 (failover, one player never returns): normal abandonment semantics apply, unmodified |
-| 6 | Redis going down does not crash any instance; live gameplay is unaffected; new resolves fail cleanly |
-| 7 | Edge Proxy correctly proxies the WebSocket upgrade for a masked-URL connection |
-| 8 | All tests pass: `go test -race ./...`, including the `GetOrHydrate` single-flight regression test |
-| 9 | `TD-008` closed: concurrent replica startup never double-runs migrations |
-| 10 | `GameStore.UpdateGameStatus`'s status predicate fix verified with a regression test |
+| # | Criterion | Result |
+|---|-----------|--------|
+| 1 | Two players, connecting independently, always end up co-located on the same instance | ✅ Confirmed (Scenario 0, and `regress N`) |
+| 2 | All Phase 1 acceptance criteria still pass under the multi-instance setup | ✅ Confirmed |
+| 3 | Scenario 1 (failover, both reconnect): game resumes correctly on the new owner | ✅ Confirmed |
+| 4 | Scenario 2 (failover, origin recovers): recovered instance never re-hydrates a migrated game — no split game under any timing | ✅ Confirmed |
+| 5 | Scenario 3 (failover, one player never returns): normal abandonment semantics apply, unmodified | ✅ Confirmed — required ADR-029/030/031, not "unmodified" as originally worded; see Critical Bugs above |
+| 6 | Redis going down does not crash any instance; live gameplay is unaffected; new resolves fail cleanly | ✅ Confirmed (Scenario 4) |
+| 7 | Edge Proxy correctly proxies the WebSocket upgrade for a masked-URL connection | ✅ Confirmed |
+| 8 | All tests pass: `go test -race ./...`, including the `GetOrHydrate` single-flight regression test | ✅ Confirmed, including `-tags integration -race` |
+| 9 | `TD-008` closed: concurrent replica startup never double-runs migrations | ✅ Confirmed |
+| 10 | `GameStore.UpdateGameStatus`'s status predicate fix verified with a regression test | ✅ Confirmed |
+| 11 | *(Added, ADR-029)* Opponent never joins, creator disconnects: game reaches `ABORTED` — no outcome, no outcome_reason, not stuck in `WAITING_FOR_PLAYER` forever | ✅ Confirmed manually (Scenario 6); scripted `scenario6` shows a known tooling-only discrepancy (`ws_disconnect`'s `kill` vs. an interactive Ctrl+C's clean close frame) — not a product issue, not pursued further |
 
 ---
 
-## Technical Debt This Phase May Introduce
+## Technical Debt This Phase Introduced
 
-| ID | Description | Must Fix By |
-|----|-------------|-------------|
-| TD-P2-001 | No fencing token — narrow, TTL-bounded false-positive liveness window can theoretically split a live game | Phase 8 (k8s `Lease` gives this near-free) |
-| TD-P2-002 | Static Edge Proxy config — scaling requires a config edit + reload | Phase 8 (dynamic service discovery) |
-| TD-P2-003 | No active liveness probing — detection is purely TTL-based | Revisit only if TD-P2-001's window is shown to matter in practice |
+| ID | Description | Status | Must Fix By |
+|----|-------------|--------|-------------|
+| TD-P2-001 | No fencing token — narrow, TTL-bounded false-positive liveness window can theoretically split a live game. **Addendum (ADR-031):** under this same window, a phantom competing session can now also spuriously abandon-lose a genuinely-connected player, not just cause duplicate processing — same bounded window, an additional possible symptom. | Open | Phase 8 (k8s `Lease` gives this near-free) |
+| TD-P2-002 | Static Edge Proxy config — scaling requires a config edit + reload | Open | Phase 8 (dynamic service discovery) |
+| TD-P2-003 | No active liveness probing — detection is purely TTL-based | Open | Revisit only if TD-P2-001's window is shown to matter in practice |
+| TD-P2-004 | A session hydrated via resolve for an already-terminal game stays registered in the local `GameRegistry` indefinitely — nothing currently evicts it | Open | Not scheduled; revisit if shown to matter |
+| TD-P2-005 | `onAbandonTimeout`'s both-disconnected branch could never succeed for a `WAITING_FOR_PLAYER` game (no `WAITING→ABANDONED` edge) | **Closed (ADR-029)** | — |
+| TD-P2-006 | A game where nobody ever calls `/resolve` again after an instance dies is not covered by ADR-030/031's fix, and cannot be by construction — nothing runs if nobody triggers a hydrate | Open | Not scheduled; candidate design is a periodic sweep folded into the existing heartbeat tick, not built speculatively |

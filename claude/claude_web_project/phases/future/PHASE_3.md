@@ -189,6 +189,38 @@ returns) — see `phases/current/PHASE_2.md`'s Connection Flow section. This is
 deliberate: match-found-then-connect and ordinary-reconnect should be the same
 code path, not two.
 
+**Open question, flagged for Phase 3 pre-planning — not decided here.** Under
+Phase 1/2's shared-link creation, a game's `ABORTED` outcome
+(`DECISIONS_LOG_PHASE_2.md` ADR-029) is scoped to "creator connected, opponent
+never joined the game at all," and its abandonment timer
+(ADR-015/ADR-030/ADR-031) is scoped to "a player who had already connected
+disconnects." Under matchmaking, both players are already assigned via
+`CreateGame(playerWhiteID, playerBlackID)` at match time — there is no
+equivalent "opponent never joined" state, since both are already players
+before either ever connects. The analogous failure here is "one matched
+player connects, the other never does." Two things worth deciding before
+implementing, not now:
+- Does this deserve its own grace period — plausibly shorter than the full
+  60s `abandonTimeout` — distinct from the mid-game disconnect timer? A
+  matched opponent failing to even connect is a stronger signal than a
+  mid-game disconnect; the connected player shouldn't necessarily wait a
+  full 60s for someone who may simply not be coming.
+- If the *connected* player also disconnects before the opponent ever
+  connects, should any timer be running at all? A grace-period timer exists
+  to protect a *waiting* player's fairness — if nobody is left waiting on
+  anybody, there is arguably nothing left to protect, and the game should
+  resolve (or be discarded) immediately rather than run out a timer nobody
+  benefits from.
+
+Do not resolve this by silently reusing or extending ADR-029/030/031's
+mechanism as-is — re-derive it against matchmaking's actual constraints.
+The shared-link design's core assumption (a solo creator can sit in
+`WAITING_FOR_PLAYER` indefinitely, waiting for anyone to join via a link) does
+not hold once players are pre-assigned at match time; treating it as if it
+does is exactly the kind of doc-inherited-without-rechecking mistake this
+project's Phase 2 session already had to correct once (see the pre-phase
+planning prompt this project uses for exactly this purpose).
+
 **Design decision to make:** Should matchmaking use the same WebSocket connection as gameplay, or a separate one? Evaluate at phase start.
 
 ---

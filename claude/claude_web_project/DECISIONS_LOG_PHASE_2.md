@@ -588,3 +588,528 @@ introducing a new pattern.
   itself.
 
 ---
+
+## ADR-028: JoinGame Made a Pure DB Operation; CreateGame Claims Initial
+Ownership
+
+**Date:** 2026-07-23
+**Status:** ACCEPTED
+
+**Context:**
+
+Real multi-instance E2E testing (Step 11) found `Manager.JoinGame` failing
+whenever a `POST /games/:id/join` request landed, via nginx's plain
+round-robin, on a different instance than the one that had handled the prior
+`POST /games` (`CreateGame`) call. The failure was not intermittent in the
+race-condition sense — it was deterministic given which two instances the two
+requests happened to land on, close to a 50% rate with two replicas.
+
+Root cause: `JoinGame` read `m.registry.Get(gameID)` — `GameRegistry` is a
+plain in-process Go map, private to one running server process's heap.
+`CreateGame`'s `m.registry.Register(session)` call had written the session
+entry into whichever instance's process memory handled *that* request only.
+A different instance's `JoinGame` call has no access to, and no way to
+observe, another process's memory — the lookup was not failing due to a
+restart or a timing window, it was asking the wrong process for something
+that only ever existed in a different process.
+
+This was worse than an ordinary 50%-of-requests failure, for a reason found
+only by reading the method in full: `JoinGame`'s `gameStore.UpdatePlayerBlack`
+DB write ran and committed *before* the registry lookup. When the lookup then
+failed, the method returned a 500 with no token — but the database already
+recorded a black player for the game. A retry with a fresh `userID` (as
+`get-id-and-token.sh` naturally does on each run) then fails
+`UpdatePlayerBlack`'s `player_black_id IS NULL` precondition permanently —
+the game is left stuck at `WAITING_FOR_PLAYER`, unjoinable by anyone, with no
+black token ever issued to any user. Confirmed directly against live cluster
+logs: the DB write succeeded silently, the HTTP response was a 500, and
+subsequent join attempts for the same `gameID` returned 409
+`GAME_NOT_JOINABLE`.
+
+Separately, but discovered and fixed in the same session: `Manager.CreateGame`
+never wrote a Redis ownership record for the game it had just registered
+locally. The heartbeat ticker's batched ownership renewal
+(`RenewOwnershipBatch`, walking `registry.AllActive()`) then tried, every 3s,
+to renew an ownership key that had never been created — its compare-and-swap
+correctly failed every time, logging `"heartbeat: lost ownership renewal for
+game — no longer the recorded owner"` indefinitely for any game that was
+created but never subsequently resolved.
+
+**Options considered for JoinGame:**
+
+**Option A: Give JoinGame the same `GetOrHydrate` fallback `HandleConnect`
+received in Step 8.** This was the fix originally diagnosed (from log output
+alone, before the full source was re-read in this session) and recorded in
+`CLAUDE.md` as the plan going into this session.
+
+- Pros: directly resolves the observed registry-miss error with a pattern
+  already proven correct elsewhere in this codebase.
+- Cons: rejected on closer reading. `HandleConnect`'s `GetOrHydrate` fallback
+  is only safe because `HandleConnect` is exclusively reachable through the
+  resolve-then-connect flow (ADR-022) — `ResolveGame` has already claimed
+  Redis ownership for this instance *before* minting the `ConnectClaims` that
+  points here. `JoinGame` has no equivalent precondition: it is a plain REST
+  POST that round-robins with zero ownership awareness. Giving it the same
+  fallback would, on any instance other than the true owner, hydrate a
+  second, independent, unclaimed `GameSession` object for the same `gameID`
+  — reintroducing, through a new code path, exactly the split-brain failure
+  mode ADR-021 was written to structurally prevent. It also does not address
+  the DB-write/response non-atomicity finding above: a hydrate failure after
+  `UpdatePlayerBlack` has already committed reproduces the identical stuck-game
+  symptom.
+
+**Option B: Make JoinGame a pure DB operation — remove the registry read and
+`GameSession.SetPlayerBlack` call entirely (CHOSEN).**
+
+- Pros: matches this project's own architecture as designed
+  (`ARCHITECTURE.md`/`phases/current/PHASE_2.md`: "`POST /games/:id/join` ...
+  never touch a live `GameSession` ... no affinity needed, no resolve step
+  involved"). Postgres is the one store reachable identically from every
+  instance; `UpdatePlayerBlack`'s existing atomic conditional UPDATE
+  (ADR-016) is already the full correctness guarantee for "did Black join."
+  Grepping every consumer of `GameSession.playerBlackID`
+  (`CurrentStateSnapshot`, the WebSocket message protocol in `messages.go`,
+  `HandleConnect`'s authorization path) found no live reader — connect-flow
+  identity is established entirely from signed JWT claims, never from this
+  field. Any `GameSession` later legitimately hydrated fresh from the DB
+  (`hydrateGameSession`/`NewGameSessionFromDB`) already reads
+  `player_black_id` off the row `JoinGame` wrote, with no extra step needed.
+  Removing the registry touch also fully closes the DB/response
+  non-atomicity bug: nothing remains after the DB write that can fail the
+  request.
+- Cons: the specific in-memory `GameSession` object `CreateGame` originally
+  built (if still the live one on the owning instance, which it usually is)
+  never has its `playerBlackID` field synced after this change — it stays
+  `""` for that object's lifetime. Accepted: nothing currently reads it: if a
+  future phase needs live-session player identity (rather than DB or JWT
+  claims), this should be revisited then, not solved speculatively now —
+  consistent with this project's standing discipline against building ahead
+  of demonstrated need (ADR-014, ADR-016).
+
+**Decision:** Option B for `JoinGame`. For `CreateGame`: add a best-effort,
+non-fatal `ClaimOwnership(ctx, gameID, m.instanceID, "")` call immediately
+after `registry.Register(session)`.
+
+**Rationale:**
+
+The deciding factor against Option A was not that it failed to fix the
+reported symptom — it would have — but that it reintroduced, via a new call
+site, the exact class of bug (an unowned, uncoordinated, independently
+hydrated second `GameSession`) that this project's entire Phase 2 design
+exists to structurally rule out. A fix that resolves an observed error while
+reopening the architecture's central invariant is not an acceptable trade,
+regardless of how directly it addresses the symptom in front of it. Option B
+is simpler, matches the system's actual required behavior (not merely what a
+document says — the documents were re-derived as correct independently, by
+checking what actually reads `playerBlackID` and confirming nothing does),
+and removes an entire failure mode (the DB/response non-atomicity bug) as a
+free side effect rather than requiring a second, separate fix. `CreateGame`'s
+ownership claim is a distinct, unrelated-in-mechanism fix bundled into the
+same ADR because it was found and fixed in the same session and closes the
+other half of the same observed symptom class (heartbeat log spam for
+created-but-unresolved games).
+
+**Consequences:**
+- `Manager.JoinGame` is now exactly: `GetGame` (precondition checks) →
+  `UpdatePlayerBlack` → sign token. No `GameRegistry`/`GameSession` access
+  anywhere in the method.
+- `Manager.CreateGame` now calls `ClaimOwnership` immediately after
+  `registry.Register`, best-effort — logged on failure, never fails game
+  creation itself.
+- `GameSession.SetPlayerBlack` becomes unused by any production call site.
+  Not deleted — it remains directly unit-tested
+  (`TestCurrentStateSnapshot_ReflectsSetPlayerBlack` in `session_test.go`,
+  unaffected by this ADR) and costs nothing to keep as a general-purpose
+  session mutator, but a future session should not be surprised to find it
+  has no production caller.
+- Three tests updated: `TestManager_JoinGame_UpdatesSessionAndDB` and
+  `TestManager_JoinGame_ConcurrentJoins_ExactlyOneWins`
+  (`internal/game/manager_test.go`, `manager_race_test.go`) no longer assert
+  `session.CurrentStateSnapshot().PlayerBlackID` after a successful join —
+  the DB-side assertions, which are the actual invariant ADR-016 protects,
+  are unchanged and remain the correctness guarantee.
+  `TestManager_JoinGame_RejectsSelfPlay`'s existing empty-`PlayerBlackID`
+  assertion still passes (trivially, now) and was left as-is.
+- Corrects, rather than implements, the `GetOrHydrate`-fallback approach for
+  `JoinGame` that `CLAUDE.md` recorded as the plan at the end of the prior
+  session — that approach was never implemented, and is superseded by this
+  ADR before any code following it was written.
+
+---
+
+## ADR-029: `ABORTED` Status for a Game Whose Opponent Never Joined
+
+**Date:** 2026-07-24
+**Status:** ACCEPTED
+
+**Context:**
+
+Manual E2E testing of Scenario 3 (PHASE_2.md's failover-abandonment test)
+surfaced a design flaw predating Phase 2 entirely, not a Phase 2 regression:
+`Manager.onAbandonTimeout`, when it fires for a game still in
+`WAITING_FOR_PLAYER` (the creator connected, the opponent never joined at
+all, and the creator then disconnected), runs the exact same
+single/both-disconnected branching built for `ACTIVE` games. `IsPlayerConnected`
+for the never-existent opponent returns `false`, which falls into the
+both-disconnected branch and attempts `Transition(ABANDONED)` with a `DRAW`
+outcome — which cannot even succeed, since `validTransitions` had no
+`WAITING→ABANDONED` edge (tracked separately as TD-P2-005), leaving such a
+game stuck in `WAITING_FOR_PLAYER` forever. But the deeper problem, caught
+during design of TD-P2-005's fix rather than by any test, is that the
+intended outcome was wrong regardless: a game where the opponent never showed
+up has no meaningful winner (ruling out the single-disconnect "opponent
+wins" branch) and was never actually contested (ruling out scoring it a
+`DRAW` either). It never started. Real-world chess platforms treat this case
+as void, not a drawn game.
+
+**Options considered:**
+
+**Option A: Add the missing `WAITING→ABANDONED` edge, keep the existing
+both-disconnected branch's `DRAW` outcome.** Closes TD-P2-005's stuck-forever
+bug with a minimal diff.
+
+- Pros: smallest possible change.
+- Cons: fixes the state-machine gap but leaves the wrong result recorded —
+  a game that never had two contesting players ends up with `outcome: DRAW`,
+  identical in shape to a genuine mutual-abandonment draw from an `ACTIVE`
+  game. Indistinguishable from a real correctness bug to any future consumer
+  of game history (Phase 4's ELO/history work would have no way to tell
+  "this was a void, unplayed game" from "these two players drew after both
+  disconnecting mid-game" without inspecting move count as an out-of-band
+  signal).
+
+**Option B: New `ABORTED` status, no outcome, no outcome_reason (CHOSEN).**
+`validTransitions` gains `WAITING→ABORTED`. `onAbandonTimeout` gains an early
+branch: if the game is still `WAITING_FOR_PLAYER` when the timer fires,
+transition straight to `ABORTED` and skip the ACTIVE-game single/both-disconnected
+branching entirely, since that logic is only meaningful for a game that
+actually started.
+
+- Pros: correctly represents the actual event — void, not drawn. Matches
+  real chess platform conventions the same design principle already leans on
+  elsewhere in this project (ADR-015's abandonment-vs-abandoned-draw split
+  was reached by the same reasoning: don't let one mechanism paper over two
+  genuinely different situations). Self-documenting for any future history/
+  ELO feature — an `ABORTED` game is trivially filterable without inspecting
+  move count.
+- Cons: one new status value, one migration (CHECK constraint), one new
+  `validTransitions` edge — marginally more than Option A, but not
+  meaningfully more complex to implement.
+
+**Decision:** Option B.
+
+**Rationale:**
+
+This project has consistently preferred correctly modeling a genuinely
+different situation over reusing an existing mechanism that happens to be
+adjacent (ADR-015 is the direct precedent: single-disconnect vs.
+both-disconnected `ACTIVE`-game outcomes were split into `COMPLETED`-with-a-
+winner vs. `ABANDONED`-as-a-draw specifically because conflating them produced
+a misleading result). A game that never started is not a weaker version of a
+drawn game; it's a different event, and Option A's minimal fix would leave it
+permanently misrecorded in a way nothing downstream could ever correct after
+the fact (unlike a code bug, a wrong `outcome: DRAW` written to a real row is
+permanent history).
+
+**Consequences:**
+- `store.GameStatusAborted` (`"ABORTED"`) added. `games.status`'s CHECK
+  constraint gains it (migration 004).
+- `validTransitions[WAITING]` gains `ABORTED: true`.
+- `Manager.onAbandonTimeout` branches on `snap.Status == WAITING` before the
+  existing `ACTIVE`-game logic; the `ABORTED` branch calls
+  `UpdateGameStatus(..., outcome: nil)` — `outcome`/`outcome_reason` stay
+  `NULL`, distinct from every other terminal path.
+- `GAME_OVER`'s wire payload for this path sends `outcome: ""`,
+  `reason: "ABORTED"` — the reason string is wire-only, not routed through
+  `store.OutcomeReason` (which has no `ABORTED` member and is not being given
+  one, since it isn't a scored result in that taxonomy).
+- This also directly closes TD-P2-005, which is now resolved rather than
+  merely tracked — the state-machine gap it flagged (`WAITING` had no path
+  to any terminal state) no longer exists.
+- Bundled with, but independent in mechanism from, ADR-030 below — both were
+  found via the same E2E testing session and both concern
+  `onAbandonTimeout`, but this ADR is a pure outcome-correctness fix with no
+  cross-instance component; a single-instance Phase 1 deployment has exactly
+  this same bug today and benefits from this fix identically.
+
+---
+
+## ADR-030: Persisted Disconnect Timestamps for Abandonment-Timer Continuity
+Across Failover
+
+**Date:** 2026-07-24
+**Status:** ACCEPTED
+
+**Context:**
+
+Manual E2E testing of Scenario 3 found that an `ACTIVE` game's abandonment
+timer does not survive an instance failover: if the owning instance dies
+while a player is disconnected (mid-60s-grace-period), and the surviving
+instance later hydrates the game when the other player reconnects, the game
+never reaches an abandonment outcome — it sits `ACTIVE` indefinitely with the
+missing player's connection slot permanently empty. Root cause, confirmed
+against source: `Manager.abandonTimers` (`map[string]*time.Timer`) is pure
+in-process memory, armed via `time.AfterFunc` inside `startAbandonTimer`,
+called only from `HandleDisconnect`. `hydrateGameSession` (the function that
+rebuilds a `GameSession` on the surviving instance) has no way to know a
+disconnect ever happened — nothing persists that fact anywhere — so it never
+arms a replacement timer, and `HandleConnect`'s reconnect path only ever
+*cancels* a timer for the color that just reconnected, never starts one for
+an opponent that's still missing.
+
+This is genuinely new to Phase 2, not a latent Phase 1 bug: in a
+single-instance deployment, the process that witnesses a disconnect is
+always the same process that would witness the timeout or the reconnect, so
+this gap cannot surface. Phase 2 is what introduces a second process that
+can inherit a game with zero memory of what the first process saw. This
+directly fails `phases/current/PHASE_2.md`'s stated Acceptance Criterion #5
+("Scenario 3 ... normal abandonment semantics apply, unmodified") as
+written.
+
+**Options considered for where to persist the disconnect fact:**
+
+**Option A: Redis key, mirroring the ownership/liveness pattern (ADR-023).**
+A `disconnect:{gameID}:{color}` key, TTL-based.
+
+- Pros: reuses an already-established pattern and store; no new dependency;
+  ownership/liveness already prove this project is comfortable reasoning
+  about TTL-based ephemeral coordination state in Redis.
+- Cons: rejected. Redis's outage is an explicit, documented, *tolerated*
+  failure mode in this design — `phases/current/PHASE_2.md`: "Redis going
+  down does not crash any instance; live gameplay is unaffected; new
+  resolves fail cleanly." Abandonment correctness is a fairness guarantee,
+  not a routing concern — it decides who wins or loses a game. If Redis
+  happens to be down at the exact moment a takeover instance needs to check
+  "was there a pending disconnect, and for how long," a Redis-backed design
+  has no way to know at all — indistinguishable from "nobody was ever
+  disconnected." That would silently reintroduce this exact bug, just
+  conditioned on Redis's health at that instant, which is a materially worse
+  failure mode for a fairness-determining fact than for a routing decision.
+  Separately: relying on Redis TTL expiry as the enforcement signal (rather
+  than just for key cleanup) is ambiguous on its own — an expired key and a
+  key that was never set are indistinguishable via a plain `EXISTS` check,
+  which would require storing an actual timestamp as the value anyway (at
+  which point Redis's TTL machinery isn't even being used for its main
+  benefit).
+
+**Option B: Postgres columns, `white_disconnected_at`/`black_disconnected_at`
+on `games` (CHOSEN).**
+
+- Pros: Postgres is already unconditionally required for the game to
+  function at all — every move and status transition already depends on it —
+  so tying fairness-critical state to it introduces no new single point of
+  failure, unlike Option A. `hydrateGameSession`/`restoreGame` already fetch
+  the `games` row via `GetGame`; two more nullable columns return in that
+  *same* query, at no extra round-trip cost — Option A would require a
+  mandatory second store round-trip per hydrate. A real timestamp column,
+  not a TTL'd key, removes the expired-vs-never-set ambiguity Option A had
+  to work around.
+- Cons: requires a migration (small, two nullable columns — migration 004,
+  bundled with ADR-029's `ABORTED` status change since both were found in
+  the same session and touch the same table). Marginally more "chatty" than
+  a Redis `SET` per disconnect/reconnect, irrelevant here since this is not
+  the move-processing hot path.
+
+**Decision:** Option B.
+
+**Rationale:**
+
+The deciding factor is failure-mode alignment, not raw performance or reuse
+of an existing pattern: Redis's documented, accepted failure mode (routing
+decisions fail cleanly, gameplay is unaffected) is specifically calibrated
+for routing/coordination concerns, not for a fact that determines who wins a
+game. Riding on the store that's already unconditionally required removes an
+entire class of "what if Redis is down at exactly the wrong moment" reasoning
+for this specific piece of state, and does so while being simpler (no
+TTL/expiry-ambiguity handling needed) and cheaper (no extra round-trip) than
+the Redis alternative would have been.
+
+**Consequences:**
+- `games` gains `white_disconnected_at`/`black_disconnected_at` (nullable
+  `TIMESTAMPTZ`, migration 004). `store.Game` gains matching fields.
+  `GameStore.GetGame`/`GetActiveGames` return them; new
+  `GameStore.UpdateDisconnectTimestamp(ctx, id, color, *time.Time)` sets
+  (disconnect) or clears (reconnect) one.
+- `Manager.HandleDisconnect` persists the disconnect moment (detached-context,
+  best-effort, same ADR-019 pattern as its existing clock-persist write) right
+  after arming the in-memory timer. `Manager.HandleConnect` clears it
+  (best-effort) alongside `cancelAbandonTimer`.
+- New `Manager.startAbandonTimerWithDuration` (parameterized duration,
+  `startAbandonTimer` becomes a thin wrapper passing the fixed
+  `abandonTimeout`), `armAbandonTimerForColor` (computes remaining duration
+  from a persisted timestamp, arms via `time.AfterFunc` even at zero
+  duration — see its doc comment for why this specifically avoids a
+  registration-ordering race against `GetOrHydrate`), and
+  `armAbandonTimersForGame` (re-fetches the row and arms both colors; called
+  after `GetOrHydrate` returns, not from inside `hydrateGameSession` itself,
+  for the same ordering reason).
+- Called from `restoreGame` (directly, since it already holds the row and
+  registers synchronously) and from both `ResolveGame`'s claim-and-hydrate
+  branch and `HandleConnect`'s registry-miss fallback (via
+  `armAbandonTimersForGame`, after `GetOrHydrate` returns).
+- Not addressed: stale timestamps on a now-terminal game are not explicitly
+  cleared (e.g. by `finalizeGame`). Left as harmless dead data —
+  `armAbandonTimerForColor`/`onAbandonTimeout`'s own terminal-state check
+  (`snap.Status != ACTIVE && != WAITING → return`) means an accidentally
+  re-armed timer for a terminal game is a guaranteed no-op, not a
+  correctness risk. Worth revisiting only if TD-P2-004's eventual
+  session-eviction work ever touches this same area.
+- This directly restores `phases/current/PHASE_2.md` Acceptance Criterion #5
+  to being actually true, rather than requiring it to be weakened/descoped.
+
+---
+
+## ADR-031: `NULL`-Ambiguity Fix — Assume-Disconnected-Now Fallback When No
+Disconnect Was Ever Individually Observed
+
+**Date:** 2026-07-25
+**Status:** ACCEPTED
+
+**Context:**
+
+An independent design review (a separate session, deliberately briefed
+neutrally rather than asked to validate ADR-030) found a real gap in
+ADR-030's implementation, confirmed against source before acting on it here:
+`white_disconnected_at`/`black_disconnected_at` are only ever written from
+inside `Manager.HandleDisconnect` — which only runs when *this process's own
+code* observes a connection close. If the owning instance itself dies while
+both players are still actively connected (a hard kill, an OOM, a crash, or
+a graceful shutdown that doesn't finish routing every connection through
+`ws.Registry.CloseAll`'s close path before a forced kill arrives), **neither
+timestamp is ever written** — not "expired," never set at all. When a
+survivor later hydrates the game, `armAbandonTimerForColor` treats `NULL` as
+"no grace period needed" (correct in ordinary steady state) and arms
+nothing for either color. If one player then reconnects and the other never
+does, no timer exists anywhere to eventually resolve it — the game sits
+`ACTIVE` forever. This is functionally the same failure ADR-030 exists to
+close, re-entered through a path ADR-030's original design didn't account
+for: **the instance-death case, not the individually-observed-disconnect
+case**, which by nature of how and when instances actually die in the
+Scenario 1–3 walkthrough (`docker compose stop`/`kill`) may be the *more*
+common trigger, not an edge case.
+
+Root cause, stated precisely: `NULL` was being used to mean two different
+things — "definitely fine" and "unknown, because the process that would
+have recorded a disconnect died first." This is the exact ambiguity class
+ADR-030 explicitly rejected when it ruled out a bare Redis `EXISTS` check
+("an expired key and a key that was never set are indistinguishable"),
+reintroduced one layer up in the chosen Postgres design because a `NULL`
+column has the identical two-meanings problem a TTL-expired key does.
+
+**Options considered:**
+
+**Option A: Fresh full `abandonTimeout` for any not-yet-reconnected color at
+hydration, ignoring any real elapsed time.**
+
+- Pros: simplest possible fix, no need to distinguish the two `NULL`
+  meanings at all.
+- Cons: rejected. Discards real information in the case where elapsed time
+  actually is known (a genuinely individually-observed disconnect) would
+  never reach this branch anyway (persisted is non-nil there), so this
+  option only matters for the crash case — but even there, it's strictly
+  worse than Option B for no benefit: it's never more correct, only ever
+  equal to or more generous than necessary in a way that's harder to reason
+  about (why would an assumed-fresh 60s be right if the crash happened,
+  say, 3 minutes before anyone noticed?).
+
+**Option B: Deriving the fallback timestamp from the routing directory's
+last liveness renewal instead of `time.Now()`.**
+
+- Pros: could in principle produce a tighter estimate of the actual crash
+  moment than "whenever someone happens to reconnect."
+- Cons: rejected. Redis's liveness key (`instance_alive:{instanceID}`, ADR-023)
+  is renewed every 3s specifically for fast failure detection, not retained
+  history — by the time a survivor is hydrating this game, the dead
+  instance's liveness key has already expired and is gone; there is nothing
+  left to read a "last renewal time" from. Reconstructing this would require
+  persisting additional liveness history nowhere else in this design keeps,
+  for a fairness benefit that only ever helps in the direction of being
+  *less* generous to the disconnected player — the wrong direction to add
+  complexity for.
+
+**Option C: Reactive arming only — arm the opponent's timer only once the
+first player's `HandleConnect` actually succeeds, never at hydration time
+itself.**
+
+- Pros: avoids arming a timer for a game nobody has touched yet; slightly
+  less speculative than arming both colors unconditionally at hydration.
+- Cons: rejected as incomplete, not wrong. Leaves a real case unresolved: a
+  player who calls `/resolve` (successfully claiming/hydrating the session)
+  but never completes the WebSocket dial within `ConnectClaimsTTL` — under
+  Option C, nothing would ever arm a timer for the *other* color in that
+  scenario, since no `HandleConnect` ever ran on this instance to trigger
+  it.
+
+**Option D: Periodic sweep/poll across all locally-registered `ACTIVE`/
+`WAITING_FOR_PLAYER` sessions with stale/missing connections, instead of
+timer reconstruction at hydration (CHOSEN alternative rejected, see
+Decision).**
+
+- Pros: structurally more robust — doesn't depend on hydration being the
+  only trigger point; would also close the "nobody ever resolves again"
+  gap (see Consequences) that no hydration-triggered fix can close by
+  construction.
+- Cons: rejected for this fix, though not because it's wrong — it's
+  disproportionate for what is otherwise a small, localized correction, and
+  this project has repeatedly declined exactly this shape of
+  build-ahead-of-need complexity (ADR-014, ADR-016, ADR-023's own
+  TD-P2-001/003 deferrals). Recorded as a candidate design for the
+  "nobody ever resolves" gap below if it's ever shown to matter in
+  practice, not dismissed outright.
+
+**Decision:** `effectiveDisconnectedAt(status, persisted)` — a fallback
+applied only at hydration (`armAbandonTimersForGame`, `restoreGame`), never
+from `HandleDisconnect` itself: if a persisted timestamp exists, trust it
+as-is (unchanged from ADR-030); if it's `nil` and the game is `ACTIVE` or
+`WAITING_FOR_PLAYER`, assume disconnected as of `time.Now()` rather than
+assuming fine.
+
+**Rationale:**
+
+A freshly-hydrated `GameSession` always starts with both connection slots
+empty regardless of *why* — individually-observed disconnect, instance
+death, or genuinely nobody has connected yet — so hydration time is the one
+point where the ambiguity is unavoidable and must be resolved one way or the
+other. Erring toward "assume disconnected" costs nothing in the case where
+the assumption is wrong: a player who is in fact fine and reconnects moments
+later self-cancels this defensively-armed timer through the exact same
+`cancelAbandonTimer`/`UpdateDisconnectTimestamp(nil)` path that already
+cancels a real disconnect timer (unchanged, ADR-030). The cost of guessing
+wrong in this direction is a few seconds of a timer that gets cancelled
+before it matters — the cost of guessing wrong in the other direction (the
+original bug) is a game stuck `ACTIVE` forever. This asymmetry is why
+"assume disconnected" and not "assume fine" is the only defensible default.
+
+**Consequences:**
+- New package-level helper `effectiveDisconnectedAt(status store.GameStatus,
+  persisted *time.Time) *time.Time` in `internal/game/manager.go`. Called
+  from `armAbandonTimersForGame` and `restoreGame`, wrapping the value
+  passed to `armAbandonTimerForColor` — `armAbandonTimerForColor`,
+  `onAbandonTimeout`'s branching, the `ABORTED` branch, and `finalizeGame`
+  are all unchanged; this is additive, not a rewrite of anything ADR-029/030
+  already got right.
+- Explicitly NOT closed by this fix, and cannot be by construction: a game
+  where **nobody ever calls `/resolve` again** after an instance dies.
+  Nothing runs if nobody triggers a hydrate — `effectiveDisconnectedAt` only
+  ever executes at the moment someone does. Tracked as new technical debt
+  (not scheduled, no demonstrated need yet — candidate design if ever
+  needed: a periodic sweep, Option D above, folded into the existing
+  heartbeat tick rather than a new ticker).
+- TD-P2-001's existing false-positive liveness window gains a compounding
+  note: under that window, a competing phantom session hydrated on a second
+  instance while the original owner is in fact still alive would, as of
+  this fix, also arm defensive abandon timers via `effectiveDisconnectedAt`
+  for a game that was never actually down — same bounded window TD-P2-001
+  already documents, now with an additional possible symptom (a spurious
+  abandon-loss for a genuinely-connected player) alongside the
+  already-documented duplicate-processing risk. Not a new risk class, an
+  addition to an already-accepted one.
+- Regression tests required (not yet written as of this ADR): a
+  two-`Manager`-instance test proving the crash-while-both-connected case
+  now resolves correctly (previously unclosed), and a test confirming the
+  individually-observed-disconnect case (already correct under ADR-030
+  alone) does not regress — a single-`Manager` test cannot reproduce either,
+  per this project's own established Known Sharp Edges note on this class of
+  bug.
+
+---
