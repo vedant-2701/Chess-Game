@@ -174,13 +174,17 @@ func TestManager_JoinGame_UpdatesSessionAndDB(t *testing.T) {
 		t.Errorf("token UserID: got %q, want %q", claims.UserID, mgrTestBlackID)
 	}
 
-	// Session reflects the joined player. Note: JoinGame does not transition
-	// status to ACTIVE — per PHASE_1.md, that only happens when Black's
-	// WebSocket connects (Manager.HandleConnect), not on the HTTP join call.
+	// Session status must remain WAITING_FOR_PLAYER — JoinGame does not
+	// transition to ACTIVE (that only happens when Black's WebSocket connects,
+	// via Manager.HandleConnect). Per DECISIONS_LOG_PHASE_2.md ADR-028,
+	// JoinGame no longer touches the live GameSession at all — it is a pure
+	// DB operation — so session.PlayerBlackID is deliberately NOT asserted
+	// here anymore: it stays "" on this specific in-memory object (the one
+	// CreateGame originally built) until/unless a fresh GameSession is
+	// hydrated from the DB, which is exactly where PlayerBlackID gets picked
+	// up correctly (NewGameSessionFromDB). The DB assertion below is the
+	// actual correctness guarantee this test protects.
 	snap := session.CurrentStateSnapshot()
-	if snap.PlayerBlackID != mgrTestBlackID {
-		t.Errorf("session.PlayerBlackID: got %q, want %q", snap.PlayerBlackID, mgrTestBlackID)
-	}
 	if snap.Status != store.GameStatusWaiting {
 		t.Errorf("session status after JoinGame: got %q, want still WAITING_FOR_PLAYER", snap.Status)
 	}
@@ -706,5 +710,149 @@ func TestManager_RestoreActiveGames_MultipleGamesIndependentFailureIsolation(t *
 	}
 	if _, err := m.registry.Get(badGameID); err == nil {
 		t.Error("unreplayable game was incorrectly added to the registry")
+	}
+}
+
+// --- onAbandonTimeout / ABORTED (DECISIONS_LOG_PHASE_2.md ADR-029) --------
+
+// TestManager_OnAbandonTimeout_WaitingGame_TransitionsToAborted is the core
+// regression test for ADR-029: a game whose creator connected but whose
+// opponent never joined must resolve to ABORTED — no winner, no outcome —
+// not the ACTIVE-game single/both-disconnected branching, which would
+// either award a phantom win or score a meaningless draw for a game that
+// never actually started.
+//
+// onAbandonTimeout is called directly rather than through the real 60s
+// timer, matching CODING_GUIDELINES.md §6's prohibition on time.Sleep in
+// tests — the timer itself is not what's under test here.
+func TestManager_OnAbandonTimeout_WaitingGame_TransitionsToAborted(t *testing.T) {
+	truncateAll(t)
+	mustCreateUser(t, mgrTestWhiteID)
+
+	ctx := context.Background()
+	m := newTestManager(t)
+
+	session, _, err := m.CreateGame(ctx, mgrTestWhiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+
+	m.onAbandonTimeout(session.ID, store.ColorWhite)
+
+	// In-memory session.
+	snap := session.CurrentStateSnapshot()
+	if snap.Status != store.GameStatusAborted {
+		t.Errorf("session status after onAbandonTimeout: got %q, want ABORTED", snap.Status)
+	}
+
+	// DB state: status ABORTED, and — unlike every other terminal path —
+	// outcome/outcome_reason must both stay nil. An aborted game has no
+	// result to record; it never started.
+	game, err := store.NewGameStore(testPool).GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame: %v", err)
+	}
+	if game.Status != store.GameStatusAborted {
+		t.Errorf("DB game.Status: got %q, want ABORTED", game.Status)
+	}
+	if game.Outcome != nil {
+		t.Errorf("DB game.Outcome: got %v, want nil (an aborted game has no winner)", game.Outcome)
+	}
+	if game.OutcomeReason != nil {
+		t.Errorf("DB game.OutcomeReason: got %v, want nil (an aborted game has no reason —"+
+			" it isn't a scored result in that taxonomy)", game.OutcomeReason)
+	}
+
+	// finalizeGame must have unregistered the session — same contract every
+	// other terminal path already has (checkmate, resignation, abandonment).
+	if _, err := m.registry.Get(session.ID); err == nil {
+		t.Error("session still present in registry after ABORTED — finalizeGame should have unregistered it")
+	}
+}
+
+// TestManager_OnAbandonTimeout_WaitingGame_IdempotentOnRepeatedFire confirms
+// a second call (e.g. a duplicate timer fire, or the zero-duration
+// resumption path in armAbandonTimerForColor racing an already-fired real
+// timer) is a safe no-op, not a double-transition or a double DB write.
+// Relies on GameSession.Transition's existing idempotency (already-terminal
+// → ErrInvalidTransition, logged at Debug and returned early) — this test
+// exists to confirm onAbandonTimeout's ABORTED branch actually goes through
+// that guard rather than assuming any WAITING-status snapshot is safe to
+// re-transition.
+func TestManager_OnAbandonTimeout_WaitingGame_IdempotentOnRepeatedFire(t *testing.T) {
+	truncateAll(t)
+	mustCreateUser(t, mgrTestWhiteID)
+
+	ctx := context.Background()
+	m := newTestManager(t)
+
+	session, _, err := m.CreateGame(ctx, mgrTestWhiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+
+	m.onAbandonTimeout(session.ID, store.ColorWhite)
+	// Second call must not panic (registry.Get will already miss, since
+	// finalizeGame unregistered the session on the first call — this alone
+	// already exercises the "session not found" early return, but the more
+	// interesting case is asserting the DB row was not touched a second time).
+	m.onAbandonTimeout(session.ID, store.ColorWhite)
+
+	game, err := store.NewGameStore(testPool).GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame: %v", err)
+	}
+	if game.Status != store.GameStatusAborted {
+		t.Errorf("DB game.Status after repeated onAbandonTimeout: got %q, want ABORTED", game.Status)
+	}
+}
+
+// TestManager_OnAbandonTimeout_ActiveGame_NeverGoesToAborted is a regression
+// guard for the new WAITING-status early branch in onAbandonTimeout: it must
+// not affect the ACTIVE-game path (ADR-015's existing single/both-disconnected
+// logic) at all. A game that actually reached ACTIVE has real stakes and must
+// never resolve to ABORTED.
+func TestManager_OnAbandonTimeout_ActiveGame_NeverGoesToAborted(t *testing.T) {
+	truncateAll(t)
+	mustCreateUser(t, mgrTestWhiteID)
+	mustCreateUser(t, mgrTestBlackID)
+
+	ctx := context.Background()
+	m := newTestManager(t)
+
+	session, _, err := m.CreateGame(ctx, mgrTestWhiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+	if _, err := m.JoinGame(ctx, session.ID, mgrTestBlackID); err != nil {
+		t.Fatalf("JoinGame: %v", err)
+	}
+	if err := session.Transition(store.GameStatusActive); err != nil {
+		t.Fatalf("Transition to ACTIVE: %v", err)
+	}
+	// session.Transition only flips the in-memory session status.
+	// onAbandonTimeout's DB write uses an atomic CAS keyed on the DB row
+	// actually being ACTIVE (ADR-016's pattern) — without also syncing the
+	// DB here, the CAS predicate correctly (and unhelpfully, for this test)
+	// rejects the write, since the real row is still WAITING_FOR_PLAYER.
+	if err := store.NewGameStore(testPool).UpdateGameStatus(ctx, session.ID, store.GameStatusWaiting, store.GameStatusActive, nil); err != nil {
+		t.Fatalf("sync DB status to ACTIVE: %v", err)
+	}
+
+	// Neither player has a live connection in this test (no real WebSocket),
+	// so IsPlayerConnected is false for both — this exercises the
+	// both-disconnected branch, which must still resolve to ABANDONED (a
+	// drawn, but real, outcome), never ABORTED.
+	m.onAbandonTimeout(session.ID, store.ColorWhite)
+
+	game, err := store.NewGameStore(testPool).GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame: %v", err)
+	}
+	if game.Status == store.GameStatusAborted {
+		t.Fatal("ACTIVE game incorrectly resolved to ABORTED — the WAITING-only early branch leaked into the ACTIVE path")
+	}
+	if game.Status != store.GameStatusAbandoned {
+		t.Errorf("DB game.Status: got %q, want ABANDONED (both-disconnected branch, unchanged ADR-015 behavior)", game.Status)
 	}
 }

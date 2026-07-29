@@ -123,8 +123,29 @@ func TestVerifyPlayerToken(t *testing.T) {
 				if err != nil {
 					t.Fatalf("sign: %v", err)
 				}
-				// Corrupt the last character of the signature segment
-				return tok[:len(tok)-1] + "X"
+				// Flip a character in the MIDDLE of the signature segment, not
+				// the last one. The final character of a base64url-encoded
+				// 32-byte HMAC-SHA256 signature carries 2 "don't-care" padding
+				// bits the decoder ignores, so a fixed last-character
+				// replacement can decode to the SAME bytes as the original on
+				// roughly 1 in 16 runs (the signature, and therefore its last
+				// character, differs every run because IssuedAt varies it) —
+				// making this test flakily pass-when-it-should-fail. A
+				// middle-index flip always changes a real, meaningful bit
+				// position. Mirrors the already-correct pattern used below in
+				// TestVerifyConnectToken's "tampered payload" case.
+				parts := strings.Split(tok, ".")
+				if len(parts) != 3 {
+					t.Fatalf("expected 3 JWT segments, got %d", len(parts))
+				}
+				sig := parts[2]
+				mid := len(sig) / 2
+				replacement := byte('A')
+				if sig[mid] == 'A' {
+					replacement = 'B'
+				}
+				tamperedSig := sig[:mid] + string(replacement) + sig[mid+1:]
+				return parts[0] + "." + parts[1] + "." + tamperedSig
 			},
 			secret:  testSecret,
 			wantErr: auth.ErrTokenInvalid,
@@ -301,7 +322,23 @@ func TestVerifyConnectToken(t *testing.T) {
 				if err != nil {
 					t.Fatalf("sign: %v", err)
 				}
-				return tok[:len(tok)-1] + "X"
+				// Same fix as TestVerifyPlayerToken's identical case: flip a
+				// MIDDLE character of the signature segment, not the last one,
+				// to avoid the base64 "don't-care bits" collision that made
+				// this flaky (~1 in 16 runs) with a fixed last-character
+				// replacement.
+				parts := strings.Split(tok, ".")
+				if len(parts) != 3 {
+					t.Fatalf("expected 3 JWT segments, got %d", len(parts))
+				}
+				sig := parts[2]
+				mid := len(sig) / 2
+				replacement := byte('A')
+				if sig[mid] == 'A' {
+					replacement = 'B'
+				}
+				tamperedSig := sig[:mid] + string(replacement) + sig[mid+1:]
+				return parts[0] + "." + parts[1] + "." + tamperedSig
 			},
 			secret:  testSecret,
 			wantErr: auth.ErrTokenInvalid,

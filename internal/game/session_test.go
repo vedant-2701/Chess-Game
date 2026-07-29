@@ -28,6 +28,10 @@ func TestTransition_ValidEdges(t *testing.T) {
 		{"waiting to active", store.GameStatusWaiting, store.GameStatusActive},
 		{"active to completed", store.GameStatusActive, store.GameStatusCompleted},
 		{"active to abandoned", store.GameStatusActive, store.GameStatusAbandoned},
+		// DECISIONS_LOG_PHASE_2.md ADR-029: a creator who disconnects before
+		// anyone joins, and never returns, must reach a terminal state — the
+		// game never started, so ABORTED, not ABANDONED.
+		{"waiting to aborted", store.GameStatusWaiting, store.GameStatusAborted},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -96,6 +100,26 @@ func TestTransition_InvalidEdges(t *testing.T) {
 				_ = s.Transition(store.GameStatusActive)
 				_ = s.Transition(store.GameStatusAbandoned)
 			},
+			store.GameStatusCompleted,
+		},
+		// DECISIONS_LOG_PHASE_2.md ADR-029: ABORTED must only be reachable from
+		// WAITING_FOR_PLAYER, never from ACTIVE — a game that actually started
+		// (both players joined) has real stakes and must resolve via
+		// COMPLETED/ABANDONED, never be silently voided.
+		{
+			"active to aborted",
+			func(s *game.GameSession) { _ = s.Transition(store.GameStatusActive) },
+			store.GameStatusAborted,
+		},
+		// ABORTED is terminal, same as every other end state.
+		{
+			"aborted to active",
+			func(s *game.GameSession) { _ = s.Transition(store.GameStatusAborted) },
+			store.GameStatusActive,
+		},
+		{
+			"aborted to completed",
+			func(s *game.GameSession) { _ = s.Transition(store.GameStatusAborted) },
 			store.GameStatusCompleted,
 		},
 	}

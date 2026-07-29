@@ -20,6 +20,12 @@ const InitialTimeMs int64 = 600_000
 var validTransitions = map[store.GameStatus]map[store.GameStatus]bool{
 	store.GameStatusWaiting: {
 		store.GameStatusActive: true,
+		// DECISIONS_LOG_PHASE_2.md ADR-029: a creator who disconnects before
+		// anyone joins, and never returns, must be able to reach a terminal
+		// state — the game never started, so ABORTED (no outcome, no winner),
+		// not ABANDONED (which requires the game to have actually reached
+		// ACTIVE first).
+		store.GameStatusAborted: true,
 	},
 	store.GameStatusActive: {
 		store.GameStatusCompleted: true,

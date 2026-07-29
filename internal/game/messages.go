@@ -37,6 +37,15 @@ const (
 	ErrCodeGameNotFound  = "GAME_NOT_FOUND"
 	ErrCodeGameFull      = "GAME_FULL"
 	ErrCodeInternalError = "INTERNAL_ERROR"
+
+	// ErrCodeConnectTokenExpired is PHASE_2.md Step 8's dedicated code for an
+	// expired ConnectClaims token specifically — distinct from the generic
+	// ErrCodeInvalidToken. ConnectClaims' 10s TTL (ADR-022) is deliberately
+	// short, so expiry here is an expected, common outcome (the client took
+	// too long between resolve and dialing the WS), not evidence of a bug.
+	// The distinct code lets a client branch on "call resolve again" vs.
+	// "something is actually wrong" without string-matching an error message.
+	ErrCodeConnectTokenExpired = "CONNECT_TOKEN_EXPIRED"
 )
 
 // wsCloseNormal is the RFC 6455 "normal closure" WebSocket status code, used

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +39,7 @@ import (
 const shutdownTimeout = 15 * time.Second
 
 // config holds the environment-derived settings PHASE_1.md Step 13 and
-// PHASE_2.md Step 1 require.
+// PHASE_2.md Step 1/9 require.
 type config struct {
 	DatabaseURL string
 	JWTSecret   string
@@ -46,6 +47,20 @@ type config struct {
 	LogLevel    string
 	RedisAddr   string
 	InstanceID  string
+
+	// SkipMigrations is PHASE_2.md Step 9 / DECISIONS_LOG_PHASE_2.md ADR-025's
+	// mechanism for closing TD-008. Optional, defaults to false so every
+	// existing single-instance workflow (bare `go run`/`make run`, no
+	// SKIP_MIGRATIONS set) is completely unaffected and keeps calling
+	// runMigrations exactly as it always has. docker-compose.yml's cluster
+	// profile sets SKIP_MIGRATIONS=true on server1/server2 specifically,
+	// since under that profile a dedicated one-shot `migrate` service
+	// (gated via depends_on: condition: service_completed_successfully) has
+	// already applied every migration before either replica starts —
+	// ADR-025's Consequences are explicit that runMigrations must not be
+	// invoked at all "in the Phase 2 multi-instance docker-compose.yml
+	// path," not merely left as a harmless no-op there.
+	SkipMigrations bool
 }
 
 // loadConfig reads and validates required environment variables. DATABASE_URL
@@ -91,6 +106,15 @@ func loadConfig() (config, error) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
+
+	// SKIP_MIGRATIONS: optional, defaults to false on any parse failure or
+	// absence — an unrecognized value here should never accidentally suppress
+	// migrations (the safer failure direction is "run them when unsure," not
+	// "skip them when unsure"). strconv.ParseBool accepts "true"/"false" (and
+	// a few common variants); anything else, including an empty string,
+	// yields false via the ignored error.
+	cfg.SkipMigrations, _ = strconv.ParseBool(os.Getenv("SKIP_MIGRATIONS"))
+
 	return cfg, nil
 }
 
@@ -135,7 +159,9 @@ func main() {
 	}
 	defer pool.Close() // safety net; the graceful shutdown path also closes this explicitly below.
 
-	if err := runMigrations(cfg.DatabaseURL); err != nil {
+	if cfg.SkipMigrations {
+		slog.Info("SKIP_MIGRATIONS set — assuming a dedicated migrate service already applied them (PHASE_2.md Step 9, ADR-025)")
+	} else if err := runMigrations(cfg.DatabaseURL); err != nil {
 		slog.Error("failed to run migrations", "error", err)
 		os.Exit(1)
 	}
@@ -177,10 +203,14 @@ func main() {
 	registry := game.NewGameRegistry()
 	manager := game.NewManager(registry, processor, gameStore, moveStore, eventBus, cfg.JWTSecret, validator, directory, cfg.InstanceID)
 
-	if err := manager.RestoreActiveGames(ctx); err != nil {
-		slog.Error("failed to restore active games", "error", err)
-		os.Exit(1)
-	}
+	// PHASE_2.md Step 8 / DECISIONS_LOG_PHASE_2.md ADR-024: RestoreActiveGames
+	// is deliberately NOT called here anymore. Manager.HandleConnect's
+	// GetOrHydrate fallback (added this same step) now handles every local
+	// registry miss identically, regardless of cause — including the exact
+	// fast-restart gap eager restore used to close. The function itself is
+	// not deleted (internal/game/manager.go) — it remains correct and
+	// available for a genuinely single-instance deployment that wants eager
+	// restore, just not invoked by this binary's own startup path.
 
 	// PHASE_2.md Step 6: start the per-instance heartbeat ticker (renews this
 	// instance's liveness key and, once any games exist, their ownership

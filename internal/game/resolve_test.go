@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/goleak"
@@ -14,6 +15,7 @@ import (
 	"github.com/vedant-2701/chess/internal/auth"
 	internalchess "github.com/vedant-2701/chess/internal/chess"
 	"github.com/vedant-2701/chess/internal/store"
+	"github.com/vedant-2701/chess/internal/ws"
 )
 
 const resolveTestJWTSecret = "resolve-test-secret"
@@ -354,5 +356,225 @@ func TestManager_ResolveGame_ConcurrentResolves_SameInstanceLabel(t *testing.T) 
 		if r.instanceLabel != "instance-a" {
 			t.Errorf("instanceLabel: got %q, want %q", r.instanceLabel, "instance-a")
 		}
+	}
+}
+
+// --- Abandon-timer continuity across failover (DECISIONS_LOG_PHASE_2.md ADR-030/ADR-031) ---
+
+// TestManager_AbandonTimer_ResumesAfterCrashWhileBothConnected is ADR-031's
+// core regression test: an instance dies while BOTH players are connected,
+// so HandleDisconnect never runs for either color and
+// white_disconnected_at/black_disconnected_at both stay NULL straight
+// through the crash — not "expired," never written at all. Confirms a
+// surviving instance still arms a defensive abandon timer for whichever
+// player never comes back, via effectiveDisconnectedAt's "assume
+// disconnected as of now" fallback. Without ADR-031, this game would sit
+// ACTIVE forever: armAbandonTimerForColor no-ops on a nil timestamp, and
+// nothing else ever arms anything for the missing color.
+func TestManager_AbandonTimer_ResumesAfterCrashWhileBothConnected(t *testing.T) {
+	truncateAll(t)
+	flushTestRedisDB(t)
+
+	const whiteID = "40000000-0000-0000-0000-000000000009"
+	const blackID = "40000000-0000-0000-0000-000000000010"
+	mustCreateUser(t, whiteID)
+	mustCreateUser(t, blackID)
+
+	ctx := context.Background()
+
+	// Instance A: create, join, both players connect — game reaches ACTIVE
+	// with two live (fake, nil-underlying) connections. ws.NewConnection(id,
+	// nil) is safe here per CLAUDE.md's documented sharp edge: Send() never
+	// touches wsConn unless WriteLoop is running, which only happens via
+	// Start() — never called in this test.
+	m1 := newTestManagerWithDirectory(t, "instance-a")
+	session, _, err := m1.CreateGame(ctx, whiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+	if _, err := m1.JoinGame(ctx, session.ID, blackID); err != nil {
+		t.Fatalf("JoinGame: %v", err)
+	}
+	whiteConnA := ws.NewConnection("white-conn-a", nil)
+	blackConnA := ws.NewConnection("black-conn-a", nil)
+	if err := m1.HandleConnect(ctx, session.ID, store.ColorWhite, whiteConnA); err != nil {
+		t.Fatalf("HandleConnect white: %v", err)
+	}
+	if err := m1.HandleConnect(ctx, session.ID, store.ColorBlack, blackConnA); err != nil {
+		t.Fatalf("HandleConnect black: %v", err)
+	}
+
+	if snap := session.CurrentStateSnapshot(); snap.Status != store.GameStatusActive {
+		t.Fatalf("precondition failed: game must be ACTIVE after both connect, got %q", snap.Status)
+	}
+
+	// Simulate the crash: instance-a simply stops being used. Deliberately
+	// do NOT call HandleDisconnect for either color — a real crash gives
+	// neither player's disconnect a chance to be individually observed.
+	// instance-a's liveness key was also never set (SetAlive is the
+	// heartbeat ticker's job, not exercised here), so it already reads as
+	// dead from the directory's perspective — same pattern as
+	// TestManager_ResolveGame_TakeoverFromDeadOwner above.
+	gs := store.NewGameStore(testPool)
+	precrash, err := gs.GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame precondition check: %v", err)
+	}
+	if precrash.WhiteDisconnectedAt != nil || precrash.BlackDisconnectedAt != nil {
+		t.Fatalf("precondition failed: expected both disconnect timestamps NULL after a simulated crash "+
+			"(neither disconnect was individually observed), got white=%v black=%v",
+			precrash.WhiteDisconnectedAt, precrash.BlackDisconnectedAt)
+	}
+
+	// Instance B takes over. White resolves and reconnects; Black never does.
+	m2 := newTestManagerWithDirectory(t, "instance-b")
+	_, instanceLabel, err := m2.ResolveGame(ctx, session.ID, whiteID, store.ColorWhite)
+	if err != nil {
+		t.Fatalf("ResolveGame (takeover): %v", err)
+	}
+	if instanceLabel != "instance-b" {
+		t.Fatalf("expected takeover to instance-b, got %q", instanceLabel)
+	}
+
+	whiteConnB := ws.NewConnection("white-conn-b", nil)
+	if err := m2.HandleConnect(ctx, session.ID, store.ColorWhite, whiteConnB); err != nil {
+		t.Fatalf("HandleConnect white on instance-b: %v", err)
+	}
+
+	// The actual regression assertion: prior to ADR-031, neither color would
+	// ever get an armed timer (both DB timestamps were nil, and
+	// armAbandonTimerForColor no-ops on nil), so Black's absence would never
+	// resolve. White's own reconnect must have cancelled its own
+	// defensively-armed timer; Black's must still be armed.
+	m2.mu.Lock()
+	_, whiteArmed := m2.abandonTimers[abandonKey(session.ID, store.ColorWhite)]
+	_, blackArmed := m2.abandonTimers[abandonKey(session.ID, store.ColorBlack)]
+	m2.mu.Unlock()
+
+	if whiteArmed {
+		t.Error("White's defensive timer should have been cancelled by White's own HandleConnect, but is still armed")
+	}
+	if !blackArmed {
+		t.Fatal("Black has no armed abandon timer after takeover — this is exactly the ADR-031 bug: " +
+			"a crash-while-both-connected leaves NULL/NULL in the DB, and without effectiveDisconnectedAt's " +
+			"fallback, armAbandonTimerForColor no-ops on nil forever")
+	}
+
+	// Fire it directly (CODING_GUIDELINES.md §6 forbids time.Sleep in tests)
+	// to confirm the CORRECT end state once it does fire: White is
+	// connected, so this must be a decisive COMPLETED/White-wins/ABANDONED
+	// outcome — not a draw.
+	m2.onAbandonTimeout(session.ID, store.ColorBlack)
+
+	finalGame, err := gs.GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame after firing: %v", err)
+	}
+	if finalGame.Status != store.GameStatusCompleted {
+		t.Errorf("final status: got %q, want COMPLETED", finalGame.Status)
+	}
+	if finalGame.Outcome == nil || *finalGame.Outcome != store.OutcomeWhite {
+		t.Errorf("final outcome: got %v, want WHITE (White was connected, Black was not)", finalGame.Outcome)
+	}
+	if finalGame.OutcomeReason == nil || *finalGame.OutcomeReason != store.OutcomeReasonAbandoned {
+		t.Errorf("final outcome reason: got %v, want ABANDONED", finalGame.OutcomeReason)
+	}
+}
+
+// TestManager_AbandonTimer_IndividuallyObservedDisconnect_NoRegression
+// confirms ADR-031's fallback does NOT disturb the case ADR-030 already got
+// right: a real, individually-observed disconnect (HandleDisconnect
+// actually ran before the crash) must resume from its own persisted
+// timestamp, unmodified — not have that real timestamp silently overwritten
+// by effectiveDisconnectedAt's "assume now" fallback, which must only ever
+// apply when persisted is nil.
+func TestManager_AbandonTimer_IndividuallyObservedDisconnect_NoRegression(t *testing.T) {
+	truncateAll(t)
+	flushTestRedisDB(t)
+
+	const whiteID = "40000000-0000-0000-0000-000000000011"
+	const blackID = "40000000-0000-0000-0000-000000000012"
+	mustCreateUser(t, whiteID)
+	mustCreateUser(t, blackID)
+
+	ctx := context.Background()
+
+	m1 := newTestManagerWithDirectory(t, "instance-a")
+	session, _, err := m1.CreateGame(ctx, whiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+	if _, err := m1.JoinGame(ctx, session.ID, blackID); err != nil {
+		t.Fatalf("JoinGame: %v", err)
+	}
+	whiteConnA := ws.NewConnection("white-conn-a", nil)
+	blackConnA := ws.NewConnection("black-conn-a", nil)
+	if err := m1.HandleConnect(ctx, session.ID, store.ColorWhite, whiteConnA); err != nil {
+		t.Fatalf("HandleConnect white: %v", err)
+	}
+	if err := m1.HandleConnect(ctx, session.ID, store.ColorBlack, blackConnA); err != nil {
+		t.Fatalf("HandleConnect black: %v", err)
+	}
+
+	// Black disconnects for real, while instance-a is still alive — the
+	// individually-observed case, exercising the exact ADR-030 write path
+	// (HandleDisconnect -> UpdateDisconnectTimestamp).
+	m1.HandleDisconnect(ctx, session.ID, store.ColorBlack)
+
+	gs := store.NewGameStore(testPool)
+	afterDisconnect, err := gs.GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame after HandleDisconnect: %v", err)
+	}
+	if afterDisconnect.BlackDisconnectedAt == nil {
+		t.Fatal("precondition failed: HandleDisconnect must persist a real black_disconnected_at")
+	}
+
+	// Simulate "20 seconds have passed" without sleeping: overwrite the real
+	// timestamp HandleDisconnect just wrote with one dated 20s in the past.
+	// Truncated to microsecond precision before writing: Postgres TIMESTAMPTZ
+	// only stores microsecond precision, so a full-nanosecond-precision
+	// time.Now()-derived value (plus its monotonic reading, which Postgres
+	// cannot store at all) would silently lose its trailing digits on the
+	// round trip through GetGame below — truncating here first makes what we
+	// write and what we read back byte-for-byte comparable.
+	twentySecondsAgo := time.Now().Add(-20 * time.Second).Truncate(time.Microsecond)
+	if err := gs.UpdateDisconnectTimestamp(ctx, session.ID, store.ColorBlack, &twentySecondsAgo); err != nil {
+		t.Fatalf("simulate elapsed time: %v", err)
+	}
+
+	// Instance-a "dies" (never call HandleDisconnect again; its liveness key
+	// was never set). Instance-b takes over as White resolves.
+	m2 := newTestManagerWithDirectory(t, "instance-b")
+	if _, _, err := m2.ResolveGame(ctx, session.ID, whiteID, store.ColorWhite); err != nil {
+		t.Fatalf("ResolveGame (takeover): %v", err)
+	}
+
+	// The real, individually-observed timestamp must survive the takeover
+	// unchanged — effectiveDisconnectedAt trusts a non-nil persisted value
+	// as-is. Confirms the ADR-031 fallback did NOT overwrite it with "now."
+	afterTakeover, err := gs.GetGame(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetGame after takeover: %v", err)
+	}
+	if afterTakeover.BlackDisconnectedAt == nil {
+		t.Fatal("black_disconnected_at was cleared by the takeover — it must survive untouched")
+	}
+	if !afterTakeover.BlackDisconnectedAt.Equal(twentySecondsAgo) {
+		t.Errorf("black_disconnected_at was altered by takeover: got %v, want unchanged %v "+
+			"(ADR-031's fallback must never overwrite a real timestamp)",
+			*afterTakeover.BlackDisconnectedAt, twentySecondsAgo)
+	}
+
+	// A real timer must have been armed for Black on instance-b using that
+	// ~40s-remaining value — the exact math is covered by
+	// TestRemainingAbandonDuration (abandon_test.go); here we only need to
+	// confirm a timer exists at all, proving the resumption wiring actually
+	// ran end-to-end across the two Manager instances.
+	m2.mu.Lock()
+	_, blackArmed := m2.abandonTimers[abandonKey(session.ID, store.ColorBlack)]
+	m2.mu.Unlock()
+	if !blackArmed {
+		t.Fatal("Black's abandon timer was not resumed on the surviving instance")
 	}
 }

@@ -15,6 +15,13 @@ const (
 	GameStatusActive    GameStatus = "ACTIVE"
 	GameStatusCompleted GameStatus = "COMPLETED"
 	GameStatusAbandoned GameStatus = "ABANDONED"
+	// GameStatusAborted (DECISIONS_LOG_PHASE_2.md ADR-029): the game's
+	// creator connected but the opponent never joined before the
+	// abandonment timer fired. Distinct from GameStatusAbandoned, which
+	// requires the game to have actually reached ACTIVE (both players
+	// joined) first — an ABORTED game never started, so it has no
+	// meaningful winner and isn't scored as a draw either.
+	GameStatusAborted GameStatus = "ABORTED"
 )
 
 // Color identifies which side a player or move belongs to.
@@ -76,8 +83,16 @@ type Game struct {
 	BlackTimeMs   int64
 	Outcome       *Outcome       // nil until game is over
 	OutcomeReason *OutcomeReason // nil until game is over
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// WhiteDisconnectedAt / BlackDisconnectedAt (DECISIONS_LOG_PHASE_2.md
+	// ADR-030): nil unless that color currently has a pending abandonment
+	// grace period. Persisted so a surviving instance can resume (or
+	// immediately resolve) the grace period after a failover —
+	// Manager.abandonTimers is pure per-process memory and does not survive
+	// the owning process dying mid-grace-period.
+	WhiteDisconnectedAt *time.Time
+	BlackDisconnectedAt *time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // Move represents a row in the moves table.

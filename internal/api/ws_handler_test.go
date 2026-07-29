@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/goleak"
 
+	"github.com/vedant-2701/chess/internal/auth"
 	internalchess "github.com/vedant-2701/chess/internal/chess"
 	"github.com/vedant-2701/chess/internal/game"
 	"github.com/vedant-2701/chess/internal/store"
@@ -24,11 +26,21 @@ import (
 
 const testJWTSecret = "test-secret-for-ws-handler-tests"
 
+// testInstanceLabel is the fixed instance label these tests dial. Real
+// production instanceLabels come from Manager.ResolveGame (see
+// internal/game/resolve_test.go, internal/api/resolve_test.go for that
+// coverage) — these WSHandler tests exercise connection lifecycle only and
+// deliberately mint ConnectClaims directly (mustConnectToken below) rather
+// than going through the full resolve flow, so any fixed string works as
+// long as it's consistent between the minted token and the URL dialed.
+const testInstanceLabel = "test-instance"
+
 // newTestManager builds a fully-wired *game.Manager against the shared
 // testPool — no mocks, per CODING_GUIDELINES.md §6 (store tests use real
 // PostgreSQL). Mirrors production wiring exactly; if this diverges from how
-// cmd/server/main.go (Step 13) actually constructs a Manager, that is itself
-// a signal something is wrong with one of the two.
+// cmd/server/main.go actually constructs a Manager, that is itself a signal
+// something is wrong with one of the two. directory=nil: these tests never
+// call ResolveGame/StartHeartbeat — see NewManager's doc comment.
 func newTestManager(t *testing.T) *game.Manager {
 	t.Helper()
 	registry := game.NewGameRegistry()
@@ -40,26 +52,50 @@ func newTestManager(t *testing.T) *game.Manager {
 	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator, nil, "")
 }
 
-// newTestServer wires WSHandler behind a chi router exactly as Step 12's
-// internal/api/routes.go will, and returns an httptest.Server.
+// newTestServer wires WSHandler behind a chi router exactly as
+// internal/api/routes.go does, and returns an httptest.Server.
 func newTestServer(t *testing.T, manager *game.Manager) *httptest.Server {
 	t.Helper()
 	wsRegistry := ws.NewRegistry()
 	handler := NewWSHandler(context.Background(), manager, wsRegistry, testJWTSecret)
 
 	r := chi.NewRouter()
-	r.Get("/ws/game/{id}", handler.ServeHTTP)
+	r.Get("/connect/{instanceLabel}", handler.ServeHTTP)
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return srv
 }
 
+// mustConnectToken mints a ConnectClaims token directly via
+// auth.SignConnectToken, bypassing the full resolve flow — see
+// testInstanceLabel's doc comment for why that's the right scope for these
+// tests. Uses auth.ConnectClaimsTTL (the real production value), not an
+// arbitrary test duration, so these tests exercise the actual expiry window.
+func mustConnectToken(t *testing.T, gameID, userID string, color store.Color) string {
+	t.Helper()
+	claims := auth.ConnectClaims{
+		GameID:        gameID,
+		UserID:        userID,
+		Color:         string(color),
+		InstanceLabel: testInstanceLabel,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(auth.ConnectClaimsTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	token, err := auth.SignConnectToken(claims, testJWTSecret)
+	if err != nil {
+		t.Fatalf("SignConnectToken: %v", err)
+	}
+	return token
+}
+
 // wsURL converts an httptest.Server's http:// base URL into a ws:// URL for
-// the given game ID and token.
-func wsURL(srv *httptest.Server, gameID, token string) string {
+// the masked /connect/{instanceLabel} endpoint.
+func wsURL(srv *httptest.Server, instanceLabel, token string) string {
 	base := strings.TrimPrefix(srv.URL, "http://")
-	return "ws://" + base + "/ws/game/" + gameID + "?token=" + token
+	return "ws://" + base + "/connect/" + instanceLabel + "?token=" + token
 }
 
 func statusOrZero(resp *http.Response) int {
@@ -71,13 +107,20 @@ func statusOrZero(resp *http.Response) int {
 
 // dial opens a WebSocket connection and fails the test immediately if the
 // dial itself fails (as opposed to failing later on a specific assertion).
-func dial(t *testing.T, srv *httptest.Server, gameID, token string) *websocket.Conn {
+func dial(t *testing.T, srv *httptest.Server, instanceLabel, token string) *websocket.Conn {
 	t.Helper()
-	conn, resp, err := websocket.DefaultDialer.Dial(wsURL(srv, gameID, token), nil)
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL(srv, instanceLabel, token), nil)
 	if err != nil {
-		t.Fatalf("dial gameID=%s: %v (status=%d)", gameID, err, statusOrZero(resp))
+		t.Fatalf("dial instanceLabel=%s: %v (status=%d)", instanceLabel, err, statusOrZero(resp))
 	}
 	return conn
+}
+
+// dialGame is a convenience wrapper combining mustConnectToken + dial for
+// the common case (the game and instance label this test server expects).
+func dialGame(t *testing.T, srv *httptest.Server, gameID, userID string, color store.Color) *websocket.Conn {
+	t.Helper()
+	return dial(t, srv, testInstanceLabel, mustConnectToken(t, gameID, userID, color))
 }
 
 // readOne reads a single message with a bounded deadline, so a broken
@@ -112,16 +155,109 @@ func assertMessageType(t *testing.T, conn *websocket.Conn, expected string) {
 }
 
 // TestWSHandler_InvalidToken_RefusedBeforeUpgrade covers PHASE_1.md Step 11's
-// first required case: an invalid token must be refused with HTTP 401 before
-// any WebSocket upgrade is attempted.
+// first required case, updated for PHASE_2.md Step 8's ConnectClaims-based
+// connect path: an invalid token must be refused with HTTP 401 before any
+// WebSocket upgrade is attempted.
 func TestWSHandler_InvalidToken_RefusedBeforeUpgrade(t *testing.T) {
 	truncateAll(t)
 	manager := newTestManager(t)
 	srv := newTestServer(t, manager)
 
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL(srv, "some-game-id", "not-a-real-token"), nil)
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(srv, testInstanceLabel, "not-a-real-token"), nil)
 	if err == nil {
 		t.Fatal("expected dial to fail for an invalid token, but it succeeded")
+	}
+	if resp == nil {
+		t.Fatal("expected an HTTP response accompanying the dial failure")
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected HTTP 401, got %d", resp.StatusCode)
+	}
+}
+
+// TestWSHandler_ExpiredConnectToken_RejectsCleanly is PHASE_2.md Step 5's
+// originally-deferred test, finally implementable now that WSHandler
+// verifies ConnectClaims at all: a connect token that expired in the gap
+// between resolve returning and the client actually dialing must be
+// rejected cleanly (not panic, not hang) with the dedicated
+// ErrCodeConnectTokenExpired code, distinct from a generically invalid
+// token — the response body itself tells the client what to do next
+// (re-call resolve, not retry this URL), per PHASE_2.md's exact wording for
+// this test.
+func TestWSHandler_ExpiredConnectToken_RejectsCleanly(t *testing.T) {
+	truncateAll(t)
+	manager := newTestManager(t)
+	srv := newTestServer(t, manager)
+
+	whiteID := uuid.NewString()
+	mustCreateUser(t, whiteID)
+	session, _, err := manager.CreateGame(context.Background(), whiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+
+	// Construct an already-expired ConnectClaims token directly — simulates
+	// the client taking longer than ConnectClaimsTTL (10s) between resolve
+	// returning and actually dialing.
+	claims := auth.ConnectClaims{
+		GameID:        session.ID,
+		UserID:        whiteID,
+		Color:         string(store.ColorWhite),
+		InstanceLabel: testInstanceLabel,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(-1 * time.Second)),
+			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-auth.ConnectClaimsTTL - time.Second)),
+		},
+	}
+	expiredToken, err := auth.SignConnectToken(claims, testJWTSecret)
+	if err != nil {
+		t.Fatalf("SignConnectToken: %v", err)
+	}
+
+	_, resp, dialErr := websocket.DefaultDialer.Dial(wsURL(srv, testInstanceLabel, expiredToken), nil)
+	if dialErr == nil {
+		t.Fatal("expected dial to fail for an expired connect token, but it succeeded")
+	}
+	if resp == nil {
+		t.Fatal("expected an HTTP response accompanying the dial failure")
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected HTTP 401, got %d", resp.StatusCode)
+	}
+
+	body := decodeErr(t, resp)
+	if body.Code != game.ErrCodeConnectTokenExpired {
+		t.Errorf("expected code %q, got %q", game.ErrCodeConnectTokenExpired, body.Code)
+	}
+	if body.Message == "" {
+		t.Error("expected a non-empty message telling the client to re-resolve")
+	}
+}
+
+// TestWSHandler_InstanceLabelMismatch_RejectsCleanly is the new integrity
+// check PHASE_2.md Step 8 introduces (mirroring the old PlayerClaims path's
+// "token gameID does not match URL" check): a token minted for a DIFFERENT
+// instance than the one it's presented to must be rejected, not silently
+// accepted just because the signature and gameID/color are otherwise valid.
+func TestWSHandler_InstanceLabelMismatch_RejectsCleanly(t *testing.T) {
+	truncateAll(t)
+	manager := newTestManager(t)
+	srv := newTestServer(t, manager)
+
+	whiteID := uuid.NewString()
+	mustCreateUser(t, whiteID)
+	session, _, err := manager.CreateGame(context.Background(), whiteID)
+	if err != nil {
+		t.Fatalf("CreateGame: %v", err)
+	}
+
+	// Token is validly signed and otherwise correct, but names a DIFFERENT
+	// instance label than the one it's dialed against below.
+	token := mustConnectToken(t, session.ID, whiteID, store.ColorWhite)
+
+	_, resp, dialErr := websocket.DefaultDialer.Dial(wsURL(srv, "some-other-instance", token), nil)
+	if dialErr == nil {
+		t.Fatal("expected dial to fail for a mismatched instance label, but it succeeded")
 	}
 	if resp == nil {
 		t.Fatal("expected an HTTP response accompanying the dial failure")
@@ -142,12 +278,12 @@ func TestWSHandler_ValidToken_ReceivesGameState(t *testing.T) {
 	whiteID := uuid.NewString()
 	mustCreateUser(t, whiteID)
 
-	session, whiteToken, err := manager.CreateGame(context.Background(), whiteID)
+	session, _, err := manager.CreateGame(context.Background(), whiteID)
 	if err != nil {
 		t.Fatalf("CreateGame: %v", err)
 	}
 
-	conn := dial(t, srv, session.ID, whiteToken)
+	conn := dialGame(t, srv, session.ID, whiteID, store.ColorWhite)
 	defer conn.Close()
 
 	raw := readOne(t, conn)
@@ -172,7 +308,7 @@ func TestWSHandler_ValidToken_ReceivesGameState(t *testing.T) {
 }
 
 // TestWSHandler_Reconnect_ReceivesCurrentGameState covers the third required
-// case: a second connection with the same token receives the current
+// case: a second connection with the same identity receives the current
 // GAME_STATE, and the original connection's session state is reflected
 // correctly.
 //
@@ -196,20 +332,19 @@ func TestWSHandler_Reconnect_ReceivesCurrentGameState(t *testing.T) {
 	mustCreateUser(t, blackID)
 
 	ctx := context.Background()
-	session, whiteToken, err := manager.CreateGame(ctx, whiteID)
+	session, _, err := manager.CreateGame(ctx, whiteID)
 	if err != nil {
 		t.Fatalf("CreateGame: %v", err)
 	}
-	blackToken, err := manager.JoinGame(ctx, session.ID, blackID)
-	if err != nil {
+	if _, err := manager.JoinGame(ctx, session.ID, blackID); err != nil {
 		t.Fatalf("JoinGame: %v", err)
 	}
 
-	whiteConn1 := dial(t, srv, session.ID, whiteToken)
+	whiteConn1 := dialGame(t, srv, session.ID, whiteID, store.ColorWhite)
 	defer whiteConn1.Close()
 	assertMessageType(t, whiteConn1, "GAME_STATE") // WAITING_FOR_PLAYER — Black hasn't joined yet
 
-	blackConn := dial(t, srv, session.ID, blackToken)
+	blackConn := dialGame(t, srv, session.ID, blackID, store.ColorBlack)
 	defer blackConn.Close()
 	assertMessageType(t, blackConn, "GAME_STATE") // Black's connect activates the game
 
@@ -217,9 +352,9 @@ func TestWSHandler_Reconnect_ReceivesCurrentGameState(t *testing.T) {
 	// now receive OPPONENT_CONNECTED.
 	assertMessageType(t, whiteConn1, "OPPONENT_CONNECTED")
 
-	// Second connection using White's same token, while the first connection
+	// Second connection using White's identity, while the first connection
 	// is still open.
-	whiteConn2 := dial(t, srv, session.ID, whiteToken)
+	whiteConn2 := dialGame(t, srv, session.ID, whiteID, store.ColorWhite)
 	defer whiteConn2.Close()
 
 	raw := readOne(t, whiteConn2)
@@ -275,12 +410,7 @@ func assertConnectionClosedNormally(t *testing.T, conn *websocket.Conn) {
 // exercises this session's fix: GameSession.CloseConnections is called from
 // the same goroutine, immediately after the GAME_OVER send (Manager's
 // startEventSubscriber), rather than from Manager.finalizeGame on a
-// different goroutine. A version of the fix that closed connections from
-// finalizeGame instead would still make this test's first assertion pass
-// (the connection does eventually close) while having a real chance of
-// failing the second (the close frame racing GAME_OVER's own delivery
-// through the same per-connection outbound queue) — this is why both
-// assertions matter, not just proof of eventual closure.
+// different goroutine.
 func TestWSHandler_GameOver_ClosesConnectionsAfterDelivery(t *testing.T) {
 	truncateAll(t)
 	manager := newTestManager(t)
@@ -292,20 +422,19 @@ func TestWSHandler_GameOver_ClosesConnectionsAfterDelivery(t *testing.T) {
 	mustCreateUser(t, blackID)
 
 	ctx := context.Background()
-	session, whiteToken, err := manager.CreateGame(ctx, whiteID)
+	session, _, err := manager.CreateGame(ctx, whiteID)
 	if err != nil {
 		t.Fatalf("CreateGame: %v", err)
 	}
-	blackToken, err := manager.JoinGame(ctx, session.ID, blackID)
-	if err != nil {
+	if _, err := manager.JoinGame(ctx, session.ID, blackID); err != nil {
 		t.Fatalf("JoinGame: %v", err)
 	}
 
-	whiteConn := dial(t, srv, session.ID, whiteToken)
+	whiteConn := dialGame(t, srv, session.ID, whiteID, store.ColorWhite)
 	defer whiteConn.Close()
 	assertMessageType(t, whiteConn, "GAME_STATE") // WAITING_FOR_PLAYER
 
-	blackConn := dial(t, srv, session.ID, blackToken)
+	blackConn := dialGame(t, srv, session.ID, blackID, store.ColorBlack)
 	defer blackConn.Close()
 	assertMessageType(t, blackConn, "GAME_STATE") // Black's connect activates the game
 
@@ -329,72 +458,13 @@ func TestWSHandler_GameOver_ClosesConnectionsAfterDelivery(t *testing.T) {
 }
 
 // TestWSHandler_GameOver_NoGoroutineLeaks closes PHASE_1.md acceptance
-// criterion #7 ("No goroutine leaks after a completed game"). Prior to this
-// test, goleak.VerifyNone existed ONLY in internal/game/clock_test.go, wrapped
-// around isolated *Clock unit tests — nothing exercised the composite
-// teardown of an actual completed game driven through the real stack:
-// Manager's EventBus subscriber goroutine (started in CreateGame, must exit
-// after forwarding GAME_OVER — see startEventSubscriber), and both players'
-// three per-connection goroutines each (ws.Connection.WriteLoop, ReadLoop,
-// StartHeartbeatMonitor, started by Connection.Start). Reasoning in code
-// comments that these all exit correctly is not the same as PHASE_1.md's
-// explicit requirement to verify it with goleak or pprof — this test is that
-// verification, not a restatement of the reasoning.
-//
-// This deliberately reuses TestWSHandler_GameOver_ClosesConnectionsAfterDelivery's
-// setup rather than being a lighter variant of it: the leak surface this test
-// checks is a property of the exact same resign-to-GAME_OVER-to-close
-// sequence, not a different code path.
+// criterion #7 ("No goroutine leaks after a completed game"). See the
+// standing pattern documented in CLAUDE.md's Known Sharp Edges for why
+// goleak.IgnoreCurrent() is required in a scoped, per-test check like this
+// one, rather than a package-wide TestMain-level check.
 func TestWSHandler_GameOver_NoGoroutineLeaks(t *testing.T) {
-	// goleak.VerifyNone is deferred FIRST so it executes LAST (defers run
-	// LIFO) — see clock_test.go's verifyNoLeaks for the same pattern. By the
-	// time it runs, every statement below (including the explicit
-	// conn.Close() and srv.Close() calls near the end of this function) has
-	// already executed as part of the function body returning.
-	//
-	// goleak.VerifyNone retries internally with backoff before reporting a
-	// failure (this is a library-provided bounded wait, not a manual
-	// time.Sleep added here — CODING_GUIDELINES.md §6 forbids the latter as
-	// a test-synchronization mechanism, not the former), which is what makes
-	// it safe to call immediately after triggering asynchronous goroutine
-	// teardown (WriteLoop/ReadLoop/StartHeartbeatMonitor all exit in
-	// response to a closed TCP connection, which is not instantaneous)
-	// rather than racing the check against still-unwinding goroutines.
-	// DELIBERATELY SCOPED TO THIS TEST, NOT TestMain: this package's other
-	// tests (e.g. TestWSHandler_ValidToken_ReceivesGameState,
-	// TestWSHandler_Reconnect_ReceivesCurrentGameState, several in
-	// game_handler_test.go) correctly leave a game non-terminal, which leaves
-	// their EventBus subscriber and/or Clock goroutines legitimately still
-	// running when this test's own goroutines are inspected. That's not a
-	// leak — it's tested behavior belonging to a different game session, and
-	// `go test` runs every test in this package sequentially inside ONE
-	// process, so those goroutines are genuinely still alive when this test
-	// runs, regardless of which test file or TestMain scope goleak is called
-	// from. A package-wide check (TestMain) was tried and reverted for this
-	// exact reason; scoping the goleak.VerifyNone call to only this test
-	// function is necessary but NOT sufficient on its own — confirmed by a
-	// real run: even scoped to just this test, VerifyNone still flagged the
-	// prior tests' leftover goroutines, because VerifyNone with no ignore
-	// options inspects the WHOLE PROCESS's live goroutines, not \"goroutines
-	// created since this test began.\"
-	//
-	// goleak.IgnoreCurrent() is the actual fix: it snapshots which goroutines
-	// already exist at the moment it is called and excludes them from the
-	// later comparison. Because Go evaluates a deferred call's ARGUMENTS
-	// immediately at the `defer` statement (only the call itself is
-	// deferred), `goleak.IgnoreCurrent()` runs right here, before
-	// truncateAll/newTestManager/newTestServer below — capturing every
-	// leftover goroutine from every earlier test as the baseline, so only
-	// goroutines created and not cleaned up DURING this test's own body are
-	// flagged when VerifyNone actually runs at function return.
 	defer goleak.VerifyNone(t,
 		goleak.IgnoreCurrent(),
-		// Redundant with IgnoreCurrent() in the common case (the pgxpool
-		// health-check goroutine already exists by the time this test runs,
-		// so IgnoreCurrent() already covers it) but kept as an explicit,
-		// self-documenting belt-and-suspenders in case pgxpool ever recycles
-		// that goroutine mid-run — same exemption used by
-		// internal/game/clock_test.go's verifyNoLeaks.
 		goleak.IgnoreTopFunction("github.com/jackc/pgx/v5/pgxpool.(*Pool).backgroundHealthCheck"),
 	)
 
@@ -408,19 +478,18 @@ func TestWSHandler_GameOver_NoGoroutineLeaks(t *testing.T) {
 	mustCreateUser(t, blackID)
 
 	ctx := context.Background()
-	session, whiteToken, err := manager.CreateGame(ctx, whiteID)
+	session, _, err := manager.CreateGame(ctx, whiteID)
 	if err != nil {
 		t.Fatalf("CreateGame: %v", err)
 	}
-	blackToken, err := manager.JoinGame(ctx, session.ID, blackID)
-	if err != nil {
+	if _, err := manager.JoinGame(ctx, session.ID, blackID); err != nil {
 		t.Fatalf("JoinGame: %v", err)
 	}
 
-	whiteConn := dial(t, srv, session.ID, whiteToken)
+	whiteConn := dialGame(t, srv, session.ID, whiteID, store.ColorWhite)
 	assertMessageType(t, whiteConn, "GAME_STATE") // WAITING_FOR_PLAYER
 
-	blackConn := dial(t, srv, session.ID, blackToken)
+	blackConn := dialGame(t, srv, session.ID, blackID, store.ColorBlack)
 	assertMessageType(t, blackConn, "GAME_STATE") // Black's connect activates the game
 
 	assertMessageType(t, whiteConn, "OPPONENT_CONNECTED")
@@ -435,27 +504,7 @@ func TestWSHandler_GameOver_NoGoroutineLeaks(t *testing.T) {
 	assertConnectionClosedNormally(t, whiteConn)
 	assertConnectionClosedNormally(t, blackConn)
 
-	// Close the client sides explicitly now, rather than deferring them (as
-	// the sibling ordering test does). gorilla's client-side ReadMessage
-	// already auto-responds to the server's close frame with its own close
-	// frame per RFC 6455, which should let the server's ReadLoop observe the
-	// closure and exit on its own — but closing explicitly here, before the
-	// goleak check below rather than after (a deferred Close would run AFTER
-	// the deferred goleak.VerifyNone above, since defers are LIFO relative
-	// to registration order), removes any dependency on that auto-response
-	// actually having reached the server by the time this function returns.
 	whiteConn.Close()
 	blackConn.Close()
-
-	// Close the httptest.Server itself before goleak inspects the process.
-	// httptest.NewServer runs its own Accept-loop goroutine for the life of
-	// the server; newTestServer's t.Cleanup(srv.Close) alone is not early
-	// enough here, since t.Cleanup callbacks run AFTER the test function
-	// (and therefore after its deferred goleak.VerifyNone) returns — an
-	// uncleaned server at that point would false-positive as a "leak" that
-	// has nothing to do with the game/WebSocket code actually under test.
-	// Calling Close() here is redundant with, not a replacement for,
-	// newTestServer's Cleanup registration: httptest.Server.Close() is
-	// idempotent, so the later Cleanup-triggered call is a safe no-op.
 	srv.Close()
 }

@@ -113,6 +113,57 @@ func TestLoadConfig_ExplicitValuesPassThrough(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_SkipMigrations_DefaultsFalse(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("INSTANCE_ID", "test-instance")
+	t.Setenv("SKIP_MIGRATIONS", "") // deliberately absent/empty
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.SkipMigrations {
+		t.Error("expected SkipMigrations to default to false when unset")
+	}
+}
+
+func TestLoadConfig_SkipMigrations_True(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("INSTANCE_ID", "test-instance")
+	t.Setenv("SKIP_MIGRATIONS", "true")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !cfg.SkipMigrations {
+		t.Error("expected SkipMigrations=true when SKIP_MIGRATIONS=true")
+	}
+}
+
+func TestLoadConfig_SkipMigrations_InvalidValueDefaultsFalse(t *testing.T) {
+	// An unrecognized value must fail toward "run migrations," not "skip
+	// them" — skipping is the more dangerous direction to default to on a
+	// typo (see loadConfig's own comment on this).
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("REDIS_ADDR", "localhost:6379")
+	t.Setenv("INSTANCE_ID", "test-instance")
+	t.Setenv("SKIP_MIGRATIONS", "not-a-bool")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.SkipMigrations {
+		t.Error("expected SkipMigrations to default to false for an unrecognized value")
+	}
+}
+
 func TestParseLogLevel(t *testing.T) {
 	tests := []struct {
 		name  string

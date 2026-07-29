@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,11 +34,11 @@ func NewGameStore(pool *pgxpool.Pool) *GameStore {
 // is not guaranteed for user-defined string types.
 func scanGame(scanFn func(dest ...any) error) (*Game, error) {
 	var (
-		g              Game
-		statusStr      string
-		playerBlackID  *string
-		outcome        *string
-		outcomeReason  *string
+		g             Game
+		statusStr     string
+		playerBlackID *string
+		outcome       *string
+		outcomeReason *string
 	)
 
 	err := scanFn(
@@ -50,6 +51,8 @@ func scanGame(scanFn func(dest ...any) error) (*Game, error) {
 		&g.BlackTimeMs,
 		&outcome,
 		&outcomeReason,
+		&g.WhiteDisconnectedAt,
+		&g.BlackDisconnectedAt,
 		&g.CreatedAt,
 		&g.UpdatedAt,
 	)
@@ -104,7 +107,9 @@ func (s *GameStore) GetGame(ctx context.Context, id string) (*Game, error) {
 	const q = `
 		SELECT id, status, player_white_id, player_black_id,
 		       current_fen, white_time_ms, black_time_ms,
-		       outcome, outcome_reason, created_at, updated_at
+		       outcome, outcome_reason,
+		       white_disconnected_at, black_disconnected_at,
+		       created_at, updated_at
 		FROM games
 		WHERE id = $1`
 
@@ -214,7 +219,9 @@ func (s *GameStore) GetActiveGames(ctx context.Context) ([]*Game, error) {
 	const q = `
 		SELECT id, status, player_white_id, player_black_id,
 		       current_fen, white_time_ms, black_time_ms,
-		       outcome, outcome_reason, created_at, updated_at
+		       outcome, outcome_reason,
+		       white_disconnected_at, black_disconnected_at,
+		       created_at, updated_at
 		FROM games
 		WHERE status IN ('WAITING_FOR_PLAYER', 'ACTIVE')`
 
@@ -254,6 +261,34 @@ func (s *GameStore) UpdateClocks(ctx context.Context, id string, whiteMs, blackM
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("GameStore.UpdateClocks gameID=%s: %w", id, ErrGameNotFound)
+	}
+	return nil
+}
+
+// UpdateDisconnectTimestamp sets or clears the disconnect-grace-period
+// timestamp for the given color (DECISIONS_LOG_PHASE_2.md ADR-030). Passing
+// a non-nil t records "this player disconnected at t"; passing nil clears it
+// (reconnect). This is what lets a surviving instance, after a failover,
+// resume or immediately resolve an abandonment grace period it has no
+// in-memory record of — Manager.abandonTimers is pure per-process state and
+// does not survive the owning process dying.
+func (s *GameStore) UpdateDisconnectTimestamp(ctx context.Context, id string, color Color, t *time.Time) error {
+	var q string
+	switch color {
+	case ColorWhite:
+		q = `UPDATE games SET white_disconnected_at = $1, updated_at = NOW() WHERE id = $2`
+	case ColorBlack:
+		q = `UPDATE games SET black_disconnected_at = $1, updated_at = NOW() WHERE id = $2`
+	default:
+		return fmt.Errorf("GameStore.UpdateDisconnectTimestamp gameID=%s: invalid color %q", id, color)
+	}
+
+	tag, err := s.pool.Exec(ctx, q, t, id)
+	if err != nil {
+		return fmt.Errorf("GameStore.UpdateDisconnectTimestamp gameID=%s color=%s: %w", id, color, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("GameStore.UpdateDisconnectTimestamp gameID=%s: %w", id, ErrGameNotFound)
 	}
 	return nil
 }

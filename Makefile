@@ -72,6 +72,16 @@ migrate-down: ## Roll back exactly one migration
 migrate-drop: ## Drop everything in the database — DESTRUCTIVE, dev only
 	migrate -path ./migrations -database "$(DATABASE_URL)" drop -f
 
+test-migrate-up: ## Apply all pending migrations
+	migrate -path ./migrations -database "$(TEST_DATABASE_URL)" up
+
+test-migrate-down: ## Roll back exactly one migration
+	migrate -path ./migrations -database "$(TEST_DATABASE_URL)" down 1
+
+test-migrate-drop: ## Drop everything in the database — DESTRUCTIVE, dev only
+	migrate -path ./migrations -database "$(TEST_DATABASE_URL)" drop -f
+
+
 # ---- Docker ------------------------------------------------
 
 docker-up: ## Start PostgreSQL + Redis in Docker (detached) — for local `go run` dev
