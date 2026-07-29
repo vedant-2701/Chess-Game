@@ -32,26 +32,62 @@ services:
       timeout: 5s
       retries: 5
 
-  # --- PHASE_2.md Step 7: multi-instance cluster -------------------------
+  redis-insights:
+    image: redis/redisinsight:latest
+    ports:
+      - "5540:5540"
+    environment:
+      - RI_REDIS_HOST=redis
+      - RI_REDIS_PORT=6379
+      - RI_REDIS_ALIAS=chess_redis
+    volumes:
+      - redisinsight_data:/data
+    
+  # --- PHASE_2.md Step 7/9: multi-instance cluster -----------------------
   # Only started via `make docker-up-cluster` (docker compose --profile
   # cluster up), not by plain `make docker-up` (postgres+redis only, for
   # local single-instance `go run` dev — unaffected by the profile tag
   # below, since explicitly-named services start regardless of profile).
   #
-  # TD-008 still open at this step (CLAUDE.md's Technical Debt table): both
-  # server1 and server2 still run main.go's own runMigrations on their own
-  # startup, serialized (not broken) by golang-migrate's advisory lock, but
-  # not the final design. PHASE_2.md's own Step 9 checklist ("server
-  # replicas depends_on: condition: service_completed_successfully") reads
-  # as already assuming these two services exist — so this step
-  # deliberately creates them with today's still-TD-008-open behavior
-  # unchanged, and Step 9 will add the one-shot `migrate` service plus the
-  # depends_on gating that actually closes it (DECISIONS_LOG_PHASE_2.md
-  # ADR-025).
+  # TD-008 (CLAUDE.md's Technical Debt table) is closed as of this file:
+  # the one-shot `migrate` service below applies every migration exactly
+  # once, by exactly one process, before either server replica starts —
+  # DECISIONS_LOG_PHASE_2.md ADR-025. server1/server2 no longer run their
+  # own runMigrations under this profile at all (SKIP_MIGRATIONS=true in
+  # their environment, cmd/server/main.go's SkipMigrations config field) —
+  # not merely a redundant-but-harmless second migration attempt, per
+  # ADR-025's Consequences being explicit that runMigrations must not be
+  # invoked in this path.
   #
   # Neither server1 nor server2 publishes a host port — the entire point of
   # Phase 2's resolve-then-connect design (ADR-022) is that a client never
   # dials an instance directly; only nginx's port is public.
+  migrate:
+    # Pinned to the exact version matching go.mod's
+    # golang-migrate/migrate/v4 v4.18.1 — deliberate, not an oversight:
+    # avoids the CLI and the library drifting to different migration
+    # engine versions, which is exactly the kind of mismatch that's silent
+    # until it isn't.
+    image: migrate/migrate:v4.18.1
+    container_name: chess_migrate
+    profiles: ["cluster"]
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path"
+      - "/migrations"
+      - "-database"
+      - "postgres://chess:chess@postgres:5432/chess?sslmode=disable"
+      - "up"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Deliberately no healthcheck, no restart policy: this is a one-shot
+    # job, not a long-running service. Its exit code is the signal —
+    # `depends_on: condition: service_completed_successfully` on
+    # server1/server2 below is what actually gates on it, per Compose's own
+    # mechanism for one-shot dependencies (not a healthcheck substitute).
+
   server1:
     build: .
     container_name: chess_server1
@@ -63,11 +99,14 @@ services:
       LOG_LEVEL: info
       REDIS_ADDR: redis:6379
       INSTANCE_ID: server1
+      SKIP_MIGRATIONS: "true"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
       interval: 5s
@@ -85,11 +124,14 @@ services:
       LOG_LEVEL: info
       REDIS_ADDR: redis:6379
       INSTANCE_ID: server2
+      SKIP_MIGRATIONS: "true"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
       interval: 5s
@@ -118,3 +160,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  redisinsight_data:
