@@ -43,7 +43,7 @@ func NewRouter(manager *game.Manager, userStore *store.UserStore, wsRegistry *ws
 	r.Get("/games/{id}", gameHandler.GetGame)
 	r.Get("/games/{id}/resolve", gameHandler.Resolve)
 	r.Get("/health", gameHandler.Health)
-	r.Get("/ws/game/{id}", wsHandler.ServeHTTP)
+	r.Get("/connect/{instanceLabel}", wsHandler.ServeHTTP)
 
 	return r
 }

@@ -75,7 +75,7 @@ func VerifyPlayerToken(tokenString string, secret string) (*PlayerClaims, error)
 // immediately-following WebSocket dial — not a reconnection window like
 // PlayerClaims' 24h. Exported so Step 5's resolve handler has a single
 // source of truth rather than hardcoding "10 * time.Second" at the mint site.
-const ConnectClaimsTTL = 10 * time.Second
+const ConnectClaimsTTL = 60 * time.Second
 
 // ConnectClaims are the JWT claims embedded in the short-lived routing
 // credential minted by the Step 5 resolve endpoint (GET /games/:id/resolve)

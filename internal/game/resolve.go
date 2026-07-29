@@ -112,6 +112,12 @@ func (m *Manager) ResolveGame(ctx context.Context, gameID, userID string, color 
 			}); hydrateErr != nil {
 				return "", "", fmt.Errorf("Manager.ResolveGame gameID=%s: hydrate: %w", gameID, hydrateErr)
 			}
+			// DECISIONS_LOG_PHASE_2.md ADR-030: resume any pending abandonment
+			// grace period this freshly-hydrated (or already-registered, in the
+			// racing-second-resolve case) session has no in-memory record of on
+			// THIS process. Safe to call after GetOrHydrate returns —
+			// registration into GameRegistry is guaranteed complete by then.
+			m.armAbandonTimersForGame(ctx, gameID)
 		}
 	}
 

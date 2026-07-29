@@ -131,12 +131,13 @@ func TestManager_JoinGame_ConcurrentJoins_ExactlyOneWins(t *testing.T) {
 				trial, *game.PlayerBlackID, winnerID)
 		}
 
-		// In-memory session must agree with the DB — SetPlayerBlack is only
-		// called on the success path in Manager.JoinGame. This confirms the
-		// loser's goroutine never reached SetPlayerBlack despite racing.
-		snap := session.CurrentStateSnapshot()
-		if snap.PlayerBlackID != winnerID {
-			t.Errorf("trial %d: in-memory session.PlayerBlackID = %q, want %q", trial, snap.PlayerBlackID, winnerID)
-		}
+		// No in-memory session assertion here anymore: per
+		// DECISIONS_LOG_PHASE_2.md ADR-028, JoinGame no longer touches
+		// GameSession at all (SetPlayerBlack's call site was removed), so
+		// session.PlayerBlackID stays "" for both the winner and the loser of
+		// this race regardless of outcome — asserting it here would no longer
+		// exercise anything. The DB assertion above (against the actual
+		// ADR-016-protected atomic UPDATE) is the real invariant this test
+		// protects, and remains fully exercised without this block.
 	}
 }

@@ -165,14 +165,47 @@ func (m *Manager) CreateGame(ctx context.Context, userID string) (*GameSession, 
 
 	m.registry.Register(session)
 
+	// DECISIONS_LOG_PHASE_2.md ADR-028: claim Redis ownership for this game
+	// immediately, on the same instance that just registered its live
+	// GameSession locally. Without this, no instance holds an ownership
+	// record for a freshly created game until some future resolve call
+	// happens to claim it fresh — and the heartbeat ticker's batched renewal
+	// (which walks registry.AllActive(), not the directory) tries to renew a
+	// key that was never created, failing forever and logging "lost
+	// ownership renewal" indefinitely for a game that was never actually lost.
+	//
+	// Best-effort / non-fatal: a Redis hiccup at creation time must not fail
+	// game creation itself — the in-memory session and DB row are already
+	// correct and authoritative regardless. A later resolve call's own
+	// ClaimOwnership path handles "no owner recorded yet" identically whether
+	// that's because this call never ran or because it failed here.
+	if m.directory != nil {
+		if _, claimErr := m.directory.ClaimOwnership(ctx, gameID, m.instanceID, ""); claimErr != nil {
+			slog.Error("Manager.CreateGame: failed to claim initial ownership",
+				"gameID", gameID, "instanceID", m.instanceID, "error", claimErr)
+		}
+	}
+
 	slog.Info("game created", "gameID", gameID, "userID", userID)
 	return session, token, nil
 }
 
 // JoinGame lets userID join an existing game as Black. It validates the game
 // is in WAITING_FOR_PLAYER status and that the user is not attempting self-play,
-// updates the database, updates the in-memory session, and returns Black's
-// signed player token.
+// updates the database, and returns Black's signed player token.
+//
+// Deliberately a pure DB operation (DECISIONS_LOG_PHASE_2.md ADR-028): this
+// method never touches GameRegistry or a live GameSession. Under round-robin
+// REST routing, JoinGame can land on a different instance than the one
+// CreateGame landed on — that instance's GameRegistry is a separate
+// in-process map with no entry for a game it never created or hydrated, so
+// reaching into it here would be asking the wrong process's memory for
+// something Postgres already answers correctly. Nothing in the WebSocket
+// message protocol reads GameSession.playerBlackID — connect-flow identity
+// comes from signed JWT claims — and any GameSession later legitimately
+// hydrated from the DB (hydrateGameSession/NewGameSessionFromDB) picks up
+// player_black_id from the row this method writes, automatically, with no
+// extra step needed here.
 //
 // The caller is responsible for ensuring the user record exists before calling.
 func (m *Manager) JoinGame(ctx context.Context, gameID, userID string) (string, error) {
@@ -203,17 +236,6 @@ func (m *Manager) JoinGame(ctx context.Context, gameID, userID string) (string, 
 		return "", fmt.Errorf("Manager.JoinGame gameID=%s userID=%s: %w", gameID, userID, err)
 	}
 
-	session, err := m.registry.Get(gameID)
-	if err != nil {
-		// Game is in DB but not in the registry. This indicates a server restart
-		// between CreateGame and JoinGame — the game was WAITING and not restored
-		// (RestoreActiveGames only loads ACTIVE games per GetActiveGames).
-		slog.Error("Manager.JoinGame: game in DB but not in registry — server may have restarted",
-			"gameID", gameID, "userID", userID)
-		return "", fmt.Errorf("Manager.JoinGame gameID=%s: session not in registry: %w", gameID, err)
-	}
-	session.SetPlayerBlack(userID)
-
 	token, err := m.signToken(gameID, userID, string(store.ColorBlack))
 	if err != nil {
 		return "", fmt.Errorf("Manager.JoinGame gameID=%s userID=%s: %w", gameID, userID, err)
@@ -236,7 +258,27 @@ func (m *Manager) JoinGame(ctx context.Context, gameID, userID string) (string, 
 func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.Color, conn *ws.Connection) error {
 	session, err := m.registry.Get(gameID)
 	if err != nil {
-		return fmt.Errorf("Manager.HandleConnect gameID=%s color=%s: %w", gameID, color, err)
+		// PHASE_2.md Step 8: fall back to hydrate-on-miss, regardless of why
+		// the local registry missed — never previously owned by this instance,
+		// a post-failover connect, or a fast-restart-with-empty-registry
+		// (DECISIONS_LOG_PHASE_2.md ADR-024) all look identical to this code
+		// and are all handled correctly by the same path. This is now the
+		// single mechanism responsible for "does this instance have this
+		// game's session in memory" — see ADR-024's Consequences, and note
+		// cmd/server/main.go no longer calls RestoreActiveGames eagerly at
+		// startup as of this same change, per that ADR.
+		hydrated, hydrateErr := m.registry.GetOrHydrate(ctx, gameID, func(hydrateCtx context.Context) (*GameSession, error) {
+			return m.hydrateGameSession(hydrateCtx, gameID)
+		})
+		if hydrateErr != nil {
+			return fmt.Errorf("Manager.HandleConnect gameID=%s color=%s: %w", gameID, color, hydrateErr)
+		}
+		session = hydrated
+		// DECISIONS_LOG_PHASE_2.md ADR-030: resume any pending abandonment
+		// grace period this freshly-hydrated session has no in-memory record
+		// of. Safe to call after GetOrHydrate returns — registration into
+		// GameRegistry is guaranteed complete by then.
+		m.armAbandonTimersForGame(ctx, gameID)
 	}
 
 	// Snapshot status before registering so we can distinguish first-connect
@@ -255,6 +297,19 @@ func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.
 
 	// Cancel any pending abandonment timer for this player.
 	m.cancelAbandonTimer(gameID, color)
+	// DECISIONS_LOG_PHASE_2.md ADR-030: clear the persisted disconnect
+	// marker so a later failover doesn't see a stale timestamp and think this
+	// player is still disconnected. Best-effort/non-fatal, matching the
+	// existing precedent for Redis ownership claims in CreateGame: a DB
+	// hiccup here must not fail an otherwise-successful connect, and worst
+	// case a lingering timestamp only matters if this exact game later fails
+	// over again while still ACTIVE/WAITING with this color's slot empty
+	// once more — a narrow, bounded residual risk, not a silent
+	// mis-resolution of the current connect.
+	if err := m.gameStore.UpdateDisconnectTimestamp(ctx, gameID, color, nil); err != nil {
+		slog.Error("Manager.HandleConnect: failed to clear disconnect timestamp",
+			"gameID", gameID, "color", color, "error", err)
+	}
 
 	if activated {
 		// Both players now connected for the first time. This goroutine atomically
@@ -373,6 +428,25 @@ func (m *Manager) HandleDisconnect(ctx context.Context, gameID string, color sto
 	}
 
 	m.startAbandonTimer(gameID, color)
+
+	// DECISIONS_LOG_PHASE_2.md ADR-030: persist the disconnect moment so a
+	// surviving instance can resume (or immediately resolve) this grace
+	// period after a failover — the in-memory timer just armed above is pure
+	// per-process memory and does not survive this process dying. Detached
+	// from ctx's cancellation for the same reason as the clock-persist write
+	// above (ADR-019): during graceful shutdown this fires from every
+	// still-connected player's disconnect, after ctx is already cancelled.
+	// Best-effort — the LOCAL timer already governs this process's own
+	// behavior regardless of whether this write succeeds; only
+	// failover-survival degrades if it doesn't.
+	disconnectedAt := time.Now()
+	persistDisconnectCtx, cancelDisconnect := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	if err := m.gameStore.UpdateDisconnectTimestamp(persistDisconnectCtx, gameID, color, &disconnectedAt); err != nil {
+		slog.Error("Manager.HandleDisconnect: failed to persist disconnect timestamp",
+			"gameID", gameID, "color", color, "error", err)
+	}
+	cancelDisconnect()
+
 	slog.Debug("player disconnected", "gameID", gameID, "color", color)
 }
 
@@ -566,6 +640,14 @@ func (m *Manager) restoreGame(ctx context.Context, game *store.Game) error {
 	m.startEventSubscriber(session, ch, unsubscribe)
 
 	m.registry.Register(session)
+	// DECISIONS_LOG_PHASE_2.md ADR-030/ADR-031: resume any pending abandonment
+	// grace period from persisted DB timestamps, falling back to "assume
+	// disconnected as of now" when no timestamp was ever written but the game
+	// is non-terminal (effectiveDisconnectedAt) — Manager.abandonTimers is
+	// pure per-process memory and does not survive the process being
+	// restarted, which is exactly the scenario restoreGame exists for.
+	m.armAbandonTimerForColor(game.ID, store.ColorWhite, effectiveDisconnectedAt(game.Status, game.WhiteDisconnectedAt))
+	m.armAbandonTimerForColor(game.ID, store.ColorBlack, effectiveDisconnectedAt(game.Status, game.BlackDisconnectedAt))
 	slog.Info("game restored", "gameID", game.ID, "status", game.Status, "moves", len(moves))
 	return nil
 }
@@ -682,6 +764,46 @@ func (m *Manager) onAbandonTimeout(gameID string, color store.Color) {
 	}
 
 	session.clock.Stop()
+
+	// DECISIONS_LOG_PHASE_2.md ADR-029: a game that never left
+	// WAITING_FOR_PLAYER has no opponent to have "abandoned" and no winner to
+	// declare — it never started. This must be handled BEFORE the
+	// single/both-disconnected branching below, which was designed for a game
+	// where both players had actually joined (ACTIVE) and is the wrong
+	// outcome shape here: it would either award a phantom "opponent wins"
+	// against an opponent who never existed, or score a DRAW for a game with
+	// no real stakes. Real chess platforms treat this as void (aborted), not
+	// a scored draw — same principle here.
+	if snap.Status == store.GameStatusWaiting {
+		if err := session.Transition(store.GameStatusAborted); err != nil {
+			slog.Debug("Manager.onAbandonTimeout: game already in terminal state",
+				"gameID", gameID, "color", color)
+			return
+		}
+
+		// fromStatus is always WAITING: Transition(ABORTED) just succeeded, and
+		// that edge only exists from WAITING (session.go's validTransitions).
+		// outcome is nil — an aborted game has no result to record, unlike a
+		// COMPLETED or ABANDONED one.
+		if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusWaiting, store.GameStatusAborted, nil); err != nil {
+			slog.Error("Manager.onAbandonTimeout: failed to persist ABORTED",
+				"gameID", gameID, "error", err)
+		}
+
+		// Outcome/reason are deliberately empty strings, not store.Outcome/
+		// store.OutcomeReason constants — ABORTED has no entry in either DB
+		// CHECK constraint (outcome/outcome_reason stay NULL above), since it
+		// isn't a scored result in that taxonomy. "ABORTED" here is a
+		// wire-only signal for the GAME_OVER payload, not a persisted value.
+		m.publishGameOver(context.Background(), session, "", "ABORTED",
+			session.CurrentStateSnapshot().CurrentFEN)
+
+		m.finalizeGame(gameID)
+
+		slog.Info("game aborted — opponent never joined",
+			"gameID", gameID, "creatorColor", color)
+		return
+	}
 
 	opponent := opponentOf(color)
 	opponentConnected := session.IsPlayerConnected(opponent)
@@ -837,8 +959,18 @@ func (m *Manager) setClockTimeoutCallback(session *GameSession) {
 }
 
 func (m *Manager) startAbandonTimer(gameID string, color store.Color) {
+	m.startAbandonTimerWithDuration(gameID, color, abandonTimeout)
+}
+
+// startAbandonTimerWithDuration arms (or re-arms, replacing any existing
+// timer for this key) an abandonment timer with an explicit duration rather
+// than always the full abandonTimeout. Used by armAbandonTimerForColor
+// (DECISIONS_LOG_PHASE_2.md ADR-030) to resume a grace period for its
+// correctly-computed remaining duration after a failover, instead of
+// restarting the full 60s from scratch.
+func (m *Manager) startAbandonTimerWithDuration(gameID string, color store.Color, d time.Duration) {
 	key := abandonKey(gameID, color)
-	t := time.AfterFunc(abandonTimeout, func() {
+	t := time.AfterFunc(d, func() {
 		m.onAbandonTimeout(gameID, color)
 	})
 	m.mu.Lock()
@@ -847,6 +979,109 @@ func (m *Manager) startAbandonTimer(gameID string, color store.Color) {
 	}
 	m.abandonTimers[key] = t
 	m.mu.Unlock()
+}
+
+// remainingAbandonDuration computes how much of the abandonment grace
+// period is left, given when the disconnect was recorded. Pulled out as a
+// pure function (no receiver, no side effects) specifically so it's
+// unit-testable without needing to inspect a *time.Timer's internal state,
+// which Go's stdlib does not expose — see abandon_test.go.
+func remainingAbandonDuration(disconnectedAt time.Time) time.Duration {
+	remaining := abandonTimeout - time.Since(disconnectedAt)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining
+}
+
+// armAbandonTimerForColor resumes an abandonment grace period for color from
+// a persisted disconnect timestamp (DECISIONS_LOG_PHASE_2.md ADR-030).
+// Manager.abandonTimers is pure per-process memory — a session constructed
+// fresh via hydrateGameSession (Phase 2 failover) or restoreGame (Phase 1
+// startup) has no such timer running even if a disconnect happened before
+// this process existed. disconnectedAt is nil when the player is not
+// currently in a disconnect grace period (never disconnected, or already
+// reconnected and cleared) — a no-op in that case.
+//
+// Always uses time.AfterFunc, even when the grace period has already fully
+// elapsed (remaining <= 0), rather than calling onAbandonTimeout inline:
+// this function can run before the caller has necessarily finished
+// registering the session into GameRegistry (see hydrateGameSession's
+// caller sites, which register only after hydrateFn returns), and
+// onAbandonTimeout looks the session up via registry.Get. Scheduling
+// asynchronously — even at duration 0 — gives the caller's registration a
+// chance to complete first in the overwhelmingly common case, and
+// onAbandonTimeout's existing Transition-based idempotency (session already
+// terminal → no-op, logged at Debug) makes this safe even in the rare case
+// it doesn't.
+func (m *Manager) armAbandonTimerForColor(gameID string, color store.Color, disconnectedAt *time.Time) {
+	if disconnectedAt == nil {
+		return
+	}
+	m.startAbandonTimerWithDuration(gameID, color, remainingAbandonDuration(*disconnectedAt))
+}
+
+// effectiveDisconnectedAt resolves the ambiguity DECISIONS_LOG_PHASE_2.md
+// ADR-031 identified in ADR-030's original design: persisted is nil in two
+// genuinely different situations that armAbandonTimerForColor cannot tell
+// apart on its own — "this player is definitely fine" (true in ordinary
+// steady state) and "we have no idea, because the process that would have
+// recorded a disconnect died before it could" (true only at hydration time,
+// for a game whose owning instance crashed while both players were still
+// connected — HandleDisconnect never got the chance to run for either
+// color, so neither timestamp was ever written).
+//
+// A freshly-hydrated GameSession always starts with both connection slots
+// empty regardless of which of these two situations actually holds, so
+// there is no way to distinguish them from the session's own state either.
+// The only safe default for an ACTIVE or WAITING_FOR_PLAYER game is to
+// treat "we have no idea" as "assume disconnected as of right now" — a
+// player who is in fact still fine self-cancels this defensively-armed
+// timer within their own HandleConnect call moments later (same mechanism
+// that already cancels a real, individually-observed disconnect timer), so
+// the cost of guessing wrong in the safe direction is bounded to a few
+// seconds of an unnecessary timer that immediately gets cancelled, not a
+// false abandonment.
+//
+// Only ever called at hydration (armAbandonTimersForGame, restoreGame) —
+// never from HandleDisconnect itself, which always has a real, individually
+// observed timestamp to write and never needs this fallback.
+func effectiveDisconnectedAt(status store.GameStatus, persisted *time.Time) *time.Time {
+	if persisted != nil {
+		return persisted // real, individually-observed disconnect — trust as-is
+	}
+	if status == store.GameStatusActive || status == store.GameStatusWaiting {
+		now := time.Now()
+		return &now // unknown at hydration time — assume disconnected as of now, not "fine"
+	}
+	return nil
+}
+
+// armAbandonTimersForGame re-fetches gameID's row and arms
+// (DECISIONS_LOG_PHASE_2.md ADR-030) any pending abandonment grace periods
+// for both colors. Used after GetOrHydrate hydrates a session fresh: unlike
+// restoreGame, hydrateGameSession does not itself register the session into
+// GameRegistry — GetOrHydrate's singleflight wrapper does that after
+// hydrateFn returns — so arming timers inside hydrateGameSession itself
+// would race that registration. This helper is called by the caller of
+// GetOrHydrate, strictly after it has returned, when registration is
+// guaranteed complete. See armAbandonTimerForColor's doc comment for why the
+// arm itself is still safe even without this ordering, as defense in depth.
+//
+// Costs one extra indexed GetGame read per call. Only invoked on the
+// GetOrHydrate fallback paths (ResolveGame's claim-and-hydrate branch,
+// HandleConnect's registry-miss fallback) — not on every ordinary
+// already-resident connect/resolve — so this is bounded to the relatively
+// infrequent "this instance just took ownership" moment, not a hot path.
+func (m *Manager) armAbandonTimersForGame(ctx context.Context, gameID string) {
+	game, err := m.gameStore.GetGame(ctx, gameID)
+	if err != nil {
+		slog.Error("armAbandonTimersForGame: failed to read game for timer resumption",
+			"gameID", gameID, "error", err)
+		return
+	}
+	m.armAbandonTimerForColor(gameID, store.ColorWhite, effectiveDisconnectedAt(game.Status, game.WhiteDisconnectedAt))
+	m.armAbandonTimerForColor(gameID, store.ColorBlack, effectiveDisconnectedAt(game.Status, game.BlackDisconnectedAt))
 }
 
 func (m *Manager) cancelAbandonTimer(gameID string, color store.Color) {
