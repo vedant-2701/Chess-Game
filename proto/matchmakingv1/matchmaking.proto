@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package matchmaking.v1;
+
+// go_package: single-module monorepo — matchmaking-service builds into its
+// own container but lives in the same github.com/vedant-2701/chess module
+// as chess-server (see cmd/matchmaking-service/, Phase 3 Step 4, not yet
+// implemented). This keeps internal/auth's MatchmakingClaims importable by
+// both binaries with one signing secret and no duplicated JWT code —
+// PHASE_3_DESIGN_NOTES.md §6 originally drafted this go_package under a
+// separate "github.com/vedant-2701/matchmaking-service" module path before
+// that question was actually settled; corrected here.
+option go_package = "github.com/vedant-2701/chess/proto/matchmakingv1;matchmakingv1";
+
+// MatchReportService is called by chess-server instances after a pairing
+// attempt resolves. matchmaking-service has no involvement in *which*
+// instance handles a pair (server-picks — PHASE_3_DESIGN_NOTES.md §2) —
+// this is purely a report of an outcome that has already happened.
+//
+// Two methods, not one method with a success/failure oneof: the two
+// outcomes share almost no fields and have completely different downstream
+// handling on matchmaking-service's side, so a oneof would mostly produce a
+// message where half the fields are meaningless depending on branch
+// (PHASE_3_DESIGN_NOTES.md §6).
+service MatchReportService {
+  rpc ReportMatchCreated(MatchCreatedRequest) returns (MatchCreatedResponse);
+  rpc ReportMatchmakingFailed(MatchmakingFailedRequest) returns (MatchmakingFailedResponse);
+}
+
+// MatchCreatedRequest reports a successful CreateMatchedGame. game_id is
+// the natural idempotency/dedup key on matchmaking-service's side
+// (short-TTL "reported:<gameID>" Redis key, checked before pushing SSE) —
+// covers a chess-server retry after a lost ACK without double-delivering
+// MATCH_FOUND.
+message MatchCreatedRequest {
+  string game_id        = 1;
+  string white_user_id  = 2;
+  string black_user_id  = 3;
+  string white_token    = 4;  // signed PlayerClaims, same shape /resolve issues today
+  string black_token    = 5;
+  // instance_label, not instance_id — matches the field name already used
+  // end-to-end in the real codebase (auth.ConnectClaims.InstanceLabel,
+  // Manager.ResolveGame's instanceLabel return value, nginx.conf's
+  // $instance_label / ADR-022's "instanceLabel is opaque" language),
+  // confirmed by direct read of resolve.go and nginx.conf.
+  string instance_label = 6;
+}
+
+message MatchCreatedResponse {
+  bool acknowledged = 1;
+}
+
+// MatchmakingFailedRequest reports a confirmed, terminal failure of
+// CreateMatchedGame's atomic DB insert after retries are exhausted —
+// mirrors CreateGame's existing failure semantics (ADR-028). Must NOT fire
+// for every transient/retryable insert failure; chess-server owns
+// re-enqueue directly for those (PHASE_3_DESIGN_NOTES.md §8) and this RPC
+// is never involved in that path.
+message MatchmakingFailedRequest {
+  string white_user_id = 1;
+  string black_user_id = 2;
+  MatchmakingFailureReason reason = 3;
+}
+
+// Enum, not a free-form string — CODING_GUIDELINES.md's forbidden-patterns
+// table already bans hardcoded strings for state in favor of typed
+// constants; no reason to relax that at a service boundary.
+//
+// Scoped to what chess-server can actually experience over this RPC only
+// (RETRIES_EXHAUSTED). Queue-starvation timeouts (QUEUE_TIMEOUT) never
+// touch gRPC at all — chess-server never attempted a pairing for a player
+// who timed out in the queue, so it has nothing to report here.
+// matchmaking-service has its own superset client-facing reason type for
+// its SSE/status payloads (PHASE_3_DESIGN_NOTES.md §14), translating
+// RETRIES_EXHAUSTED from this enum and generating QUEUE_TIMEOUT natively —
+// that type is not this one and is not defined in this proto.
+enum MatchmakingFailureReason {
+  MATCHMAKING_FAILURE_REASON_UNSPECIFIED       = 0;
+  // Only case that exists today. Left as an enum (not a bool) so a second
+  // cause later doesn't force a field-shape change.
+  MATCHMAKING_FAILURE_REASON_RETRIES_EXHAUSTED = 1;
+}
+
+message MatchmakingFailedResponse {
+  bool acknowledged = 1;
+}

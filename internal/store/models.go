@@ -77,7 +77,7 @@ type Game struct {
 	ID            string
 	Status        GameStatus
 	PlayerWhiteID string
-	PlayerBlackID *string        // nil while status is WAITING_FOR_PLAYER
+	PlayerBlackID *string // nil while status is WAITING_FOR_PLAYER
 	CurrentFEN    string
 	WhiteTimeMs   int64
 	BlackTimeMs   int64
@@ -91,8 +91,17 @@ type Game struct {
 	// the owning process dying mid-grace-period.
 	WhiteDisconnectedAt *time.Time
 	BlackDisconnectedAt *time.Time
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	// MatchmakingRequestID (Phase 3, DECISIONS_LOG_PHASE_3.md ADR-034,
+	// rationale corrected by ADR-039): nil for shared-link games
+	// (CreateGame/UpdatePlayerBlack) — only matchmaking-originated games
+	// populate it. One UUID v4 generated per ZPOPMIN-won pairing attempt on
+	// the chess-server side and reused across every retry of that same
+	// attempt; CreateMatchedGame's ON CONFLICT (matchmaking_request_id) DO
+	// NOTHING is what makes retrying after an ambiguous failure
+	// (timeout / lost ACK) safe rather than a double-booking risk.
+	MatchmakingRequestID *string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 // Move represents a row in the moves table.

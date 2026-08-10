@@ -12,6 +12,17 @@ This document describes how the chess server is built, why it is built that way,
 > Game State Machine, Database Schema, and Dependency Graph all now reflect
 > Phase 2 as built, not Phase 1 as originally documented here.
 
+> **Note on Phase 3 (added 2026-08-08):** Phase 3 (matchmaking) pre-planning
+> is complete and independently reviewed — see `DECISIONS_LOG_PHASE_3.md`
+> ADR-032 through ADR-038 and `phases/current/PHASE_3.md`. **Implementation
+> has not started.** A new "Matchmaking (Phase 3 — Design Decided, Not Yet
+> Implemented)" section has been added near the end of this document,
+> clearly separated from the sections below, which continue to describe only
+> what is actually built (Phase 1/2). Do not treat the Phase 3 section as
+> current system state — it is a forward-looking design record, following
+> the same convention this document used for Phase 2 before that phase was
+> implemented.
+
 ---
 
 ## System Overview (Phase 2 — current)
@@ -183,36 +194,48 @@ bridges the two.
 
 **Endpoints (current):**
 
+**Envelope correction (found during Phase 3 pre-planning reconciliation,
+fixed here):** the responses below now show the actual wire format —
+confirmed against `internal/api/response.go`'s `writeData` (every response
+wrapped in `{"data": ...}`, `GET /health` the sole exception). These
+examples previously showed the bare inner payload only; that was always an
+inaccurate representation of what these endpoints actually return, not a
+deliberate shorthand — fixed here rather than left inconsistent with
+`phases/current/PHASE_3.md`, which received the same correction first.
+
 ```
 POST /games
   Body: { "userID": "..." }
-  Response: { "gameID": "uuid", "playerToken": "jwt", "color": "WHITE", "joinURL": "/game/uuid" }
+  Response: { "data": { "gameID": "uuid", "playerToken": "jwt", "color": "WHITE", "joinURL": "/game/uuid" } }
 
 POST /games/:id/join
   Body: { "userID": "..." }
-  Response: { "gameID": "uuid", "playerToken": "jwt", "color": "BLACK" }
+  Response: { "data": { "gameID": "uuid", "playerToken": "jwt", "color": "BLACK" } }
   Pure DB operation (ADR-028) — never touches GameRegistry/GameSession, no
   instance affinity, no resolve step involved.
 
 GET /games/:id
-  Response: { "gameID": "...", "status": "...", "currentFEN": "...", "outcome": null, "outcomeReason": null }
+  Response: { "data": { "gameID": "...", "status": "...", "currentFEN": "...", "outcome": null, "outcomeReason": null } }
   status can be WAITING_FOR_PLAYER, ACTIVE, COMPLETED, ABANDONED, or ABORTED
   (ADR-029). Pure DB read, same affinity-free contract as join.
 
 GET /games/:id/resolve
   Header: Authorization: Bearer <playerToken>
-  Response: { "connectToken": "jwt", "instanceLabel": "...", "wsPath": "/connect/..." }
+  Response: { "data": { "connectToken": "jwt", "instanceLabel": "...", "wsPath": "/connect/..." } }
   Determines (or claims) the owning instance and mints a short-lived
   ConnectClaims token. See WebSocket Connection Lifecycle below.
 
 GET /health
   Response: { "status": "ok" }
+  The one documented exception to the data-envelope rule — confirmed
+  directly against response.go, not an oversight here.
 
 GET /connect/{instanceLabel}  (WebSocket upgrade)
   Query: ?token=<connectToken>
   Upgrades to WebSocket. gameID/userID/color come entirely from the
   verified ConnectClaims token, not the URL — the masked URL deliberately
-  has no gameID path segment.
+  has no gameID path segment. Not a JSON response at all — envelope rule
+  does not apply.
 ```
 
 ---
@@ -542,6 +565,139 @@ cmd/server/main.go
 ```
 
 Dependencies flow downward only. No circular imports. `internal/ws` does not know about `internal/game`. This is enforced by the Go compiler — not just a style convention: `internal/api` is the only package permitted to import both `internal/ws` and `internal/game`, since it is the one place both are genuinely needed (bridging an HTTP-upgraded WebSocket connection to a game session). `internal/game` is the only package that talks to Redis, and only for routing/ownership — no other package imports a Redis client.
+
+**Forward note (Phase 3, not yet implemented):** Phase 3's design
+(`DECISIONS_LOG_PHASE_3.md` ADR-032) adds a new `internal/matchmaking`
+package on the chess-server side that also needs to talk to Redis (its own
+pairing loop against the matchmaking queue). This invariant — "`internal/game`
+is the only package that talks to Redis" — will need an explicit amendment
+when that lands: either `internal/matchmaking` gets its own client (simplest,
+reuses `main.go`'s existing connection, no cross-package coupling), or it's
+routed through an `internal/game`-exposed accessor. This is an
+implementation-time wiring decision, not something requiring its own ADR —
+flagged here so it isn't silently forgotten when Step 3 of
+`phases/current/PHASE_3.md`'s Implementation Checklist is picked up.
+
+---
+
+## Matchmaking (Phase 3 — Design Decided, Not Yet Implemented)
+
+> Everything in this section describes a decided design
+> (`DECISIONS_LOG_PHASE_3.md` ADR-032–038, independently reviewed 2026-08-08),
+> not built state. No code in this section exists in the repository yet. See
+> `phases/current/PHASE_3.md` for the full checklist and the still-open
+> connection-grace-semantics question this design does not yet resolve.
+
+### Component overview
+
+```
+                    nginx Edge Proxy (shared, existing — ADR-035)
+         │                              │                    │
+         │ /games, /connect             │ /matchmaking       │
+         ▼                              ▼                    │
+  chess-server instances          matchmaking-service            │
+  (existing, Phase 1/2)           (NEW — separate deployable)    │
+         │                              │                    │
+         │ internal/matchmaking         │ SSE conns          │
+         │ (NEW, chess-server side)     │ (userID→flusher,   │
+         │ pairing loop: ZPOPMIN         │  in-memory, M=1)   │
+         │                              │                    │
+         ▼                              ▼                    │
+     Redis (existing instance, new namespace)
+       matchmaking:queue:10+0 (ZSET)
+       matchmaking_active_game:{userID} (lease key, written by chess-server only)
+         │
+         ▼
+     PostgreSQL (existing — new matchmaking_request_id column on games)
+
+  chess-server ── gRPC (MatchReportService, shared-secret interceptor) ──▶ matchmaking-service
+```
+
+**Key structural facts, all decided in ADR-032:**
+- `matchmaking-service` never picks or assigns a pair, and never talks to
+  `GameStore`, `GameRegistry`, or the Redis ownership keys — it only sees
+  outcomes reported to it after the fact.
+- chess-server instances never talk to each other directly, and never hold
+  or know about any SSE connection. `ZPOPMIN`'s atomicity is the entire
+  cross-instance coordination mechanism for pairing — the same primitive
+  `ClaimOwnership` already uses.
+- The two services share the existing Redis instance (new key namespace, not
+  new infrastructure) and the existing nginx edge proxy (new `location
+  /matchmaking` block, ADR-035), but are otherwise independent deployables
+  with their own container, own `docker-compose.yml` entry, and a gRPC
+  contract (not a shared database or shared in-process types) as the only
+  link between them.
+
+### Component responsibilities
+
+| Component | Owns | Does NOT do |
+|---|---|---|
+| **matchmaking-service** | `POST /matchmaking/queue` (mint `MatchmakingClaims` + `ZADD NX`), `GET /matchmaking/stream` (SSE), `GET /matchmaking/status` (polling backstop), `DELETE /matchmaking/queue` (cancel), queue-timeout sweep, `MatchReportService` gRPC server | Never picks or assigns a chess-server instance. Never touches `GameStore`/`GameRegistry`/Redis ownership keys. Never decides who plays whom. |
+| **chess-server (`internal/matchmaking`, new)** | Per-instance pairing loop (`ZPOPMIN queue 2`), `Manager.CreateMatchedGame` (atomic two-player insert, `GameRegistry` registration, `ClaimOwnership`), re-enqueue-on-failure, gRPC client reporting outcomes, `matchmaking_active_game:{userID}` writes (folded into the existing heartbeat tick in `internal/game/heartbeat.go`) | Never talks to another chess-server instance. Never holds or knows about an SSE connection. |
+
+### New database column (planned, not yet migrated)
+
+```sql
+-- Planned migration, Phase 3 Step 1 (DECISIONS_LOG_PHASE_3.md ADR-034):
+ALTER TABLE games ADD COLUMN matchmaking_request_id UUID UNIQUE;
+-- Nullable: only matched games populate it. UUID v4 (correlation/idempotency
+-- token generated per pairing attempt, reused across retries of that same
+-- attempt) — NOT the same convention as games.id, which is UUID v7
+-- (confirmed via internal/game/manager.go's CreateGame: `uuid.NewV7()`,
+-- "time-ordered, better B-tree index locality than v4"). ADR-034's original
+-- text incorrectly claimed v4 was this codebase's general DB-primary-key
+-- convention, based on a stale doc comment in game_store.go rather than the
+-- actual generation call site — corrected during independent review.
+-- Insert issued with ON CONFLICT (matchmaking_request_id) DO NOTHING,
+-- making CreateMatchedGame safe to retry under ACK loss.
+```
+
+### New Redis keys (planned)
+
+```
+matchmaking:queue:10+0                    ZSET, member=userID, score=enqueue timestamp
+matchmaking_active_game:{userID}          STRING (JSON), TTL=OwnershipTTL (30s, reused constant),
+                                           renewed every OwnershipRenewInterval (10s) by chess-server's
+                                           existing heartbeat loop — written only by chess-server,
+                                           read-only for matchmaking-service (ADR-037)
+```
+
+### gRPC contract (planned)
+
+Unary, two methods, shared-secret interceptor for the trust boundary (Docker
+Compose has no `NetworkPolicy` equivalent — deliberate interim choice,
+mTLS post-Phase-3). Full `.proto` and reasoning: `DECISIONS_LOG_PHASE_3.md`
+ADR-033, `phases/current/PHASE_3_DESIGN_NOTES.md` §6.
+
+```
+service MatchReportService {
+  rpc ReportMatchCreated(MatchCreatedRequest) returns (MatchCreatedResponse);
+  rpc ReportMatchmakingFailed(MatchmakingFailedRequest) returns (MatchmakingFailedResponse);
+}
+```
+
+### Match notification: SSE, a new token type
+
+Match notification does **not** reuse the WebSocket infrastructure
+(`internal/ws`) at all — it's plain HTTP `text/event-stream` served by
+matchmaking-service, authenticated by a new `MatchmakingClaims{UserID}` JWT
+(same signing secret as `PlayerClaims`/`ConnectClaims`, distinguished by
+claim shape, per this codebase's existing one-secret convention). Once
+`MATCH_FOUND` is delivered, the client's connect flow is the ordinary
+existing `/resolve` → `ConnectClaims` → `/connect/{instanceLabel}` path —
+not a new connection mechanism.
+
+### Known gap in this design (see `phases/current/PHASE_3.md`'s Open Question)
+
+A matched player who connects and stays connected while their assigned
+opponent never connects at all has no timer of any kind protecting them —
+the existing abandonment mechanism only arms on an actual `HandleDisconnect`
+call, which never fires for a player who never connected in the first
+place. Confirmed NOT to be a problem for the case where the connected player
+also later disconnects (the existing `WAITING_FOR_PLAYER → ABORTED` path,
+ADR-029, handles that correctly with no matchmaking-specific code). The
+indefinite-wait case is explicitly deferred to its own future ADR, not
+solved by this design.
 
 ---
 

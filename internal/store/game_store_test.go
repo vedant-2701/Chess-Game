@@ -65,6 +65,161 @@ func TestGameStore_CreateGame(t *testing.T) {
 		if game.OutcomeReason != nil {
 			t.Errorf("OutcomeReason: expected nil, got %v", *game.OutcomeReason)
 		}
+		if game.MatchmakingRequestID != nil {
+			t.Errorf("MatchmakingRequestID: expected nil for a shared-link game, got %q", *game.MatchmakingRequestID)
+		}
+	})
+}
+
+func TestGameStore_CreateMatchedGame(t *testing.T) {
+	gs := newGameStore()
+	ctx := context.Background()
+
+	requestID := "cccccccc-0000-4000-8000-000000000001"
+
+	t.Run("inserts a game with both players assigned and WAITING_FOR_PLAYER status", func(t *testing.T) {
+		// WAITING_FOR_PLAYER, not ACTIVE, is the correct default here even
+		// though both players are already known — see the method's doc
+		// comment and TD-P3-004 (PHASE_3.md). ACTIVE only happens when both
+		// players actually connect over WebSocket.
+		truncateAll(t)
+		mustCreateUser(t, testWhiteID)
+		mustCreateUser(t, testBlackID)
+
+		reqID := requestID
+		blackID := testBlackID
+		inserted, err := gs.CreateMatchedGame(ctx, &Game{
+			ID:                   testGameID,
+			PlayerWhiteID:        testWhiteID,
+			PlayerBlackID:        &blackID,
+			CurrentFEN:           StartingFEN,
+			WhiteTimeMs:          600_000,
+			BlackTimeMs:          600_000,
+			MatchmakingRequestID: &reqID,
+		})
+		if err != nil {
+			t.Fatalf("CreateMatchedGame: %v", err)
+		}
+		if !inserted {
+			t.Error("inserted: expected true for a fresh requestID")
+		}
+
+		game, err := gs.GetGame(ctx, testGameID)
+		if err != nil {
+			t.Fatalf("GetGame after CreateMatchedGame: %v", err)
+		}
+		if game.Status != GameStatusWaiting {
+			t.Errorf("Status: got %q, want %q", game.Status, GameStatusWaiting)
+		}
+		if game.PlayerWhiteID != testWhiteID {
+			t.Errorf("PlayerWhiteID: got %q, want %q", game.PlayerWhiteID, testWhiteID)
+		}
+		if game.PlayerBlackID == nil || *game.PlayerBlackID != testBlackID {
+			t.Errorf("PlayerBlackID: got %v, want %q", game.PlayerBlackID, testBlackID)
+		}
+		if game.MatchmakingRequestID == nil || *game.MatchmakingRequestID != requestID {
+			t.Errorf("MatchmakingRequestID: got %v, want %q", game.MatchmakingRequestID, requestID)
+		}
+	})
+
+	t.Run("idempotent retry with the same requestID is a no-op, not a duplicate or an error", func(t *testing.T) {
+		// This is the exact case ADR-034/ADR-039 exist for: a caller retries
+		// after an ambiguous failure (timeout / lost ACK) using the SAME
+		// requestID it used the first time. The second call must not create a
+		// second row, and must not error.
+		truncateAll(t)
+		mustCreateUser(t, testWhiteID)
+		mustCreateUser(t, testBlackID)
+
+		reqID := requestID
+		blackID := testBlackID
+		firstGameID := testGameID
+		inserted1, err := gs.CreateMatchedGame(ctx, &Game{
+			ID:                   firstGameID,
+			PlayerWhiteID:        testWhiteID,
+			PlayerBlackID:        &blackID,
+			CurrentFEN:           StartingFEN,
+			WhiteTimeMs:          600_000,
+			BlackTimeMs:          600_000,
+			MatchmakingRequestID: &reqID,
+		})
+		if err != nil {
+			t.Fatalf("CreateMatchedGame (first): %v", err)
+		}
+		if !inserted1 {
+			t.Fatal("inserted: expected true on first call")
+		}
+
+		// Retry with the SAME requestID but a different game ID — mirrors a
+		// caller that generated a fresh game UUID before discovering the
+		// prior attempt actually committed. The row count matters here, not
+		// the second ID: it must never get inserted.
+		secondGameID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+		inserted2, err := gs.CreateMatchedGame(ctx, &Game{
+			ID:                   secondGameID,
+			PlayerWhiteID:        testWhiteID,
+			PlayerBlackID:        &blackID,
+			CurrentFEN:           StartingFEN,
+			WhiteTimeMs:          600_000,
+			BlackTimeMs:          600_000,
+			MatchmakingRequestID: &reqID,
+		})
+		if err != nil {
+			t.Fatalf("CreateMatchedGame (retry): %v", err)
+		}
+		if inserted2 {
+			t.Error("inserted: expected false on retry with the same requestID")
+		}
+
+		// The retry must not have created a second row under secondGameID.
+		if _, err := gs.GetGame(ctx, secondGameID); !errors.Is(err, ErrGameNotFound) {
+			t.Errorf("expected ErrGameNotFound for secondGameID (no row should exist), got: %v", err)
+		}
+		// The original row must be untouched.
+		game, err := gs.GetGame(ctx, firstGameID)
+		if err != nil {
+			t.Fatalf("GetGame firstGameID: %v", err)
+		}
+		if game.MatchmakingRequestID == nil || *game.MatchmakingRequestID != requestID {
+			t.Errorf("MatchmakingRequestID: got %v, want %q", game.MatchmakingRequestID, requestID)
+		}
+	})
+
+	t.Run("returns an error when PlayerBlackID is nil", func(t *testing.T) {
+		truncateAll(t)
+		mustCreateUser(t, testWhiteID)
+
+		reqID := requestID
+		_, err := gs.CreateMatchedGame(ctx, &Game{
+			ID:                   testGameID,
+			PlayerWhiteID:        testWhiteID,
+			CurrentFEN:           StartingFEN,
+			WhiteTimeMs:          600_000,
+			BlackTimeMs:          600_000,
+			MatchmakingRequestID: &reqID,
+		})
+		if err == nil {
+			t.Error("expected an error when PlayerBlackID is nil, got nil")
+		}
+	})
+
+	t.Run("returns an error when MatchmakingRequestID is nil", func(t *testing.T) {
+		truncateAll(t)
+		mustCreateUser(t, testWhiteID)
+		mustCreateUser(t, testBlackID)
+
+		blackID := testBlackID
+		_, err := gs.CreateMatchedGame(ctx, &Game{
+			ID:            testGameID,
+			PlayerWhiteID: testWhiteID,
+			PlayerBlackID: &blackID,
+			CurrentFEN:    StartingFEN,
+			WhiteTimeMs:   600_000,
+			BlackTimeMs:   600_000,
+		})
+		if err == nil {
+			t.Error("expected an error when MatchmakingRequestID is nil, got nil")
+		}
 	})
 }
 

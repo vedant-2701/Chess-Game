@@ -34,11 +34,12 @@ func NewGameStore(pool *pgxpool.Pool) *GameStore {
 // is not guaranteed for user-defined string types.
 func scanGame(scanFn func(dest ...any) error) (*Game, error) {
 	var (
-		g             Game
-		statusStr     string
-		playerBlackID *string
-		outcome       *string
-		outcomeReason *string
+		g                    Game
+		statusStr            string
+		playerBlackID        *string
+		outcome              *string
+		outcomeReason        *string
+		matchmakingRequestID *string
 	)
 
 	err := scanFn(
@@ -53,6 +54,7 @@ func scanGame(scanFn func(dest ...any) error) (*Game, error) {
 		&outcomeReason,
 		&g.WhiteDisconnectedAt,
 		&g.BlackDisconnectedAt,
+		&matchmakingRequestID,
 		&g.CreatedAt,
 		&g.UpdatedAt,
 	)
@@ -62,6 +64,7 @@ func scanGame(scanFn func(dest ...any) error) (*Game, error) {
 
 	g.Status = GameStatus(statusStr)
 	g.PlayerBlackID = playerBlackID
+	g.MatchmakingRequestID = matchmakingRequestID
 
 	if outcome != nil {
 		o := Outcome(*outcome)
@@ -109,6 +112,7 @@ func (s *GameStore) GetGame(ctx context.Context, id string) (*Game, error) {
 		       current_fen, white_time_ms, black_time_ms,
 		       outcome, outcome_reason,
 		       white_disconnected_at, black_disconnected_at,
+		       matchmaking_request_id,
 		       created_at, updated_at
 		FROM games
 		WHERE id = $1`
@@ -213,6 +217,72 @@ func (s *GameStore) UpdatePlayerBlack(ctx context.Context, id string, playerBlac
 	return nil
 }
 
+// CreateMatchedGame atomically inserts a new game row with both players
+// already assigned, for matchmaking-originated games
+// (DECISIONS_LOG_PHASE_3.md ADR-032/ADR-034). Unlike CreateGame (which
+// inserts a single-player WAITING_FOR_PLAYER row, followed later by a
+// separate UpdatePlayerBlack call for the shared-link join flow), both
+// players are already known at pairing time, so this is one INSERT, not a
+// create-then-join pair.
+//
+// Status is deliberately left unset here and takes the same DB DEFAULT
+// ('WAITING_FOR_PLAYER') CreateGame relies on. Both players being assigned
+// in the row from the start does NOT mean the game is ACTIVE: that
+// transition still only happens when both players actually connect over
+// WebSocket (Manager.HandleConnect), exactly as for a shared-link game.
+// This is confirmed load-bearing by TD-P3-004 (PHASE_3.md): a matched game
+// whose assigned opponent never connects sits in WAITING_FOR_PLAYER, not
+// ACTIVE — which is only true if this method leaves status at its default
+// rather than setting it to ACTIVE at insert time.
+//
+// game.MatchmakingRequestID must be set by the caller: one UUID v4
+// generated per ZPOPMIN-won pairing attempt (chess-server's pairing loop,
+// Phase 3 Step 3 — not yet implemented), reused across every retry of that
+// same attempt. The INSERT is issued with
+// ON CONFLICT (matchmaking_request_id) DO NOTHING, making this method safe
+// to call again with the same requestID after an ambiguous failure
+// (timeout / lost ACK) without risking a duplicate game or a double-booked
+// pair (ADR-034's rationale, corrected by ADR-039): if a prior call with the
+// same requestID already committed, this call becomes a no-op rather than a
+// second insert attempt or a UNIQUE-violation error.
+//
+// inserted reports whether THIS call performed the insert (true) or found a
+// row already committed under the same MatchmakingRequestID from a prior
+// call (false — RowsAffected()==0, the idempotent-retry case ADR-034 exists
+// to make safe). Both are success outcomes from this method's perspective —
+// deciding what "inserted == false" means for retry/report logic belongs to
+// the pairing-loop orchestration layer (Phase 3 Step 3), not the store
+// layer. This method deliberately does not fetch the existing row on a
+// no-op; the caller knows why it's retrying and what it needs next, this
+// method doesn't guess on its behalf.
+func (s *GameStore) CreateMatchedGame(ctx context.Context, game *Game) (inserted bool, err error) {
+	if game.PlayerBlackID == nil {
+		return false, fmt.Errorf("GameStore.CreateMatchedGame gameID=%s: player_black_id must be set for a matched game", game.ID)
+	}
+	if game.MatchmakingRequestID == nil {
+		return false, fmt.Errorf("GameStore.CreateMatchedGame gameID=%s: matchmaking_request_id must be set", game.ID)
+	}
+
+	const q = `
+		INSERT INTO games (id, player_white_id, player_black_id, current_fen, white_time_ms, black_time_ms, matchmaking_request_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (matchmaking_request_id) DO NOTHING`
+
+	tag, err := s.pool.Exec(ctx, q,
+		game.ID,
+		game.PlayerWhiteID,
+		game.PlayerBlackID,
+		game.CurrentFEN,
+		game.WhiteTimeMs,
+		game.BlackTimeMs,
+		game.MatchmakingRequestID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("GameStore.CreateMatchedGame gameID=%s requestID=%s: %w", game.ID, *game.MatchmakingRequestID, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // GetActiveGames returns all games in WAITING_FOR_PLAYER or ACTIVE status.
 // Used on server restart to hydrate the in-memory GameRegistry from persisted state.
 func (s *GameStore) GetActiveGames(ctx context.Context) ([]*Game, error) {
@@ -221,6 +291,7 @@ func (s *GameStore) GetActiveGames(ctx context.Context) ([]*Game, error) {
 		       current_fen, white_time_ms, black_time_ms,
 		       outcome, outcome_reason,
 		       white_disconnected_at, black_disconnected_at,
+		       matchmaking_request_id,
 		       created_at, updated_at
 		FROM games
 		WHERE status IN ('WAITING_FOR_PLAYER', 'ACTIVE')`
