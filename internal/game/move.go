@@ -19,6 +19,23 @@ type MoveProcessor struct {
 	gameStore *store.GameStore
 	moveStore *store.MoveStore
 	eventBus  EventBus
+
+	// onMovePersisted, if set, is called synchronously right after a move is
+	// confirmed persisted (Step 4 below), with the game's ID and the
+	// just-persisted move's MoveNumber. Wired by Manager (NewManager) to
+	// Manager.onMovePersisted, which implements DECISIONS_LOG_PHASE_3.md
+	// ADR-041's move-count-gated first-move grace period — mirrors the
+	// existing session.clock.SetTimeoutCallback pattern (Clock→Manager, via
+	// setClockTimeoutCallback) for the same reason: MoveProcessor must not
+	// hold a *Manager reference (a circular package-internal dependency that
+	// pulls in far more than this one hook needs), and Manager owns the
+	// abandonTimers map this hook acts on.
+	//
+	// nil is a valid, safe value (guarded by a nil check at the call site
+	// below) — every existing test constructing a MoveProcessor directly via
+	// NewMoveProcessor, without going through NewManager, continues to work
+	// unchanged.
+	onMovePersisted func(ctx context.Context, gameID string, moveNumber int)
 }
 
 // NewMoveProcessor constructs a MoveProcessor with its required dependencies.
@@ -34,6 +51,14 @@ func NewMoveProcessor(
 		moveStore: moveStore,
 		eventBus:  eventBus,
 	}
+}
+
+// setOnMovePersisted wires the DECISIONS_LOG_PHASE_3.md ADR-041 move-pipeline
+// hook. Unexported and called exactly once, by NewManager — see
+// MoveProcessor.onMovePersisted's doc comment for why this indirection
+// exists instead of MoveProcessor holding a *Manager reference directly.
+func (p *MoveProcessor) setOnMovePersisted(fn func(ctx context.Context, gameID string, moveNumber int)) {
+	p.onMovePersisted = fn
 }
 
 // moveAppliedMsg is the JSON payload for MOVE_APPLIED WebSocket messages.
@@ -131,6 +156,19 @@ func (p *MoveProcessor) ProcessMove(ctx context.Context, session *GameSession, c
 			"gameID", session.ID, "san", san, "moveNumber", move.MoveNumber, "error", err)
 		return false, fmt.Errorf("ProcessMove gameID=%s san=%s moveNumber=%d: save move: %w",
 			session.ID, san, move.MoveNumber, err)
+	}
+
+	// DECISIONS_LOG_PHASE_3.md ADR-041: fire the move-count-gated first-move
+	// grace period hook right at the moment persistence is confirmed — not
+	// after Step 6's in-memory apply, and not conditionally on the ADR-014
+	// re-check below succeeding. This move is durably recorded regardless of
+	// what happens next (a concurrent terminal transition winning the Step 6
+	// race skips the in-memory apply, but the SaveMove above already
+	// committed) — ADR-041's window arm/retire logic must track "has a move
+	// actually been durably recorded," which this moment, and only this
+	// moment, actually answers.
+	if p.onMovePersisted != nil {
+		p.onMovePersisted(ctx, session.ID, move.MoveNumber)
 	}
 
 	// Step 5: update current_fen on the game record.

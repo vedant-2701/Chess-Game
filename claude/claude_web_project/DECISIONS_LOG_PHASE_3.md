@@ -741,3 +741,407 @@ server-picks) stands, unaffected.
   ADR is the authoritative record of the addition.
 
 ---
+
+## ADR-041: First-Move Grace Period — Move-Triggered `ACTIVE→ABORTED` for a Game That Never Really Started
+
+**Date:** 2026-08-10
+**Status:** ACCEPTED
+
+**Context:**
+
+TD-P3-004's original framing covered only the *connection*-shaped half of
+"a matched game with no real content" (opponent never connects at all).
+Working through it surfaced a structurally different but related gap,
+scoped by the user as part of the same session: a game that reaches
+`ACTIVE` (both players' WebSockets connected — confirmed against
+`session.go`'s `RegisterConnection`: activation requires
+`s.playerWhite != nil && s.playerBlack != nil`, independent of any move
+having been played) but where White never plays a first move, or plays it
+and Black never responds, has **no termination mechanism of any kind**
+today. Traced directly against `manager.go`: `onAbandonTimeout` only ever
+fires from a `HandleDisconnect`-armed timer — if both players simply stay
+connected and one side never moves, nothing arms anything, and the game
+sits `ACTIVE` forever. Separately, even where a disconnect *does* occur
+during this window, the existing mechanism produces a wrong result, not
+just no result: `onAbandonTimeout`'s post-`WAITING` branching scores an
+`ACTIVE` game's abandonment as `COMPLETED` (opponent wins) or `ABANDONED`
+(draw) unconditionally — for a game with zero real moves played, both
+outcomes are as misleading as the exact problem `DECISIONS_LOG_PHASE_2.md`
+ADR-029 was written to fix for `WAITING`-status games. This is a
+pre-existing latent gap in already-shipped Phase 1/2 code, not something
+Phase 3 introduces — matchmaking only makes it far more likely to be hit in
+practice (two strangers paired automatically are more likely to have one
+side hesitate or drop before the first move than two players who
+deliberately shared a link).
+
+**Options considered:**
+
+**Option A: Do nothing beyond existing mechanisms.** Rejected — as shown
+above, the existing disconnect-triggered timer only fires on an actual
+disconnect, and produces a misleading scored outcome even when it does
+fire. It does not address the case (the core of scenario 1) where both
+players remain connected and one simply never moves.
+
+**Option B: Extend `onAbandonTimeout`'s existing disconnect-triggered timer
+with a move-count check, still keyed off disconnect.** Rejected — the
+triggering event is wrong. The actual failure mode this needs to catch
+("time elapsed since `ACTIVE` with too few moves played") has nothing
+structurally to do with a disconnect; gating discovery on a disconnect
+event that may never happen (both players can remain technically connected
+indefinitely without either one moving) leaves the core scenario uncaught.
+
+**Option C: A new, independent, move-count-gated timer — armed at the
+`WAITING→ACTIVE` transition (for White's opening move) and re-armed once,
+at White's first move, for Black's reply — entirely decoupled from
+connection state (CHOSEN).**
+
+**Decision:** Option C, with the following load-bearing sub-decisions,
+each resolved explicitly rather than left to accident:
+
+1. **New state-machine edge: `ACTIVE→ABORTED`**, gated at fire-time to only
+   apply when the actual move count is still below the timer's expected
+   threshold (1 for White's window, 2 for Black's — reusing
+   `GameStateSnapshot.Moves`'s length, already computed by
+   `CurrentStateSnapshot`, no new query needed for the live-fire path).
+   Reuses `ABORTED`'s existing meaning and wire/DB representation exactly
+   (`outcome`/`outcome_reason` stay `NULL`, wire payload
+   `outcome: "", reason: "ABORTED"`, same as the existing
+   `WAITING→ABORTED` edge) — a game with zero or one moves played was never
+   really contested, the same principle ADR-029 already established, now
+   applied to an `ACTIVE`-status game rather than only a `WAITING`-status
+   one. No new status value, no new wire message type.
+
+2. **Suppression, not independence, versus the ordinary per-color
+   disconnect-abandon timer.** Tracing the "what if a player disconnects
+   during this window" question (item 5) concretely: if the ordinary 60s
+   timer is left armed *in addition to* this one, an unlucky firing order
+   (most likely at hydration, where `effectiveDisconnectedAt`'s fallback
+   could compute a *shorter* remaining duration than a freshly-armed
+   first-move timer if the disconnect happened well before the hydrate)
+   lets the ordinary timer resolve the game as a scored `COMPLETED`/
+   `ABANDONED` outcome *before* the first-move timer gets a chance to void
+   it correctly — reintroducing the exact misleading-outcome problem this
+   ADR exists to close, just via a race instead of unconditionally.
+   Decision: while a game is `ACTIVE` with fewer than 2 moves played, the
+   ordinary per-color disconnect-abandon timer is **not armed at all** —
+   neither from a live `HandleDisconnect` call nor from hydration
+   (`armAbandonTimersForGame`'s call sites). The first-move timer is the
+   sole governing mechanism for this window, full stop. This directly
+   answers items 6 and 7: the timer is purely move-triggered and
+   indifferent to connection churn in between (item 6) — reconnecting does
+   nothing to it because disconnecting did nothing to it either — and it
+   fires on schedule even if both players disconnect, since nothing about
+   its arming or firing consults connection state at all (item 7).
+
+3. **A real gap found while closing item 5, not previously visible:**
+   suppressing the ordinary timer *while* the first-move window is open is
+   not sufficient on its own — nothing then re-arms it for a player who is
+   *still* disconnected at the moment the window concludes (Black's reply
+   is persisted, retiring the first-move mechanism entirely). Without an
+   explicit bootstrap at that exact moment, a player who disconnected
+   during the suppressed window and never reconnected would have no timer
+   of any kind protecting the game from that point forward — a silent gap,
+   not a loud one, since nothing throws an error, the game would simply
+   never resolve. Fix: at the same point the first-move mechanism retires
+   (move count reaching 2), for each color still disconnected at that
+   instant, arm the ordinary abandon timer fresh (a normal, full
+   `abandonTimeout`, with a normal disconnect-timestamp persist — treated
+   identically to an ordinary `HandleDisconnect`-observed disconnect
+   happening at that moment, not a special case downstream of this point).
+
+4. **Persisted state for failover (item 10, item 4 scenario c):** unlike
+   the opponent-never-connects mechanism (ADR-042), this one needs to
+   survive failover with real precision, not a generous re-arm — the
+   window itself is only 15–20s, an order of magnitude tighter than the
+   60s disconnect grace period, so "just give it a fresh window at
+   whatever point someone happens to hydrate" would systematically be far
+   more generous than intended, for the same reason `DECISIONS_LOG_PHASE_2.md`
+   ADR-031 rejected exactly that shortcut ("Option A") for the disconnect
+   case. New nullable `games.activated_at TIMESTAMPTZ` column, set once,
+   atomically with the same statement that persists the `WAITING→ACTIVE`
+   status transition (same best-effort/non-fatal semantics already
+   governing that write in `HandleConnect`'s `activated` branch — a
+   `NULL` `activated_at` on a genuinely-`ACTIVE` game is a real, if narrow,
+   possible outcome of that non-fatal write failing, not only a
+   hypothetical pre-migration row). Black's window needs **no new column**
+   — `moves.played_at` (confirmed present on `store.Move`, always written
+   atomically with the move itself per the Move Processing Pipeline's
+   persist-before-broadcast rule, so never ambiguously `NULL` for a move
+   that exists at all) is already the correct anchor. At hydration, a new
+   `NULL`-fallback helper mirroring `effectiveDisconnectedAt`'s exact
+   shape and reasoning (trust the persisted value when present; assume the
+   window starts now only when genuinely unknown) computes the correct
+   remaining duration for whichever window is still open, or arms nothing
+   if move count has already reached 2.
+
+5. **Scope: universal, not matchmaking-only (item 8).** Nothing about the
+   underlying defect — a disconnect (or simple non-move) during the
+   pre-first-move window producing a misleading scored outcome — is
+   matchmaking-specific; it is exactly as reachable via `CreateGame`/
+   `JoinGame` today as it will be via `CreateMatchedGame`. This follows
+   `DECISIONS_LOG_PHASE_3.md` ADR-037's precedent (extending
+   check-before-enqueue to shared-link games "since nothing about it is
+   inherently matchmaking-specific") on stronger grounds than that ADR
+   had: this is not a consistency argument but a correctness one — leaving
+   it shared-link-scoped means knowingly leaving a live, already-shippable
+   bug unfixed in already-shipped Phase 1/2 code simply because it was
+   noticed while designing something else. **Flagged explicitly as a
+   material behavior change to shipped Phase 1/2 code, not just new Phase
+   3 surface** — any existing Phase 1/2 test asserting a scored outcome
+   for a disconnect that happens to occur before either player's first
+   move will need to be re-examined against this new behavior (it should
+   now expect `ABORTED`, not `COMPLETED`/`ABANDONED`). This is called out
+   here for explicit confirmation rather than silently folded in, given
+   its blast radius beyond Phase 3.
+
+6. **Clock timing (item 13) — resolved as a non-issue, not a bug.** The
+   chess clock starts at the same `WAITING→ACTIVE` instant the first-move
+   window opens (`session.clock.Start(ColorWhite)`, confirmed in
+   `manager.go`'s `HandleConnect`), so White's clock does tick during
+   their own first-move window. Traced through deliberately rather than
+   assumed away: this is not a special cost the grace period imposes — a
+   chess clock ticking for whichever side is on move, including their very
+   first move, is ordinary, universal chess-clock behavior, identical in
+   kind to any other move taking 15–20 seconds of thought anywhere else in
+   the game. The grace period does not add a deduction on top of the
+   clock; it only adds a *ceiling* (void the game if the window is
+   exceeded), which is orthogonal to how the clock already worked. Since a
+   game the window actually times out on is voided (`outcome`/
+   `outcome_reason` `NULL`), any clock time consumed before that point is
+   moot regardless. No change to clock start/pause behavior.
+
+**Rationale:**
+
+The deciding factor across sub-decisions 1–3 is the same one this
+project's own Constraint 15/16 discipline keeps surfacing: a mechanism that
+looks complete on first pass (suppress the competing timer, done) is not
+actually complete until the *reverse* transition (suppression lifting) is
+also traced through explicitly — the gap in sub-decision 3 would have
+shipped silently otherwise. Sub-decision 4 follows `DECISIONS_LOG_PHASE_2.md`
+ADR-031's own established precedent directly (trust a real persisted
+anchor over a generous guess, whenever a real anchor is available) rather
+than re-deriving a weaker answer for a superficially similar problem.
+Sub-decision 5 is the more consequential call in this ADR and is flagged
+as such rather than buried in Consequences.
+
+**Consequences:**
+- Migration: `games.activated_at TIMESTAMPTZ`, nullable — new migration,
+  not yet an on-disk file (mirrors `matchmaking_request_id`'s own
+  ADR-034-era treatment: planned here, written at implementation time).
+  `store.Game`/`GameStateSnapshot` gain the field where needed.
+- `session.go` `validTransitions` gains `GameStatusActive: { GameStatusAborted: true, ... }` (additive to the existing `Completed`/`Abandoned` edges, not a replacement).
+- New in-process timer, sharing `Manager.abandonTimers`' map and mutex with
+  a distinct, collision-safe key shape (e.g. `gameID+":FIRSTMOVE"` — never
+  equal to any real `store.Color` value) rather than a new map — the map's
+  doc comment needs updating to describe the broadened key-space, not just
+  `gameID+":"+color`, per `CODING_GUIDELINES.md` §3's "document what a
+  mutex/its guarded state protects" spirit.
+- `armAbandonTimersForGame`'s three existing call sites (`HandleConnect`'s
+  registry-miss fallback, `ResolveGame`'s claim-and-hydrate branch,
+  `restoreGame`) need a wrapping gate: for a `WAITING`-status game, existing
+  behavior is unchanged; for an `ACTIVE`-status game with move count < 2,
+  arm the new first-move timer instead of the ordinary per-color timers;
+  for an `ACTIVE`-status game with move count ≥ 2, existing behavior is
+  unchanged. `armAbandonTimersForGame` itself does not need to change
+  internally — only whether/when its call sites invoke it.
+- New integration point in the move-processing pipeline
+  (`internal/game/move.go` — **not read this session; needs direct
+  verification against its actual structure before implementation**, per
+  this project's own "documentation is not source of truth" principle):
+  after a confirmed move-number-1 persist, arm Black's first-move window;
+  after a confirmed move-number-2 persist, retire the mechanism entirely
+  and run sub-decision 3's disconnected-player bootstrap.
+- Recommend factoring the shared "transition to `ABORTED`, persist
+  (outcome nil), notify, finalize" block into one private helper reused by
+  `onAbandonTimeout`'s existing `WAITING` branch and this ADR's new
+  `onFirstMoveTimeout` — implementation-time refactor, not mandated here.
+- No new wire message type; no new Redis state; no interaction with
+  `DECISIONS_LOG_PHASE_3.md` ADR-037's `matchmaking_active_game` marker
+  beyond what ADR-042 already covers (both new `ABORTED` triggers
+  unregister via the existing `finalizeGame`, which is what stops marker
+  renewal — see ADR-042's Consequences for the direct trace).
+- `firstMoveTimeout = 20 * time.Second` — picked from the top of the
+  stated 15–20s range: the cost of a false positive (voiding a real game
+  because a player took 16s to think) is worse than the cost of a false
+  negative (a genuinely-abandoned zero-move game taking a few extra
+  seconds to resolve), the same asymmetric-cost reasoning
+  `DECISIONS_LOG_PHASE_2.md` ADR-031 used for its own "assume disconnected"
+  default.
+
+---
+
+## ADR-042: Matched-Opponent-Never-Connects — Arm-at-Creation-Time Timeout (Closes TD-P3-004)
+
+**Date:** 2026-08-10
+**Status:** ACCEPTED
+
+**Context:**
+
+TD-P3-004, restated precisely: a matched player who connects and *stays*
+connected, while their assigned opponent never connects at all, has no
+abandonment mechanism, because no `HandleDisconnect` call ever fires for
+either color (the connected player never disconnects; the absent one never
+connected to disconnect from) — confirmed again this session by direct
+re-read of `HandleConnect`/`HandleDisconnect`/`onAbandonTimeout`, not
+assumed from `PHASE_3.md`'s prior description of the trace.
+
+**Re-verification of the already-resolved half, performed fresh rather
+than cited (item 3):** for the case where the connected player *also*
+eventually disconnects, `onAbandonTimeout`'s `WAITING`-branch check
+(`snap.Status == store.GameStatusWaiting`) is the sole gate into the
+`ABORTED` path, with no reference anywhere in that branch, or in
+`RegisterConnection`'s activation check, to how many players were assigned
+at creation versus how many actually connected. A `CreateMatchedGame` game
+that reaches this state is structurally identical, at the code level, to a
+`CreateGame` game whose second player never joined. Confirmed still
+correct, unchanged by anything in ADR-041 above (ADR-041's new mechanism
+only engages once a game has actually reached `ACTIVE`, which this case
+never does).
+
+**Verification of `DECISIONS_LOG_PHASE_2.md` ADR-031's fallback coverage
+for the crash+failover variants (item 1, item 4):** traced concretely, not
+assumed. Take the case where only White ever connected before the owning
+instance crashes, and afterward White (or, symmetrically, Black — the
+mechanism is color-agnostic) is the party who eventually calls `/resolve`
+or reconnects. Hydration (`armAbandonTimersForGame`) reads both persisted
+disconnect timestamps — both `NULL`, since White's "disconnect" was never
+individually observed (the process died) and Black's never applied at all
+(Black never connected in the first place) — and `effectiveDisconnectedAt`
+resolves both `NULL`s to "assume disconnected as of now" for this
+`WAITING`-status game, arming a **fresh 60s defensive timer for both
+colors**. Whichever side is reconnecting cancels their own timer via the
+ordinary `HandleConnect` path; the still-absent side's defensive timer
+runs its course and fires `onAbandonTimeout`, which (status still
+`WAITING`, since the reconnecting side alone cannot activate the game)
+correctly resolves to `ABORTED`. **Confirmed, not corrected**: the claim
+holds exactly as suspected — this crash+failover variant is already closed
+by ADR-031's existing side effect, *provided at least one party attempts
+to connect/resolve after the crash*. What remains genuinely uncovered,
+and can only be uncovered by construction, is the conjunction the task
+named precisely: both players never connect at all, **and** nobody ever
+attempts to connect or resolve after a crash either — a game nothing ever
+touches again, crash or no crash. This is the actual target of this ADR.
+
+**Options considered:**
+
+**Option A: Per-process `time.AfterFunc`, armed synchronously at
+`CreateMatchedGame` time, same shape as the existing `abandonTimers`
+mechanism and its existing per-process-only limitation (CHOSEN).**
+- Pros: closes the steady-state (no crash) gap completely and
+  unconditionally — it does not depend on any future event (a disconnect,
+  a resolve call, a heartbeat tick) to exist at all, since it is armed the
+  moment the game is created, before anything else can happen.
+- Cons: does not survive the owning instance dying before it fires.
+
+**Option B: A periodic check folded into the existing heartbeat tick
+(`internal/game/heartbeat.go`), reusing the "one loop appended-to" pattern
+`DECISIONS_LOG_PHASE_3.md` ADR-037 used for its own marker renewal.**
+- Pros: superficially more "robust" — doesn't depend on a single
+  in-process timer surviving.
+- Cons: rejected. It provides **zero additional failover coverage** over
+  Option A for the one case that actually matters: the heartbeat tick only
+  runs on an instance that has the game locally registered and is itself
+  alive. If the owning instance dies, its heartbeat loop dies with it —
+  identical to Option A's timer dying with it. The only way Option B would
+  close the crash+nobody-resolves residual gap is as a Postgres-level
+  sweep fully decoupled from any single instance's local registry — a
+  genuinely different, heavier component (closer to
+  `DECISIONS_LOG_PHASE_2.md` ADR-031's own "Option D," a periodic sweep
+  across all locally-registered sessions, which that ADR explicitly
+  declined to build ahead of demonstrated need). Building that here, for a
+  gap that is already an accepted, tracked, bounded characteristic of this
+  system (TD-P2-006), repeats a build-ahead-of-need mistake this project
+  has repeatedly and deliberately avoided (ADR-014, ADR-016, ADR-023's
+  TD-P2-001/003 deferrals, ADR-031's own Option D deferral).
+
+**Decision:** Option A.
+
+**Rationale:**
+
+Once the crash+resolve variant is confirmed already closed by existing
+machinery (above), the only coverage gap Option B could offer over Option A
+is precisely the crash+nobody-resolves case — and Option B does not
+actually close that case either, for the reason given. With no coverage
+difference between the options for any case that isn't already handled,
+precision and simplicity favor Option A outright: an exact per-game timer
+with no need to compute elapsed-since-creation on every tick, no new
+persisted anchor, no change to the heartbeat loop's existing
+responsibilities.
+
+**Duration (item 9):** a new, distinctly-named constant —
+`matchedOpponentConnectTimeout = 60 * time.Second` — deliberately the same
+*value* as `abandonTimeout` but a separate symbol, not a shared one.
+Reusing the value follows this project's demonstrated preference for
+reusing an existing, already-load-tested number over inventing a new one
+without evidence it needs to differ (`DECISIONS_LOG_PHASE_3.md` ADR-037
+reused `OwnershipTTL`/`OwnershipRenewInterval` on the same reasoning;
+ADR-036 mirrored `ConnectClaimsTTL`'s pattern for `MatchmakingClaimsTTL`).
+Giving it its own symbol rather than referencing `abandonTimeout` directly
+keeps the two concepts (reconnection grace vs. first-ever-connection
+grace) independently tunable later without one change silently affecting
+the other's meaning.
+
+**Scope (contrast with ADR-041): matched games only, not universal.** This
+is the opposite scope call from ADR-041 above, made deliberately, not
+inconsistently: a shared-link game's creator waiting for *anyone* to click
+the link has no specific-named-opponent promise attached to it — indefinite
+waiting is ordinary, acceptable UX (share the link again, wait as long as
+you like). A matched player has been given a specific, system-asserted
+promise ("we found you an opponent") that a shared-link creator never
+receives; that promise is what carries an implicit SLA a shared-link game
+does not have. The two mechanisms in this session solve genuinely
+different problems (a promise not kept, versus a game with no real
+content) for genuinely different populations, and are scoped accordingly.
+
+**Consequences:**
+- New timer, sharing `Manager.abandonTimers`' map/mutex with a
+  collision-safe key (e.g. `gameID+":OPPONENT_NEVER_CONNECTED"`).
+- Armed synchronously inside `Manager.CreateMatchedGame` (not yet
+  implemented — this is a requirement on that method's eventual
+  implementation, not a change to existing code), in the same call as the
+  atomic insert / `GameRegistry.Register` / `ClaimOwnership` sequence
+  `DECISIONS_LOG_PHASE_3.md` ADR-032's Consequences already describe for
+  that method.
+- Cancelled at the moment `RegisterConnection` returns `activated=true`
+  (`HandleConnect`'s existing `if activated` branch, alongside the
+  existing `session.clock.Start` call) — the opponent showed up, the
+  promise was kept, this concern is moot from that point forward.
+- At fire: reuses the exact same `WAITING→ABORTED` transition, persistence
+  shape, and wire payload as `onAbandonTimeout`'s existing `WAITING`
+  branch — no new state-machine edge needed here (unlike ADR-041). As
+  in ADR-041, recommend factoring that shared block into one helper
+  reused by both the existing `onAbandonTimeout` `WAITING` branch and this
+  new trigger.
+- `finalizeGame` should additionally cancel this new timer on every
+  terminal transition, for the same resource-hygiene reasons it already
+  cancels the two per-color abandon timers — not required for correctness
+  (a stale fire against an already-`ABORTED`/-terminal game is a
+  guaranteed no-op via the existing `Transition` state-machine guard,
+  same "harmless dead data" pattern `DECISIONS_LOG_PHASE_2.md` ADR-030
+  already accepted for stale disconnect timestamps) but worth doing since
+  timers hold live runtime resources, unlike a stale DB column.
+- **Confirms `DECISIONS_LOG_PHASE_3.md` ADR-037's marker self-heals
+  correctly for this new termination path (item 12), traced directly
+  rather than assumed:** `heartbeat.go`'s `heartbeatTick` renews ownership
+  (and, per ADR-037's design, will renew the `matchmaking_active_game`
+  marker) only for `m.registry.AllActive()`'s current contents; `finalizeGame`
+  unregisters on every terminal transition, this one included. Once
+  unregistered, the next tick simply stops including this game, and the
+  marker ages out within one `OwnershipTTL` window with no explicit
+  delete required — identical self-healing shape to every other terminal
+  path, not a special case.
+- **New interaction with ADR-037, not previously surfaced, noted rather
+  than silently accepted (item 14):** because `CreateMatchedGame` writes
+  the `matchmaking_active_game` marker for *both* assigned players eagerly
+  at match time (ADR-037's Consequences: "created eagerly... at
+  `CreateMatchedGame` success (entries for both)"), a player who never
+  connects at all will still show as having an active game — and be
+  blocked from queueing again — for up to `matchedOpponentConnectTimeout`
+  (60s), even though they never actually connected to it. This is a
+  bounded, self-healing, arguably-correct consequence (a player who was
+  validly matched into a still-nominally-open game arguably *should* be
+  blocked from a second concurrent match until the first resolves one way
+  or the other) rather than a bug, but is recorded explicitly so it is not
+  mistaken for one later.
+
+---

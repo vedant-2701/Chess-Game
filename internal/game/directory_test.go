@@ -4,6 +4,7 @@ package game
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/google/uuid"
@@ -549,5 +550,105 @@ func TestRedisDirectory_ConcurrentRenewOwnership_LoserCannotResurrectClaim(t *te
 func TestFlushTestRedisDB_TargetsIsolatedDB(t *testing.T) {
 	if testRedisClient.Options().DB != 1 {
 		t.Fatalf("testRedisClient must use DB 1 for test isolation, got DB %d", testRedisClient.Options().DB)
+	}
+}
+
+// --- Active game marker: DECISIONS_LOG_PHASE_3.md ADR-037 ------------------
+
+func TestRedisDirectory_SetActiveGameMarker_ThenRenew(t *testing.T) {
+	flushTestRedisDB(t)
+	d := newTestDirectory()
+	ctx := context.Background()
+	userID := uuid.NewString()
+
+	marker := ActiveGameMarker{
+		GameID:        uuid.NewString(),
+		ConnectToken:  "fake-token",
+		InstanceLabel: "instance-a",
+		WSPath:        "/connect/instance-a",
+	}
+	if err := d.SetActiveGameMarker(ctx, userID, marker); err != nil {
+		t.Fatalf("SetActiveGameMarker: %v", err)
+	}
+
+	raw, err := testRedisClient.Get(ctx, activeGameMarkerKey(userID)).Result()
+	if err != nil {
+		t.Fatalf("GET %s: %v", activeGameMarkerKey(userID), err)
+	}
+	var got ActiveGameMarker
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("unmarshal stored marker: %v", err)
+	}
+	if got != marker {
+		t.Errorf("stored marker: got %+v, want %+v", got, marker)
+	}
+
+	ttl, err := testRedisClient.TTL(ctx, activeGameMarkerKey(userID)).Result()
+	if err != nil {
+		t.Fatalf("TTL: %v", err)
+	}
+	if ttl <= 0 || ttl > OwnershipTTL {
+		t.Errorf("expected TTL in (0, %s], got %s", OwnershipTTL, ttl)
+	}
+
+	// RenewActiveGameMarkersBatch with an updated value must overwrite the
+	// stored content, not just bump the TTL on the old value — heartbeat
+	// re-signs a fresh token every tick (Manager.renewActiveGameMarkers), so
+	// the content genuinely does change between renewals in production.
+	updated := marker
+	updated.ConnectToken = "fake-token-v2"
+	if err := d.RenewActiveGameMarkersBatch(ctx, map[string]ActiveGameMarker{userID: updated}); err != nil {
+		t.Fatalf("RenewActiveGameMarkersBatch: %v", err)
+	}
+
+	raw, err = testRedisClient.Get(ctx, activeGameMarkerKey(userID)).Result()
+	if err != nil {
+		t.Fatalf("GET after renew: %v", err)
+	}
+	var gotAfterRenew ActiveGameMarker
+	if err := json.Unmarshal([]byte(raw), &gotAfterRenew); err != nil {
+		t.Fatalf("unmarshal renewed marker: %v", err)
+	}
+	if gotAfterRenew.ConnectToken != "fake-token-v2" {
+		t.Errorf("ConnectToken after renew: got %q, want %q", gotAfterRenew.ConnectToken, "fake-token-v2")
+	}
+}
+
+func TestRedisDirectory_RenewActiveGameMarkersBatch_MultipleUsers(t *testing.T) {
+	flushTestRedisDB(t)
+	d := newTestDirectory()
+	ctx := context.Background()
+
+	userA, userB := uuid.NewString(), uuid.NewString()
+	markers := map[string]ActiveGameMarker{
+		userA: {GameID: "game-a", ConnectToken: "token-a", InstanceLabel: "instance-a", WSPath: "/connect/instance-a"},
+		userB: {GameID: "game-b", ConnectToken: "token-b", InstanceLabel: "instance-a", WSPath: "/connect/instance-a"},
+	}
+	if err := d.RenewActiveGameMarkersBatch(ctx, markers); err != nil {
+		t.Fatalf("RenewActiveGameMarkersBatch: %v", err)
+	}
+
+	for userID, want := range markers {
+		raw, err := testRedisClient.Get(ctx, activeGameMarkerKey(userID)).Result()
+		if err != nil {
+			t.Fatalf("GET userID=%s: %v", userID, err)
+		}
+		var got ActiveGameMarker
+		if err := json.Unmarshal([]byte(raw), &got); err != nil {
+			t.Fatalf("unmarshal userID=%s: %v", userID, err)
+		}
+		if got != want {
+			t.Errorf("userID=%s: got %+v, want %+v", userID, got, want)
+		}
+	}
+}
+
+func TestRedisDirectory_RenewActiveGameMarkersBatch_Empty_NoOp(t *testing.T) {
+	flushTestRedisDB(t)
+	d := newTestDirectory()
+	ctx := context.Background()
+
+	if err := d.RenewActiveGameMarkersBatch(ctx, map[string]ActiveGameMarker{}); err != nil {
+		t.Fatalf("RenewActiveGameMarkersBatch with an empty map should be a no-op, got: %v", err)
 	}
 }

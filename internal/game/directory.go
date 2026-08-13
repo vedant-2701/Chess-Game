@@ -2,6 +2,7 @@ package game
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -183,6 +184,50 @@ type RoutingDirectory interface {
 	// instances still believe this one is alive. No compare-and-swap concern
 	// — same reasoning as SetAlive/RenewAlive.
 	ReleaseAlive(ctx context.Context, instanceID string) error
+
+	// SetActiveGameMarker (DECISIONS_LOG_PHASE_3.md ADR-037) records that
+	// userID currently has an active game — matchmaking_active_game:{userID},
+	// read only by matchmaking-service's check-before-enqueue logic (Phase 3
+	// Step 4, not this codebase). Written only by chess-server, at CreateGame/
+	// JoinGame/CreateMatchedGame success and renewed on the heartbeat tick
+	// (RenewActiveGameMarkersBatch) — never read back by chess-server itself.
+	//
+	// A plain SET with TTL, not a compare-and-swap: unlike the ownership keys,
+	// there is no other legitimate writer to race against for a given userID
+	// (a user has at most one active game at a time by construction — this
+	// marker's entire purpose is enforcing exactly that invariant on
+	// matchmaking-service's side), so CAS protection would guard against a
+	// race that cannot actually occur.
+	SetActiveGameMarker(ctx context.Context, userID string, marker ActiveGameMarker) error
+
+	// RenewActiveGameMarkersBatch renews the TTL for every (userID, marker)
+	// pair in one round-trip — the heartbeat ticker's actual call shape,
+	// mirroring RenewOwnershipBatch. Re-writes the full marker value each time
+	// (not a bare TTL bump) so a marker that happened to already expire
+	// between ticks (a missed tick, e.g. a slow Redis call) self-heals on the
+	// very next tick rather than staying gone until some other event rewrites
+	// it — the same self-healing property RenewAlive/SetAlive already have for
+	// the liveness key, deliberately not the ownership keys' CAS-based
+	// RenewOwnership (there is no "did someone else take this over" question
+	// to ask here, per SetActiveGameMarker's own doc comment). An empty
+	// markers map is a valid no-op, not an error.
+	RenewActiveGameMarkersBatch(ctx context.Context, markers map[string]ActiveGameMarker) error
+}
+
+// ActiveGameMarker is the JSON value stored under
+// matchmaking_active_game:{userID} (DECISIONS_LOG_PHASE_3.md ADR-037) —
+// everything matchmaking-service needs to hand a player direct connect info
+// on a check-before-enqueue hit, without a separate /resolve round-trip.
+// camelCase JSON tags, matching /resolve's existing REST response shape, not
+// the gRPC proto's snake_case convention — these are two different wire
+// formats for two different audiences (a browser client vs. a gRPC peer),
+// and there is no reason to make this one match the other just because both
+// happen to exist in the same phase.
+type ActiveGameMarker struct {
+	GameID        string `json:"gameID"`
+	ConnectToken  string `json:"connectToken"`
+	InstanceLabel string `json:"instanceLabel"`
+	WSPath        string `json:"wsPath"`
 }
 
 // var _ RoutingDirectory = (*RedisDirectory)(nil) — compile-time interface
@@ -390,6 +435,40 @@ func (d *RedisDirectory) RenewOwnershipBatch(ctx context.Context, gameIDs []stri
 func (d *RedisDirectory) ReleaseAlive(ctx context.Context, instanceID string) error {
 	if err := d.client.Del(ctx, livenessKey(instanceID)).Err(); err != nil {
 		return fmt.Errorf("RedisDirectory.ReleaseAlive instanceID=%s: %w", instanceID, err)
+	}
+	return nil
+}
+
+func activeGameMarkerKey(userID string) string {
+	return "matchmaking_active_game:" + userID
+}
+
+func (d *RedisDirectory) SetActiveGameMarker(ctx context.Context, userID string, marker ActiveGameMarker) error {
+	payload, err := json.Marshal(marker)
+	if err != nil {
+		return fmt.Errorf("RedisDirectory.SetActiveGameMarker userID=%s: marshal: %w", userID, err)
+	}
+	if err := d.client.Set(ctx, activeGameMarkerKey(userID), payload, OwnershipTTL).Err(); err != nil {
+		return fmt.Errorf("RedisDirectory.SetActiveGameMarker userID=%s: %w", userID, err)
+	}
+	return nil
+}
+
+func (d *RedisDirectory) RenewActiveGameMarkersBatch(ctx context.Context, markers map[string]ActiveGameMarker) error {
+	if len(markers) == 0 {
+		return nil
+	}
+
+	pipe := d.client.Pipeline()
+	for userID, marker := range markers {
+		payload, err := json.Marshal(marker)
+		if err != nil {
+			return fmt.Errorf("RedisDirectory.RenewActiveGameMarkersBatch userID=%s: marshal: %w", userID, err)
+		}
+		pipe.Set(ctx, activeGameMarkerKey(userID), payload, OwnershipTTL)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("RedisDirectory.RenewActiveGameMarkersBatch count=%d: %w", len(markers), err)
 	}
 	return nil
 }

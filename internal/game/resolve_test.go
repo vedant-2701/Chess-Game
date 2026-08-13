@@ -408,6 +408,25 @@ func TestManager_AbandonTimer_ResumesAfterCrashWhileBothConnected(t *testing.T) 
 		t.Fatalf("precondition failed: game must be ACTIVE after both connect, got %q", snap.Status)
 	}
 
+	// DECISIONS_LOG_PHASE_3.md ADR-041: play two moves so the first-move
+	// grace period has already retired before the crash below. This test is
+	// specifically about ADR-030/031's ordinary per-color abandon-timer
+	// resume mechanism, which (as of ADR-041) only governs an ACTIVE game
+	// once move count >= 2 — below that threshold, the first-move timer is
+	// the sole governing mechanism by design (armTimersForGameStatus), and
+	// asserting the ordinary timer resumed before that threshold would be
+	// asserting exactly the behavior ADR-041 deliberately changed, not a real
+	// regression. Both players are still connected when these moves land, so
+	// onMovePersisted's disconnected-player bootstrap (case 2) is a no-op
+	// here — nothing is armed yet, matching the crash not having happened
+	// yet at this point in the test's timeline.
+	if _, err := m1.processor.ProcessMove(ctx, session, store.ColorWhite, "e4"); err != nil {
+		t.Fatalf("ProcessMove e4: %v", err)
+	}
+	if _, err := m1.processor.ProcessMove(ctx, session, store.ColorBlack, "e5"); err != nil {
+		t.Fatalf("ProcessMove e5: %v", err)
+	}
+
 	// Simulate the crash: instance-a simply stops being used. Deliberately
 	// do NOT call HandleDisconnect for either color — a real crash gives
 	// neither player's disconnect a chance to be individually observed.
@@ -514,6 +533,19 @@ func TestManager_AbandonTimer_IndividuallyObservedDisconnect_NoRegression(t *tes
 	}
 	if err := m1.HandleConnect(ctx, session.ID, store.ColorBlack, blackConnA); err != nil {
 		t.Fatalf("HandleConnect black: %v", err)
+	}
+
+	// DECISIONS_LOG_PHASE_3.md ADR-041: same reasoning as
+	// TestManager_AbandonTimer_ResumesAfterCrashWhileBothConnected — play two
+	// moves so the first-move grace period has already retired before Black
+	// disconnects below, so this test actually exercises ADR-030's
+	// individually-observed-disconnect resume path rather than asserting
+	// behavior ADR-041 deliberately superseded.
+	if _, err := m1.processor.ProcessMove(ctx, session, store.ColorWhite, "e4"); err != nil {
+		t.Fatalf("ProcessMove e4: %v", err)
+	}
+	if _, err := m1.processor.ProcessMove(ctx, session, store.ColorBlack, "e5"); err != nil {
+		t.Fatalf("ProcessMove e5: %v", err)
 	}
 
 	// Black disconnects for real, while instance-a is still alive — the

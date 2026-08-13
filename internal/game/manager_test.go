@@ -509,7 +509,7 @@ func TestManager_RestoreActiveGames_SkipsCompletedGames(t *testing.T) {
 	gs := store.NewGameStore(testPool)
 	winner := store.OutcomeWhite
 	reason := store.OutcomeReasonResignation
-	if err := gs.UpdateGameStatus(ctx, gameID, store.GameStatusActive,store.GameStatusCompleted, &store.GameOutcome{
+	if err := gs.UpdateGameStatus(ctx, gameID, store.GameStatusActive, store.GameStatusCompleted, &store.GameOutcome{
 		Outcome: winner,
 		Reason:  reason,
 	}); err != nil {

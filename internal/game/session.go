@@ -30,6 +30,16 @@ var validTransitions = map[store.GameStatus]map[store.GameStatus]bool{
 	store.GameStatusActive: {
 		store.GameStatusCompleted: true,
 		store.GameStatusAbandoned: true,
+		// DECISIONS_LOG_PHASE_3.md ADR-041: a game that reaches ACTIVE (both
+		// players connected) but never receives a first move, or receives
+		// White's first move with no reply from Black within the grace
+		// window, has no real chess played and no result to score — void
+		// (ABORTED), the same treatment ADR-029 already gives a WAITING game
+		// whose creator disconnects and is never joined. Universal scope: not
+		// matchmaking-only, applies to shared-link games too, since the
+		// underlying defect (a scored COMPLETED/ABANDONED outcome for zero
+		// real chess played) isn't matchmaking-specific.
+		store.GameStatusAborted: true,
 	},
 }
 

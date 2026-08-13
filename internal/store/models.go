@@ -100,8 +100,15 @@ type Game struct {
 	// NOTHING is what makes retrying after an ambiguous failure
 	// (timeout / lost ACK) safe rather than a double-booking risk.
 	MatchmakingRequestID *string
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// ActivatedAt (Phase 3, DECISIONS_LOG_PHASE_3.md ADR-041): set once, by
+	// GameStore.ActivateGame, atomically with the WAITING→ACTIVE transition.
+	// nil for a game that has never been ACTIVE, and (rarely) for a genuinely
+	// ACTIVE game whose ActivateGame write's activated_at portion failed —
+	// see effectiveWindowStartedAt in internal/game/manager.go for the
+	// hydration-time fallback this second case requires.
+	ActivatedAt *time.Time
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // Move represents a row in the moves table.

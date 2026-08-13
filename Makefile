@@ -32,7 +32,8 @@ GOLANGCI_VERSION := v1.62.2
 .PHONY: help run build test test-race test-integration \
         migrate-up migrate-down \
         docker-up docker-down \
-        lint vet tidy install-tools clean
+        lint vet tidy install-tools clean \
+        proto install-proto-tools
 
 # ---- Default target ----------------------------------------
 
@@ -121,6 +122,27 @@ install-tools: ## Install migrate CLI and golangci-lint
 	go install github.com/golang-migrate/migrate/v4/cmd/migrate@$(MIGRATE_VERSION)
 	@echo "Installing golangci-lint $(GOLANGCI_VERSION)..."
 	go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_VERSION)
+	@echo "Done. Make sure $(shell go env GOPATH)/bin is in your PATH."
+
+# ---- Protobuf / gRPC codegen --------------------------------
+# Requires: protoc itself (install via your OS package manager — apt/brew/etc,
+# not go install, since protoc is a C++ binary, not a Go module) plus
+# protoc-gen-go / protoc-gen-go-grpc (run 'make install-proto-tools' first).
+
+PROTOC_GEN_GO_VERSION      := v1.34.2
+PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
+
+proto: ## Regenerate proto/matchmakingv1 Go stubs from matchmaking.proto
+	protoc \
+		--go_out=. --go_opt=paths=source_relative \
+		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+		proto/matchmakingv1/matchmaking.proto
+
+install-proto-tools: ## Install protoc-gen-go and protoc-gen-go-grpc (protoc itself is a separate, non-Go install)
+	@echo "Installing protoc-gen-go $(PROTOC_GEN_GO_VERSION)..."
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	@echo "Installing protoc-gen-go-grpc $(PROTOC_GEN_GO_GRPC_VERSION)..."
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 	@echo "Done. Make sure $(shell go env GOPATH)/bin is in your PATH."
 
 # ---- Cleanup -----------------------------------------------

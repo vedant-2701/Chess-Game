@@ -21,9 +21,9 @@ func fakeConn(id string) *ws.Connection {
 
 func TestTransition_ValidEdges(t *testing.T) {
 	tests := []struct {
-		name    string
-		from    store.GameStatus
-		to      store.GameStatus
+		name string
+		from store.GameStatus
+		to   store.GameStatus
 	}{
 		{"waiting to active", store.GameStatusWaiting, store.GameStatusActive},
 		{"active to completed", store.GameStatusActive, store.GameStatusCompleted},
@@ -32,6 +32,14 @@ func TestTransition_ValidEdges(t *testing.T) {
 		// anyone joins, and never returns, must reach a terminal state — the
 		// game never started, so ABORTED, not ABANDONED.
 		{"waiting to aborted", store.GameStatusWaiting, store.GameStatusAborted},
+		// DECISIONS_LOG_PHASE_3.md ADR-041: a game that reaches ACTIVE (both
+		// players connected) but never receives a first move, or never
+		// receives Black's reply within the grace window, has no real chess
+		// played and no result to score — void (ABORTED), not COMPLETED/
+		// ABANDONED. Supersedes ADR-029's original "ABORTED must only be
+		// reachable from WAITING_FOR_PLAYER, never from ACTIVE" statement —
+		// that was correct for Phase 2 and is no longer correct as of ADR-041.
+		{"active to aborted", store.GameStatusActive, store.GameStatusAborted},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -101,15 +109,6 @@ func TestTransition_InvalidEdges(t *testing.T) {
 				_ = s.Transition(store.GameStatusAbandoned)
 			},
 			store.GameStatusCompleted,
-		},
-		// DECISIONS_LOG_PHASE_2.md ADR-029: ABORTED must only be reachable from
-		// WAITING_FOR_PLAYER, never from ACTIVE — a game that actually started
-		// (both players joined) has real stakes and must resolve via
-		// COMPLETED/ABANDONED, never be silently voided.
-		{
-			"active to aborted",
-			func(s *game.GameSession) { _ = s.Transition(store.GameStatusActive) },
-			store.GameStatusAborted,
 		},
 		// ABORTED is terminal, same as every other end state.
 		{

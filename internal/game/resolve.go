@@ -117,7 +117,11 @@ func (m *Manager) ResolveGame(ctx context.Context, gameID, userID string, color 
 			// racing-second-resolve case) session has no in-memory record of on
 			// THIS process. Safe to call after GetOrHydrate returns —
 			// registration into GameRegistry is guaranteed complete by then.
-			m.armAbandonTimersForGame(ctx, gameID)
+			// DECISIONS_LOG_PHASE_3.md ADR-041: armTimersForGame (replacing the
+			// narrower, now-removed armAbandonTimersForGame) also arms the
+			// first-move timer instead, for an ACTIVE game still inside that
+			// window — see Manager.armTimersForGameStatus.
+			m.armTimersForGame(ctx, gameID)
 		}
 	}
 

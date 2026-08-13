@@ -55,6 +55,7 @@ func scanGame(scanFn func(dest ...any) error) (*Game, error) {
 		&g.WhiteDisconnectedAt,
 		&g.BlackDisconnectedAt,
 		&matchmakingRequestID,
+		&g.ActivatedAt,
 		&g.CreatedAt,
 		&g.UpdatedAt,
 	)
@@ -112,7 +113,7 @@ func (s *GameStore) GetGame(ctx context.Context, id string) (*Game, error) {
 		       current_fen, white_time_ms, black_time_ms,
 		       outcome, outcome_reason,
 		       white_disconnected_at, black_disconnected_at,
-		       matchmaking_request_id,
+		       matchmaking_request_id, activated_at,
 		       created_at, updated_at
 		FROM games
 		WHERE id = $1`
@@ -283,6 +284,80 @@ func (s *GameStore) CreateMatchedGame(ctx context.Context, game *Game) (inserted
 	return tag.RowsAffected() > 0, nil
 }
 
+// ActivateGame atomically transitions a game from WAITING_FOR_PLAYER to
+// ACTIVE and records the exact moment of activation in the same statement
+// (DECISIONS_LOG_PHASE_3.md ADR-041): games.activated_at anchors the
+// first-move grace period's White-window remaining-duration computation at
+// hydration, the same role white_disconnected_at/black_disconnected_at
+// already play for the ordinary per-color abandon timer (ADR-030).
+//
+// A dedicated method rather than an activated_at parameter bolted onto
+// UpdateGameStatus: every other UpdateGameStatus call site (handleGameOver,
+// handleResign, handleTimeout, onAbandonTimeout, restoreGame's zombie
+// correction) transitions to a terminal status and has no meaningful value
+// for activated_at — an optional field only one of six call sites would ever
+// use is a worse shape than a purpose-built method, matching this
+// codebase's existing precedent (CreateMatchedGame alongside CreateGame,
+// UpdatePlayerBlack alongside a generic update).
+//
+// Same compare-and-swap discipline as UpdateGameStatus: only actually
+// activates if the row's status is still WAITING_FOR_PLAYER at the moment
+// Postgres evaluates the WHERE clause. Returns ErrGameStatusConflict
+// otherwise (mirrors UpdateGameStatus's own RowsAffected()==0 handling) —
+// every call site already knows the row exists (it is backing an in-memory
+// GameSession that itself came from a DB row), so RowsAffected()==0 here
+// always means the predicate failed, never a missing row, same reasoning
+// UpdateGameStatus's own doc comment already established.
+func (s *GameStore) ActivateGame(ctx context.Context, id string) error {
+	const q = `
+		UPDATE games
+		SET status = 'ACTIVE', activated_at = NOW(), updated_at = NOW()
+		WHERE id = $1 AND status = 'WAITING_FOR_PLAYER'`
+
+	tag, err := s.pool.Exec(ctx, q, id)
+	if err != nil {
+		return fmt.Errorf("GameStore.ActivateGame gameID=%s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("GameStore.ActivateGame gameID=%s: %w", id, ErrGameStatusConflict)
+	}
+	return nil
+}
+
+// GetGameByMatchmakingRequestID returns the game whose matchmaking_request_id
+// matches requestID. Returns ErrGameNotFound if no row matches.
+//
+// Exists for Manager.CreateMatchedGame's idempotent-retry path
+// (DECISIONS_LOG_PHASE_3.md ADR-034/ADR-039): when CreateMatchedGame's
+// insert reports inserted==false, the caller (the same chess-server
+// instance, retrying its own prior attempt with the same requestID after an
+// ambiguous failure) needs to look up the game that a PRIOR call with this
+// exact requestID already committed — by requestID, since the retrying
+// caller may have generated a fresh gameID for this attempt without
+// realizing the previous one already succeeded.
+func (s *GameStore) GetGameByMatchmakingRequestID(ctx context.Context, requestID string) (*Game, error) {
+	const q = `
+		SELECT id, status, player_white_id, player_black_id,
+		       current_fen, white_time_ms, black_time_ms,
+		       outcome, outcome_reason,
+		       white_disconnected_at, black_disconnected_at,
+		       matchmaking_request_id, activated_at,
+		       created_at, updated_at
+		FROM games
+		WHERE matchmaking_request_id = $1`
+
+	game, err := scanGame(func(dest ...any) error {
+		return s.pool.QueryRow(ctx, q, requestID).Scan(dest...)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrGameNotFound
+		}
+		return nil, fmt.Errorf("GameStore.GetGameByMatchmakingRequestID requestID=%s: %w", requestID, err)
+	}
+	return game, nil
+}
+
 // GetActiveGames returns all games in WAITING_FOR_PLAYER or ACTIVE status.
 // Used on server restart to hydrate the in-memory GameRegistry from persisted state.
 func (s *GameStore) GetActiveGames(ctx context.Context) ([]*Game, error) {
@@ -291,7 +366,7 @@ func (s *GameStore) GetActiveGames(ctx context.Context) ([]*Game, error) {
 		       current_fen, white_time_ms, black_time_ms,
 		       outcome, outcome_reason,
 		       white_disconnected_at, black_disconnected_at,
-		       matchmaking_request_id,
+		       matchmaking_request_id, activated_at,
 		       created_at, updated_at
 		FROM games
 		WHERE status IN ('WAITING_FOR_PLAYER', 'ACTIVE')`

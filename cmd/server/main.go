@@ -26,6 +26,7 @@ import (
 	"github.com/vedant-2701/chess/internal/api"
 	internalchess "github.com/vedant-2701/chess/internal/chess"
 	"github.com/vedant-2701/chess/internal/game"
+	"github.com/vedant-2701/chess/internal/matchmaking"
 	"github.com/vedant-2701/chess/internal/store"
 	"github.com/vedant-2701/chess/internal/ws"
 )
@@ -61,6 +62,19 @@ type config struct {
 	// invoked at all "in the Phase 2 multi-instance docker-compose.yml
 	// path," not merely left as a harmless no-op there.
 	SkipMigrations bool
+
+	// MatchmakingServiceAddr/MatchmakingSharedSecret/MatchmakingPairingIntervalMs
+	// are Phase 3's additions, deliberately OPTIONAL (unlike RedisAddr/
+	// InstanceID above, which Phase 2 made unconditionally required): every
+	// existing single-instance and Phase-2-cluster deployment has neither a
+	// matchmaking-service to talk to nor any expectation of one, and must
+	// keep starting exactly as it always has with zero new required
+	// configuration. MatchmakingServiceAddr empty is the signal this
+	// instance simply does not start internal/matchmaking's pairing loop at
+	// all — not an error, not a degraded mode, a deliberate opt-in gate.
+	MatchmakingServiceAddr       string
+	MatchmakingSharedSecret      string
+	MatchmakingPairingIntervalMs int
 }
 
 // loadConfig reads and validates required environment variables. DATABASE_URL
@@ -114,6 +128,28 @@ func loadConfig() (config, error) {
 	// a few common variants); anything else, including an empty string,
 	// yields false via the ignored error.
 	cfg.SkipMigrations, _ = strconv.ParseBool(os.Getenv("SKIP_MIGRATIONS"))
+
+	// MATCHMAKING_SERVICE_ADDR left empty (the zero value) means "this
+	// instance does not run the pairing loop" — see the config struct's own
+	// doc comment. MATCHMAKING_SHARED_SECRET is required only when an addr is
+	// actually configured; there is no meaningful shared secret to validate
+	// against a gRPC client this instance never constructs.
+	cfg.MatchmakingServiceAddr = os.Getenv("MATCHMAKING_SERVICE_ADDR")
+	cfg.MatchmakingSharedSecret = os.Getenv("MATCHMAKING_SHARED_SECRET")
+	if cfg.MatchmakingServiceAddr != "" && cfg.MatchmakingSharedSecret == "" {
+		return config{}, errors.New("MATCHMAKING_SHARED_SECRET is required when MATCHMAKING_SERVICE_ADDR is set")
+	}
+	cfg.MatchmakingPairingIntervalMs, _ = strconv.Atoi(os.Getenv("MATCHMAKING_PAIRING_INTERVAL_MS"))
+	if cfg.MatchmakingPairingIntervalMs <= 0 {
+		// 500ms: frequent enough that two players sitting in an otherwise-empty
+		// queue don't notice a perceptible pairing delay, infrequent enough
+		// that N chess-server instances each polling ZCARD/ZPOPMIN every tick
+		// isn't a meaningful Redis load concern at any realistic Phase 3 scale.
+		// No ADR for this specific number — PHASE_3_DESIGN_NOTES.md §12
+		// explicitly left it as "sane default TBD at implementation time," not
+		// a decision requiring one.
+		cfg.MatchmakingPairingIntervalMs = 500
+	}
 
 	return cfg, nil
 }
@@ -224,6 +260,35 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Phase 3: the pairing loop is entirely optional — see config's own doc
+	// comment. stopPairingLoop and closeMatchReporter are both nil-safe
+	// no-ops (guarded below and in shutdown()) when matchmaking is not
+	// configured for this instance, so every existing single-instance and
+	// Phase-2-cluster deployment is unaffected.
+	var stopPairingLoop func()
+	var closeMatchReporter func() error
+	if cfg.MatchmakingServiceAddr != "" {
+		reporter, closeFn, reporterErr := matchmaking.NewGRPCMatchReporter(cfg.MatchmakingServiceAddr, cfg.MatchmakingSharedSecret)
+		if reporterErr != nil {
+			// Fatal, same treatment as every other startup-time dependency
+			// failure above: an operator who set MATCHMAKING_SERVICE_ADDR
+			// explicitly wants matchmaking running, not silently disabled
+			// because its gRPC client failed to construct.
+			slog.Error("failed to construct matchmaking gRPC reporter", "error", reporterErr)
+			os.Exit(1)
+		}
+		closeMatchReporter = closeFn
+
+		pairingLoop := matchmaking.NewPairingLoop(redisClient, manager, reporter,
+			time.Duration(cfg.MatchmakingPairingIntervalMs)*time.Millisecond, cfg.InstanceID)
+		stopPairingLoop = pairingLoop.Start(ctx)
+		slog.Info("matchmaking pairing loop started",
+			"matchmakingServiceAddr", cfg.MatchmakingServiceAddr,
+			"intervalMs", cfg.MatchmakingPairingIntervalMs)
+	} else {
+		slog.Info("MATCHMAKING_SERVICE_ADDR not set — pairing loop disabled for this instance")
+	}
+
 	wsRegistry := ws.NewRegistry()
 
 	// wsCtx is the ADR-018 server-lifetime context: created exactly once
@@ -266,7 +331,7 @@ func main() {
 		}
 	case sig := <-sigCh:
 		slog.Info("shutdown signal received", "signal", sig.String())
-		shutdown(httpServer, cancelWSCtx, wsRegistry, manager, pool, stopHeartbeat)
+		shutdown(httpServer, cancelWSCtx, wsRegistry, manager, pool, stopHeartbeat, stopPairingLoop, closeMatchReporter)
 	}
 }
 
@@ -305,9 +370,27 @@ func shutdown(
 	manager *game.Manager,
 	pool *pgxpool.Pool,
 	stopHeartbeat func(),
+	stopPairingLoop func(),
+	closeMatchReporter func() error,
 ) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
+	// 0. Stop the pairing loop first, before anything else: an in-flight tick
+	// calling Manager.CreateMatchedGame partway through HTTP/WS shutdown could
+	// register a new session into a GameRegistry that's about to be drained
+	// out from under it. stopPairingLoop (like stopHeartbeat) blocks until any
+	// in-flight tick finishes, same shape as PairingLoop.Start's own doc
+	// comment describes. Both are nil-safe no-ops when matchmaking was never
+	// configured for this instance (config's own doc comment).
+	if stopPairingLoop != nil {
+		stopPairingLoop()
+	}
+	if closeMatchReporter != nil {
+		if err := closeMatchReporter(); err != nil {
+			slog.Error("failed to close matchmaking gRPC connection", "error", err)
+		}
+	}
 
 	// 1. Stop accepting new HTTP connections and WS upgrade attempts.
 	// Shutdown also waits for in-flight *HTTP* handlers to return — but a

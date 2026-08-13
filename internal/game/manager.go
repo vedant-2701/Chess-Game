@@ -19,6 +19,22 @@ import (
 
 const abandonTimeout = 60 * time.Second
 
+// firstMoveTimeout is DECISIONS_LOG_PHASE_3.md ADR-041's grace-period
+// window: 20 seconds for White to play a first move after both players
+// connect, re-armed once for Black's reply after White's first move
+// persists. An order of magnitude tighter than abandonTimeout deliberately
+// — this governs "has anyone actually started playing," not "has a
+// mid-game player gone silent."
+const firstMoveTimeout = 20 * time.Second
+
+// matchedOpponentConnectTimeout is DECISIONS_LOG_PHASE_3.md ADR-042's
+// timeout: how long a matched game waits, from the moment
+// Manager.CreateMatchedGame creates it, for the assigned opponent to
+// connect at all, before the game is aborted. Matched games only —
+// shared-link games have no "assigned opponent," just an open slot anyone
+// with the link can fill, and never arm this timer.
+const matchedOpponentConnectTimeout = 60 * time.Second
+
 // clientMsg is the minimal envelope parsed from every raw WebSocket message.
 // The Type field routes to the appropriate handler; SAN is only present for
 // MOVE messages.
@@ -88,8 +104,25 @@ type Manager struct {
 	instanceID string
 
 	// mu protects: abandonTimers.
+	//
+	// abandonTimers holds three distinct kinds of per-game timer, sharing one
+	// map/mutex rather than three separate ones — they're never armed for
+	// the same key at the same moment (mutually exclusive by construction,
+	// see armTimersForGameStatus and HandleConnect's activated branch), so
+	// there is no meaningful concurrency benefit to splitting them, only
+	// three times the bookkeeping:
+	//   - key = gameID+":"+string(color) (abandonKey): the ordinary per-color
+	//     disconnect-abandon timer (60s, abandonTimeout).
+	//   - key = gameID+":FIRSTMOVE" (firstMoveTimerKey): DECISIONS_LOG_PHASE_3.md
+	//     ADR-041's first-move grace period (20s, firstMoveTimeout). Never
+	//     collides with the per-color key shape — "FIRSTMOVE" is never a
+	//     valid store.Color value.
+	//   - key = gameID+":OPPONENT_NEVER_CONNECTED" (opponentNeverConnectedTimerKey):
+	//     DECISIONS_LOG_PHASE_3.md ADR-042's matched-opponent-connect timeout
+	//     (60s, matchedOpponentConnectTimeout). Same collision-safety
+	//     reasoning.
 	mu            sync.Mutex
-	abandonTimers map[string]*time.Timer // key: gameID+":"+string(color)
+	abandonTimers map[string]*time.Timer
 }
 
 // NewManager constructs a Manager with all required dependencies.
@@ -110,7 +143,7 @@ func NewManager(
 	directory RoutingDirectory,
 	instanceID string,
 ) *Manager {
-	return &Manager{
+	m := &Manager{
 		registry:      registry,
 		processor:     processor,
 		gameStore:     gameStore,
@@ -122,6 +155,13 @@ func NewManager(
 		instanceID:    instanceID,
 		abandonTimers: make(map[string]*time.Timer),
 	}
+	// DECISIONS_LOG_PHASE_3.md ADR-041: wire the first-move grace period's
+	// move-pipeline hook, mirroring setClockTimeoutCallback's existing
+	// Clock→Manager pattern — processor must be non-nil (already a
+	// pre-existing invariant: HandleMessage's MOVE case unconditionally calls
+	// m.processor.ProcessMove for any test exercising it, nil or not).
+	processor.setOnMovePersisted(m.onMovePersisted)
+	return m
 }
 
 // CreateGame creates a new game for userID as White, persists it, registers it
@@ -184,6 +224,23 @@ func (m *Manager) CreateGame(ctx context.Context, userID string) (*GameSession, 
 			slog.Error("Manager.CreateGame: failed to claim initial ownership",
 				"gameID", gameID, "instanceID", m.instanceID, "error", claimErr)
 		}
+
+		// DECISIONS_LOG_PHASE_3.md ADR-037: eagerly write White's
+		// matchmaking_active_game marker now, at creation, rather than waiting
+		// for the next heartbeat tick (Manager.renewActiveGameMarkers) —
+		// closes what would otherwise be an ~OwnershipRenewInterval-wide gap
+		// during which a just-created solo WAITING_FOR_PLAYER game's creator
+		// could still slip a matchmaking-queue call through. Best-effort/
+		// non-fatal, same reasoning as ClaimOwnership immediately above.
+		if err := m.directory.SetActiveGameMarker(ctx, userID, ActiveGameMarker{
+			GameID:        gameID,
+			ConnectToken:  token,
+			InstanceLabel: m.instanceID,
+			WSPath:        "/connect/" + m.instanceID,
+		}); err != nil {
+			slog.Error("Manager.CreateGame: failed to set active-game marker",
+				"gameID", gameID, "userID", userID, "error", err)
+		}
 	}
 
 	slog.Info("game created", "gameID", gameID, "userID", userID)
@@ -241,8 +298,231 @@ func (m *Manager) JoinGame(ctx context.Context, gameID, userID string) (string, 
 		return "", fmt.Errorf("Manager.JoinGame gameID=%s userID=%s: %w", gameID, userID, err)
 	}
 
+	if m.directory != nil {
+		// DECISIONS_LOG_PHASE_3.md ADR-037: eagerly write Black's marker at
+		// join time. instanceLabel is looked up via GetOwner rather than just
+		// using m.instanceID: JoinGame deliberately never claims or even knows
+		// ownership itself (see this method's own doc comment above) — under
+		// round-robin REST routing, THIS call can land on a different instance
+		// than the one actually hosting the live GameSession. Using the wrong
+		// instanceLabel here would send a matchmaking-service 409 response's
+		// connect info somewhere that just fails the WS handshake — harmless
+		// (the client falls back to /resolve, same as any other stale-label
+		// case), but avoidable with one cheap lookup. Falls back to this
+		// instance's own ID only if no ownership record exists at all yet
+		// (nobody has connected to this game on any instance) — a reasonable
+		// best guess in that edge case, not a correctness requirement.
+		instanceLabel := m.instanceID
+		if owner, ok, ownerErr := m.directory.GetOwner(ctx, gameID); ownerErr == nil && ok {
+			instanceLabel = owner
+		}
+		if err := m.directory.SetActiveGameMarker(ctx, userID, ActiveGameMarker{
+			GameID:        gameID,
+			ConnectToken:  token,
+			InstanceLabel: instanceLabel,
+			WSPath:        "/connect/" + instanceLabel,
+		}); err != nil {
+			slog.Error("Manager.JoinGame: failed to set active-game marker",
+				"gameID", gameID, "userID", userID, "error", err)
+		}
+	}
+
 	slog.Info("player joined game", "gameID", gameID, "userID", userID, "color", "BLACK")
 	return token, nil
+}
+
+// CreateMatchedGame atomically creates a new game for two players already
+// paired by chess-server's pairing loop (internal/matchmaking, Phase 3 Step
+// 3) — DECISIONS_LOG_PHASE_3.md ADR-032/ADR-034. Unlike CreateGame (single
+// player, WAITING_FOR_PLAYER, joined later via JoinGame), both players are
+// already known: this is Manager's counterpart to GameStore.CreateMatchedGame,
+// adding the same eager local-registration/ownership-claim pattern CreateGame
+// already establishes, PLUS arming DECISIONS_LOG_PHASE_3.md ADR-042's
+// matchedOpponentConnectTimeout in the same call — closing TD-P3-004 requires
+// that timer to be armed at the exact moment the game becomes visible to
+// either player, not as an afterthought.
+//
+// matchmakingRequestID must be generated once by the caller (the pairing
+// loop: one UUID v4 per ZPOPMIN-won pairing attempt) and reused verbatim
+// across every retry of that same attempt — this is what makes retrying
+// after an ambiguous failure safe rather than a double-booking risk. See
+// GameStore.CreateMatchedGame's doc comment for the full mechanism.
+//
+// Idempotent-retry path: if a prior call with this exact matchmakingRequestID
+// already committed (GameStore.CreateMatchedGame reports inserted==false),
+// this method looks the existing game up by requestID and returns its
+// session rather than erroring or creating a duplicate.
+//
+// Known, accepted narrow gap in that retry path (new, flagged explicitly
+// rather than left silent): it re-hydrates/re-registers the session and
+// reissues tokens, but does NOT re-claim ownership or re-arm the
+// opponent-connect timer — both are assumed to have already run to
+// completion as part of the original call that produced inserted==true,
+// since neither involves any I/O between the atomic insert and the point
+// where a caller-observable failure could plausibly interrupt this method.
+// A failure narrow enough to succeed the insert but fail before
+// ClaimOwnership/arming would leave that specific game under-protected until
+// its next connect/resolve event — same shape and severity as the already-
+// accepted residual gaps this project tracks elsewhere (TD-P2-006, ADR-042's
+// own accepted residual for the crash+nobody-ever-resolves case).
+func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBlackID, matchmakingRequestID string) (session *GameSession, whiteToken, blackToken string, err error) {
+	gameUUID, err := uuid.NewV7()
+	if err != nil {
+		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame whiteID=%s blackID=%s: generate game ID: %w",
+			playerWhiteID, playerBlackID, err)
+	}
+	gameID := gameUUID.String()
+
+	reqID := matchmakingRequestID
+	blackID := playerBlackID
+	game := &store.Game{
+		ID:                   gameID,
+		Status:               store.GameStatusWaiting,
+		PlayerWhiteID:        playerWhiteID,
+		PlayerBlackID:        &blackID,
+		CurrentFEN:           store.StartingFEN,
+		WhiteTimeMs:          InitialTimeMs,
+		BlackTimeMs:          InitialTimeMs,
+		MatchmakingRequestID: &reqID,
+	}
+
+	inserted, err := m.gameStore.CreateMatchedGame(ctx, game)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame whiteID=%s blackID=%s requestID=%s: %w",
+			playerWhiteID, playerBlackID, matchmakingRequestID, err)
+	}
+
+	if !inserted {
+		// Idempotent retry — see doc comment above for the accepted gap here.
+		existing, getErr := m.gameStore.GetGameByMatchmakingRequestID(ctx, matchmakingRequestID)
+		if getErr != nil {
+			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: retry lookup: %w",
+				matchmakingRequestID, getErr)
+		}
+		if existing.PlayerBlackID == nil {
+			// Unreachable in practice: this method is the only writer of a row
+			// with this MatchmakingRequestID, and it always sets PlayerBlackID.
+			// Defensive, not a real expected path.
+			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: existing game %s has no PlayerBlackID",
+				matchmakingRequestID, existing.ID)
+		}
+
+		hydrated, hydrateErr := m.registry.GetOrHydrate(ctx, existing.ID, func(hydrateCtx context.Context) (*GameSession, error) {
+			return m.hydrateGameSession(hydrateCtx, existing.ID)
+		})
+		if hydrateErr != nil {
+			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: hydrate existing game %s: %w",
+				matchmakingRequestID, existing.ID, hydrateErr)
+		}
+
+		whiteToken, err = m.signToken(existing.ID, existing.PlayerWhiteID, string(store.ColorWhite))
+		if err != nil {
+			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: %w", matchmakingRequestID, err)
+		}
+		blackToken, err = m.signToken(existing.ID, *existing.PlayerBlackID, string(store.ColorBlack))
+		if err != nil {
+			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: %w", matchmakingRequestID, err)
+		}
+
+		slog.Info("matched game idempotent retry resolved to existing game",
+			"gameID", existing.ID, "requestID", matchmakingRequestID)
+
+		if m.directory != nil {
+			// DECISIONS_LOG_PHASE_3.md ADR-037: re-set (not just accept the
+			// original attempt's write) both markers here too — unlike
+			// ownership/the opponent-connect timer (this method's own doc
+			// comment's accepted gap), a stale-but-still-correct-content marker
+			// costs nothing to refresh, and this marker's PRIMARY purpose
+			// (preventing double-queueing, not just connect-routing convenience)
+			// is worth the small extra correctness margin. m.instanceID is a
+			// reasonable label here (unlike JoinGame's genuinely ambiguous
+			// cross-instance case): GetOrHydrate above just succeeded on THIS
+			// instance, which normally means this instance now legitimately
+			// owns the session.
+			wsPath := "/connect/" + m.instanceID
+			if err := m.directory.SetActiveGameMarker(ctx, existing.PlayerWhiteID, ActiveGameMarker{
+				GameID: existing.ID, ConnectToken: whiteToken, InstanceLabel: m.instanceID, WSPath: wsPath,
+			}); err != nil {
+				slog.Error("Manager.CreateMatchedGame: failed to set white active-game marker (retry path)",
+					"gameID", existing.ID, "userID", existing.PlayerWhiteID, "error", err)
+			}
+			if err := m.directory.SetActiveGameMarker(ctx, *existing.PlayerBlackID, ActiveGameMarker{
+				GameID: existing.ID, ConnectToken: blackToken, InstanceLabel: m.instanceID, WSPath: wsPath,
+			}); err != nil {
+				slog.Error("Manager.CreateMatchedGame: failed to set black active-game marker (retry path)",
+					"gameID", existing.ID, "userID", *existing.PlayerBlackID, "error", err)
+			}
+		}
+
+		return hydrated, whiteToken, blackToken, nil
+	}
+
+	whiteToken, err = m.signToken(gameID, playerWhiteID, string(store.ColorWhite))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame gameID=%s: %w", gameID, err)
+	}
+	blackToken, err = m.signToken(gameID, playerBlackID, string(store.ColorBlack))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame gameID=%s: %w", gameID, err)
+	}
+
+	// NewGameSessionFromDB (not NewGameSession+SetPlayerBlack): game already
+	// carries both player IDs, and this constructor sets both from a single
+	// *store.Game in one shot — internalchess.NewGame() supplies the fresh
+	// starting-position board a brand-new game needs, matching NewGameSession's
+	// own board initialization for the shared-link path.
+	session = NewGameSessionFromDB(game, internalchess.NewGame())
+	m.setClockTimeoutCallback(session)
+
+	ch, unsubscribe, err := m.eventBus.Subscribe(ctx, gameID)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame gameID=%s: subscribe: %w", gameID, err)
+	}
+	m.startEventSubscriber(session, ch, unsubscribe)
+
+	m.registry.Register(session)
+
+	// DECISIONS_LOG_PHASE_2.md ADR-028's same reasoning as CreateGame: claim
+	// ownership immediately, on the same instance that just registered the
+	// live session locally. Best-effort/non-fatal — a Redis hiccup here must
+	// not fail game creation; the in-memory session and DB row are already
+	// correct and authoritative regardless.
+	if m.directory != nil {
+		if _, claimErr := m.directory.ClaimOwnership(ctx, gameID, m.instanceID, ""); claimErr != nil {
+			slog.Error("Manager.CreateMatchedGame: failed to claim initial ownership",
+				"gameID", gameID, "instanceID", m.instanceID, "error", claimErr)
+		}
+
+		// DECISIONS_LOG_PHASE_3.md ADR-037: eagerly write both players'
+		// markers now — same reasoning as CreateGame's own eager write. Matched
+		// games have both players known upfront, so both markers land in this
+		// one call, unlike the shared-link flow's necessarily two-step
+		// CreateGame+JoinGame.
+		wsPath := "/connect/" + m.instanceID
+		if err := m.directory.SetActiveGameMarker(ctx, playerWhiteID, ActiveGameMarker{
+			GameID: gameID, ConnectToken: whiteToken, InstanceLabel: m.instanceID, WSPath: wsPath,
+		}); err != nil {
+			slog.Error("Manager.CreateMatchedGame: failed to set white active-game marker",
+				"gameID", gameID, "userID", playerWhiteID, "error", err)
+		}
+		if err := m.directory.SetActiveGameMarker(ctx, playerBlackID, ActiveGameMarker{
+			GameID: gameID, ConnectToken: blackToken, InstanceLabel: m.instanceID, WSPath: wsPath,
+		}); err != nil {
+			slog.Error("Manager.CreateMatchedGame: failed to set black active-game marker",
+				"gameID", gameID, "userID", playerBlackID, "error", err)
+		}
+	}
+
+	// DECISIONS_LOG_PHASE_3.md ADR-042 — closes TD-P3-004: arm the
+	// matched-opponent-connect timeout now, in the same call that created and
+	// registered this game, not as a separate follow-up step a caller could
+	// forget. Cancelled by HandleConnect's activated branch the moment both
+	// players are actually present.
+	m.armOpponentNeverConnectedTimer(gameID)
+
+	slog.Info("matched game created", "gameID", gameID, "whiteID", playerWhiteID, "blackID", playerBlackID,
+		"requestID", matchmakingRequestID)
+	return session, whiteToken, blackToken, nil
 }
 
 // HandleConnect registers a player's WebSocket connection into the correct
@@ -277,8 +557,11 @@ func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.
 		// DECISIONS_LOG_PHASE_2.md ADR-030: resume any pending abandonment
 		// grace period this freshly-hydrated session has no in-memory record
 		// of. Safe to call after GetOrHydrate returns — registration into
-		// GameRegistry is guaranteed complete by then.
-		m.armAbandonTimersForGame(ctx, gameID)
+		// GameRegistry is guaranteed complete by then. DECISIONS_LOG_PHASE_3.md
+		// ADR-041: armTimersForGame (not the narrower, now-removed
+		// armAbandonTimersForGame) also arms the first-move timer instead, for
+		// an ACTIVE game still inside that window — see armTimersForGameStatus.
+		m.armTimersForGame(ctx, gameID)
 	}
 
 	// Snapshot status before registering so we can distinguish first-connect
@@ -315,13 +598,34 @@ func (m *Manager) HandleConnect(ctx context.Context, gameID string, color store.
 		// Both players now connected for the first time. This goroutine atomically
 		// transitioned the session to ACTIVE.
 
-		// Persist status change. Non-fatal: in-memory state is authoritative.
-		// fromStatus is always WAITING here — RegisterConnection only returns
-		// activated=true via the WAITING→ACTIVE edge (session.go's
-		// validTransitions has no other edge into ACTIVE).
-		if err := m.gameStore.UpdateGameStatus(ctx, gameID, store.GameStatusWaiting, store.GameStatusActive, nil); err != nil {
+		// Persist status change AND the ADR-041 activation timestamp in one
+		// statement. Non-fatal: in-memory state is authoritative. Replaces the
+		// prior plain UpdateGameStatus(...ACTIVE...) call — ActivateGame is
+		// the only writer of games.activated_at, ever.
+		if err := m.gameStore.ActivateGame(ctx, gameID); err != nil {
 			slog.Error("failed to persist ACTIVE status", "gameID", gameID, "error", err)
 		}
+
+		// DECISIONS_LOG_PHASE_3.md ADR-042: the opponent showed up — the
+		// "we found you a match" promise this timer exists to enforce is kept,
+		// the concern is moot from here forward regardless of what happens
+		// next. Safe no-op for a shared-link game, which never arms this timer
+		// in the first place (Manager.CreateMatchedGame, Phase 3 Step 3, is
+		// the only arm site) — cancelTimer is a no-op on a missing key, same
+		// as cancelAbandonTimer already relies on elsewhere in this file.
+		m.cancelOpponentNeverConnectedTimer(gameID)
+
+		// DECISIONS_LOG_PHASE_3.md ADR-041: arm White's first-move grace-period
+		// window. This is the sole abandonment-governing mechanism for this
+		// game until Black's second-move-count threshold is reached (see the
+		// move-pipeline integration in move.go) — there is nothing to
+		// separately suppress here: this live activation path has never armed
+		// a per-color abandon timer to begin with (only HandleDisconnect does
+		// that), so "don't arm the ordinary timer during this window" is
+		// already true by construction on this path. The suppression that
+		// actually needs explicit gating is at hydration — see
+		// armTimersForGameStatus.
+		m.armFirstMoveTimer(gameID, firstMoveTimeout)
 
 		// White always moves first; start the clock for White.
 		session.clock.Start(store.ColorWhite)
@@ -646,8 +950,12 @@ func (m *Manager) restoreGame(ctx context.Context, game *store.Game) error {
 	// is non-terminal (effectiveDisconnectedAt) — Manager.abandonTimers is
 	// pure per-process memory and does not survive the process being
 	// restarted, which is exactly the scenario restoreGame exists for.
-	m.armAbandonTimerForColor(game.ID, store.ColorWhite, effectiveDisconnectedAt(game.Status, game.WhiteDisconnectedAt))
-	m.armAbandonTimerForColor(game.ID, store.ColorBlack, effectiveDisconnectedAt(game.Status, game.BlackDisconnectedAt))
+	// DECISIONS_LOG_PHASE_3.md ADR-041: game and moves are already both in
+	// scope here (moves was fetched above for board reconstruction), so this
+	// calls armTimersForGameStatus directly rather than the data-fetching
+	// armTimersForGame wrapper used by HandleConnect/ResolveGame, which don't
+	// already have both values loaded.
+	m.armTimersForGameStatus(game, moves)
 	slog.Info("game restored", "gameID", game.ID, "status", game.Status, "moves", len(moves))
 	return nil
 }
@@ -872,6 +1180,184 @@ func (m *Manager) onAbandonTimeout(gameID string, color store.Color) {
 		"gameID", gameID, "disconnectedColor", color)
 }
 
+// onFirstMoveTimeout is called when DECISIONS_LOG_PHASE_3.md ADR-041's
+// first-move grace period elapses — 20 seconds after the game became ACTIVE
+// (White's window), or 20 seconds after White's first move persisted
+// (Black's window, re-armed by the move pipeline — see move.go).
+//
+// Gated at fire-time on the actual current move count, not just on "this
+// timer wasn't cancelled": a stale fire (the callback was already scheduled
+// before a just-landed move retired or re-armed the mechanism — the classic
+// timer-vs-mutation race any time.AfterFunc-based mechanism has) must not
+// abort a game that has, in fact, already progressed past the threshold this
+// specific timer instance was guarding. len(snap.Moves) >= 2 means the
+// mechanism has already retired (Black's reply landed); a first-move timer
+// firing after that point is always stale and must no-op.
+func (m *Manager) onFirstMoveTimeout(gameID string) {
+	m.cancelTimer(firstMoveTimerKey(gameID))
+
+	session, err := m.registry.Get(gameID)
+	if err != nil {
+		return
+	}
+
+	snap := session.CurrentStateSnapshot()
+	if snap.Status != store.GameStatusActive {
+		return // Already terminal — stale fire, no-op.
+	}
+	if len(snap.Moves) >= 2 {
+		return // Mechanism already retired (Black replied) — stale fire, no-op.
+	}
+
+	if err := session.Transition(store.GameStatusAborted); err != nil {
+		slog.Debug("Manager.onFirstMoveTimeout: game already in terminal state", "gameID", gameID)
+		return
+	}
+
+	session.clock.Stop()
+
+	// fromStatus is always ACTIVE: Transition(ABORTED) just succeeded, and
+	// that edge only exists from ACTIVE (session.go's validTransitions,
+	// ADR-041). outcome is nil — an aborted game has no result to record,
+	// same reasoning as onAbandonTimeout's pre-existing WAITING→ABORTED
+	// branch (ADR-029).
+	if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusActive, store.GameStatusAborted, nil); err != nil {
+		slog.Error("Manager.onFirstMoveTimeout: failed to persist ABORTED",
+			"gameID", gameID, "error", err)
+	}
+
+	// Outcome/reason are the same wire-only "ABORTED" signal used by
+	// onAbandonTimeout's WAITING branch — not a store.Outcome/
+	// store.OutcomeReason constant, since ABORTED has no entry in either DB
+	// CHECK constraint.
+	m.publishGameOver(context.Background(), session, "", "ABORTED",
+		session.CurrentStateSnapshot().CurrentFEN)
+
+	m.finalizeGame(gameID)
+
+	slog.Info("game aborted — first-move grace period elapsed",
+		"gameID", gameID, "movesPlayed", len(snap.Moves))
+}
+
+// onOpponentNeverConnectedTimeout is called 60 seconds after
+// Manager.CreateMatchedGame creates a matched game, if the assigned
+// opponent never connected at all (DECISIONS_LOG_PHASE_3.md ADR-042 —
+// closes TD-P3-004). Cancelled by HandleConnect's activated branch the
+// moment both players are actually present; this callback only ever fires
+// when that never happened.
+//
+// Gated on game.Status == WAITING_FOR_PLAYER at fire-time for the same
+// stale-fire reasoning as onFirstMoveTimeout — Transition's own idempotency
+// (fails harmlessly on an already-ACTIVE or already-terminal session) is the
+// actual safety net every timeout handler in this file relies on; this
+// status check is a fast-path short-circuit, not the only thing preventing
+// a double-fire.
+//
+// Does not touch the ADR-037 matchmaking_active_game Redis marker: ADR-042's
+// own Consequences record that the absent player's marker keeps renewing
+// for up to matchedOpponentConnectTimeout after this fires, blocking their
+// own re-queue for that same window — a deliberately accepted, bounded
+// consequence (the marker's own TTL-based expiry resolves it independently
+// once ADR-037's heartbeat.go extension exists), not a gap this function
+// needs to close.
+func (m *Manager) onOpponentNeverConnectedTimeout(gameID string) {
+	m.cancelTimer(opponentNeverConnectedTimerKey(gameID))
+
+	session, err := m.registry.Get(gameID)
+	if err != nil {
+		return
+	}
+
+	snap := session.CurrentStateSnapshot()
+	if snap.Status != store.GameStatusWaiting {
+		return // Opponent connected (now ACTIVE), or the game already ended some other way — no-op.
+	}
+
+	if err := session.Transition(store.GameStatusAborted); err != nil {
+		slog.Debug("Manager.onOpponentNeverConnectedTimeout: game already in terminal state", "gameID", gameID)
+		return
+	}
+
+	// fromStatus is always WAITING, same reasoning as onAbandonTimeout's
+	// existing WAITING→ABORTED branch (ADR-029). outcome is nil, same
+	// reason: an aborted game has no scored result.
+	if err := m.gameStore.UpdateGameStatus(context.Background(), gameID, store.GameStatusWaiting, store.GameStatusAborted, nil); err != nil {
+		slog.Error("Manager.onOpponentNeverConnectedTimeout: failed to persist ABORTED",
+			"gameID", gameID, "error", err)
+	}
+
+	m.publishGameOver(context.Background(), session, "", "ABORTED",
+		session.CurrentStateSnapshot().CurrentFEN)
+
+	m.finalizeGame(gameID)
+
+	slog.Info("matched game aborted — assigned opponent never connected", "gameID", gameID)
+}
+
+// onMovePersisted implements DECISIONS_LOG_PHASE_3.md ADR-041's move-count-
+// gated first-move grace period, wired into MoveProcessor via
+// MoveProcessor.setOnMovePersisted (called once, from NewManager) — mirrors
+// setClockTimeoutCallback's existing Clock→Manager pattern.
+//
+//   - moveNumber == 1 (White's move just persisted): arm Black's window,
+//     the full firstMoveTimeout. This fires at essentially the exact moment
+//     of persistence, so time.Now() introduces no meaningful drift here,
+//     unlike the hydration-time case (armTimersForGameStatus), which must
+//     recompute precisely from moves[0].PlayedAt because it can run
+//     arbitrarily long after the fact.
+//   - moveNumber == 2 (Black's reply just persisted): the mechanism has done
+//     its job and retires. Cancels the first-move timer — best-effort; it
+//     may already be racing to fire on its own goroutine, but
+//     onFirstMoveTimeout's own move-count re-check at fire-time makes that
+//     race safe regardless of which side wins — and bootstraps the ordinary
+//     per-color abandon timer for any color disconnected AT THIS EXACT
+//     MOMENT (sub-decision 3's gap: without this, a player who disconnected
+//     during the first-move window, when the ordinary timer was
+//     deliberately not armed, would have no abandon timer running at all
+//     once the window retires, until their next connect/disconnect event).
+//     Uses the real persisted disconnect timestamp
+//     (armAbandonTimerForColor/effectiveDisconnectedAt, same machinery
+//     hydration already uses) rather than a needlessly generous fresh 60s
+//     window — a player silent since well before this exact moment
+//     shouldn't get extra grace just because the bootstrap happens to run
+//     now. Only reads the game row when at least one color is actually
+//     disconnected — the common case (both players still present through
+//     the opening moves) costs no extra I/O at all.
+//   - Any other moveNumber: no-op.
+func (m *Manager) onMovePersisted(ctx context.Context, gameID string, moveNumber int) {
+	switch moveNumber {
+	case 1:
+		m.armFirstMoveTimer(gameID, firstMoveTimeout)
+
+	case 2:
+		m.cancelFirstMoveTimer(gameID)
+
+		session, err := m.registry.Get(gameID)
+		if err != nil {
+			return
+		}
+
+		whiteConnected := session.IsPlayerConnected(store.ColorWhite)
+		blackConnected := session.IsPlayerConnected(store.ColorBlack)
+		if whiteConnected && blackConnected {
+			return
+		}
+
+		game, err := m.gameStore.GetGame(ctx, gameID)
+		if err != nil {
+			slog.Error("Manager.onMovePersisted: failed to read game for disconnected-player bootstrap",
+				"gameID", gameID, "error", err)
+			return
+		}
+		if !whiteConnected {
+			m.armAbandonTimerForColor(gameID, store.ColorWhite, effectiveDisconnectedAt(store.GameStatusActive, game.WhiteDisconnectedAt))
+		}
+		if !blackConnected {
+			m.armAbandonTimerForColor(gameID, store.ColorBlack, effectiveDisconnectedAt(store.GameStatusActive, game.BlackDisconnectedAt))
+		}
+	}
+}
+
 // finalizeGame performs bookkeeping common to every terminal path (MOVE-driven
 // checkmate/stalemate via MoveProcessor.handleGameOver, handleResign, and
 // onAbandonTimeout): it cancels any pending abandonment timers for both
@@ -897,6 +1383,13 @@ func (m *Manager) onAbandonTimeout(gameID string, color store.Color) {
 func (m *Manager) finalizeGame(gameID string) {
 	m.cancelAbandonTimer(gameID, store.ColorWhite)
 	m.cancelAbandonTimer(gameID, store.ColorBlack)
+	// DECISIONS_LOG_PHASE_3.md ADR-041/ADR-042: both new timer kinds are
+	// per-game, not per-color, and both must be cancelled on every terminal
+	// path exactly like the per-color timers above — cancelTimer is a no-op
+	// on a missing key, so this is safe even for the (overwhelmingly common)
+	// case where neither was ever armed for this particular game.
+	m.cancelFirstMoveTimer(gameID)
+	m.cancelOpponentNeverConnectedTimer(gameID)
 	m.registry.Unregister(gameID)
 }
 
@@ -962,6 +1455,36 @@ func (m *Manager) startAbandonTimer(gameID string, color store.Color) {
 	m.startAbandonTimerWithDuration(gameID, color, abandonTimeout)
 }
 
+// armTimer arms (or re-arms, replacing any existing timer at this key) a
+// timer under Manager.abandonTimers, calling onFire when it elapses. Shared
+// plumbing for the ordinary per-color abandon timer
+// (startAbandonTimerWithDuration) and the DECISIONS_LOG_PHASE_3.md
+// ADR-041/ADR-042 timers (armFirstMoveTimer, armOpponentNeverConnectedTimer)
+// — all three share the same map/mutex, keyed by collision-safe suffixes
+// (see abandonTimers' doc comment on the Manager struct).
+func (m *Manager) armTimer(key string, d time.Duration, onFire func()) {
+	t := time.AfterFunc(d, onFire)
+	m.mu.Lock()
+	if old, ok := m.abandonTimers[key]; ok {
+		old.Stop()
+	}
+	m.abandonTimers[key] = t
+	m.mu.Unlock()
+}
+
+// cancelTimer stops and removes the timer at key, if any is armed. Safe
+// no-op if absent — several callers rely on exactly this (e.g. HandleConnect
+// cancelling ADR-042's opponent-connect timer unconditionally, even for a
+// shared-link game that never armed it in the first place).
+func (m *Manager) cancelTimer(key string) {
+	m.mu.Lock()
+	if t, ok := m.abandonTimers[key]; ok {
+		t.Stop()
+		delete(m.abandonTimers, key)
+	}
+	m.mu.Unlock()
+}
+
 // startAbandonTimerWithDuration arms (or re-arms, replacing any existing
 // timer for this key) an abandonment timer with an explicit duration rather
 // than always the full abandonTimeout. Used by armAbandonTimerForColor
@@ -970,15 +1493,9 @@ func (m *Manager) startAbandonTimer(gameID string, color store.Color) {
 // restarting the full 60s from scratch.
 func (m *Manager) startAbandonTimerWithDuration(gameID string, color store.Color, d time.Duration) {
 	key := abandonKey(gameID, color)
-	t := time.AfterFunc(d, func() {
+	m.armTimer(key, d, func() {
 		m.onAbandonTimeout(gameID, color)
 	})
-	m.mu.Lock()
-	if old, ok := m.abandonTimers[key]; ok {
-		old.Stop()
-	}
-	m.abandonTimers[key] = t
-	m.mu.Unlock()
 }
 
 // remainingAbandonDuration computes how much of the abandonment grace
@@ -1057,41 +1574,168 @@ func effectiveDisconnectedAt(status store.GameStatus, persisted *time.Time) *tim
 	return nil
 }
 
-// armAbandonTimersForGame re-fetches gameID's row and arms
-// (DECISIONS_LOG_PHASE_2.md ADR-030) any pending abandonment grace periods
-// for both colors. Used after GetOrHydrate hydrates a session fresh: unlike
-// restoreGame, hydrateGameSession does not itself register the session into
-// GameRegistry — GetOrHydrate's singleflight wrapper does that after
-// hydrateFn returns — so arming timers inside hydrateGameSession itself
-// would race that registration. This helper is called by the caller of
-// GetOrHydrate, strictly after it has returned, when registration is
-// guaranteed complete. See armAbandonTimerForColor's doc comment for why the
-// arm itself is still safe even without this ordering, as defense in depth.
+// armAbandonTimersForGame is DELIBERATELY REMOVED as of DECISIONS_LOG_PHASE_3.md
+// ADR-041 — see armTimersForGame and armTimersForGameStatus below, which
+// replace it at all three former call sites (HandleConnect, ResolveGame,
+// restoreGame). This comment intentionally left as a pointer for anyone
+// grepping for the old name; remove once this has been in the codebase a
+// while and the pointer no longer earns its keep.
+
+// effectiveWindowStartedAt mirrors effectiveDisconnectedAt's exact reasoning
+// (DECISIONS_LOG_PHASE_2.md ADR-031) for DECISIONS_LOG_PHASE_3.md ADR-041's
+// first-move grace period, with one difference worth being explicit about:
+// unlike effectiveDisconnectedAt, a nil persisted value here is NEVER the
+// "steady state and fine" case — games.activated_at is set atomically with
+// the WAITING→ACTIVE transition itself (GameStore.ActivateGame), so by the
+// time this is ever called (game is ACTIVE), a nil value always means that
+// specific write's activated_at portion failed for this specific game, not
+// "hasn't happened yet in the ordinary flow." Same safe-direction default
+// regardless: assume the window started now, giving the hydrating instance a
+// full fresh window rather than guessing a shorter one — a player still
+// genuinely inside a real window loses nothing (the window merely resets to
+// full length), which is at most as generous as intended, never less.
+func effectiveWindowStartedAt(persisted *time.Time) time.Time {
+	if persisted != nil {
+		return *persisted
+	}
+	return time.Now()
+}
+
+// remainingFirstMoveWindowDuration computes how much of
+// DECISIONS_LOG_PHASE_3.md ADR-041's first-move grace period remains, given
+// when the current window actually started. Mirrors remainingAbandonDuration's
+// shape and reasoning exactly — pulled out as a pure function for the same
+// testability reason.
+func remainingFirstMoveWindowDuration(windowStartedAt time.Time) time.Duration {
+	remaining := firstMoveTimeout - time.Since(windowStartedAt)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining
+}
+
+// armTimersForGameStatus arms whichever grace-period timer(s) currently
+// apply to game, given its persisted status and (only needed/fetched when
+// ACTIVE) move history — DECISIONS_LOG_PHASE_3.md ADR-041's gating logic,
+// shared by restoreGame (which already has both values in scope from its own
+// board-reconstruction work) and armTimersForGame below (which fetches them
+// fresh for call sites that don't).
 //
-// Costs one extra indexed GetGame read per call. Only invoked on the
-// GetOrHydrate fallback paths (ResolveGame's claim-and-hydrate branch,
-// HandleConnect's registry-miss fallback) — not on every ordinary
-// already-resident connect/resolve — so this is bounded to the relatively
-// infrequent "this instance just took ownership" moment, not a hot path.
-func (m *Manager) armAbandonTimersForGame(ctx context.Context, gameID string) {
+// Per ADR-041's own Consequences, armAbandonTimerForColor's internals do not
+// change — only whether/when each of the three former
+// armAbandonTimersForGame call sites now routes through here instead of
+// arming the ordinary per-color timers unconditionally.
+func (m *Manager) armTimersForGameStatus(game *store.Game, moves []*store.Move) {
+	if game.Status != store.GameStatusActive || len(moves) >= 2 {
+		// WAITING (or a terminal status, always a no-op via
+		// effectiveDisconnectedAt either way): existing behavior, unchanged.
+		// ACTIVE with the first-move mechanism already retired (Black's reply
+		// landed): also existing behavior, unchanged — identical to any other
+		// ACTIVE game from this function's perspective.
+		m.armAbandonTimerForColor(game.ID, store.ColorWhite, effectiveDisconnectedAt(game.Status, game.WhiteDisconnectedAt))
+		m.armAbandonTimerForColor(game.ID, store.ColorBlack, effectiveDisconnectedAt(game.Status, game.BlackDisconnectedAt))
+		return
+	}
+
+	// ACTIVE with fewer than 2 moves played: DECISIONS_LOG_PHASE_3.md ADR-041
+	// sub-decision 2 — the ordinary per-color timers are not armed at all
+	// during this window; the first-move timer is the sole governing
+	// mechanism.
+	var windowStartedAt time.Time
+	if len(moves) == 0 {
+		// White's window: anchored on activation.
+		windowStartedAt = effectiveWindowStartedAt(game.ActivatedAt)
+	} else {
+		// Black's window: anchored on White's move-persist time — no fallback
+		// needed, moves.played_at is always populated (MoveStore.SaveMove's
+		// RETURNING clause).
+		windowStartedAt = moves[0].PlayedAt
+	}
+
+	m.armFirstMoveTimer(game.ID, remainingFirstMoveWindowDuration(windowStartedAt))
+}
+
+// armTimersForGame re-fetches gameID's row (and, only when ACTIVE, its move
+// history) and arms whichever grace-period timer(s) currently apply — see
+// armTimersForGameStatus for the actual gating logic. Replaces the narrower,
+// pre-ADR-041 armAbandonTimersForGame at both of its remaining call sites
+// that don't already have game/moves in scope (HandleConnect's registry-miss
+// fallback, ResolveGame's claim-and-hydrate branch); restoreGame calls
+// armTimersForGameStatus directly, since it already has both values loaded
+// from its own board-reconstruction work and a second GetGame/
+// GetMovesForGame round-trip there would be pure waste.
+//
+// Costs up to two extra reads (GetGame, and GetMovesForGame only when the
+// game is ACTIVE) — same "infrequent hydration moment, not a hot path" bound
+// the superseded armAbandonTimersForGame already documented.
+func (m *Manager) armTimersForGame(ctx context.Context, gameID string) {
 	game, err := m.gameStore.GetGame(ctx, gameID)
 	if err != nil {
-		slog.Error("armAbandonTimersForGame: failed to read game for timer resumption",
+		slog.Error("armTimersForGame: failed to read game for timer resumption",
 			"gameID", gameID, "error", err)
 		return
 	}
-	m.armAbandonTimerForColor(gameID, store.ColorWhite, effectiveDisconnectedAt(game.Status, game.WhiteDisconnectedAt))
-	m.armAbandonTimerForColor(gameID, store.ColorBlack, effectiveDisconnectedAt(game.Status, game.BlackDisconnectedAt))
+
+	var moves []*store.Move
+	if game.Status == store.GameStatusActive {
+		moves, err = m.moveStore.GetMovesForGame(ctx, gameID)
+		if err != nil {
+			slog.Error("armTimersForGame: failed to read moves for timer resumption",
+				"gameID", gameID, "error", err)
+			return
+		}
+	}
+
+	m.armTimersForGameStatus(game, moves)
 }
 
 func (m *Manager) cancelAbandonTimer(gameID string, color store.Color) {
-	key := abandonKey(gameID, color)
-	m.mu.Lock()
-	if t, ok := m.abandonTimers[key]; ok {
-		t.Stop()
-		delete(m.abandonTimers, key)
-	}
-	m.mu.Unlock()
+	m.cancelTimer(abandonKey(gameID, color))
+}
+
+// firstMoveTimerKey returns the map key for a game's DECISIONS_LOG_PHASE_3.md
+// ADR-041 first-move grace-period timer. Never collides with abandonKey's
+// shape: abandonKey's second segment is always a real store.Color
+// ("WHITE"/"BLACK"); "FIRSTMOVE" is not.
+func firstMoveTimerKey(gameID string) string {
+	return gameID + ":FIRSTMOVE"
+}
+
+func (m *Manager) armFirstMoveTimer(gameID string, d time.Duration) {
+	m.armTimer(firstMoveTimerKey(gameID), d, func() {
+		m.onFirstMoveTimeout(gameID)
+	})
+}
+
+func (m *Manager) cancelFirstMoveTimer(gameID string) {
+	m.cancelTimer(firstMoveTimerKey(gameID))
+}
+
+// opponentNeverConnectedTimerKey returns the map key for a matched game's
+// DECISIONS_LOG_PHASE_3.md ADR-042 opponent-connect timeout. Same
+// collision-safety reasoning as firstMoveTimerKey.
+func opponentNeverConnectedTimerKey(gameID string) string {
+	return gameID + ":OPPONENT_NEVER_CONNECTED"
+}
+
+// armOpponentNeverConnectedTimer arms DECISIONS_LOG_PHASE_3.md ADR-042's
+// timeout. Called by Manager.CreateMatchedGame (Phase 3 Step 3) at the
+// moment a matched game is created — always the full matchedOpponentConnectTimeout,
+// never a partial/resumed duration: unlike the first-move timer or the
+// ordinary abandon timer, this one has no hydration-time resumption path,
+// since it only ever needs to survive from game-creation to the opponent's
+// first connect, both of which happen on the instance that created the game
+// (Manager.CreateMatchedGame registers the session locally in the same call
+// that arms this timer — no failover-survival gap to close here the way
+// ADR-030/ADR-031 closed one for the ordinary abandon timer).
+func (m *Manager) armOpponentNeverConnectedTimer(gameID string) {
+	m.armTimer(opponentNeverConnectedTimerKey(gameID), matchedOpponentConnectTimeout, func() {
+		m.onOpponentNeverConnectedTimeout(gameID)
+	})
+}
+
+func (m *Manager) cancelOpponentNeverConnectedTimer(gameID string) {
+	m.cancelTimer(opponentNeverConnectedTimerKey(gameID))
 }
 
 func (m *Manager) sendGameState(session *GameSession, color store.Color) {

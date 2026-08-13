@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/vedant-2701/chess/internal/store"
 )
 
 // StartHeartbeat launches a background goroutine (PHASE_2.md Step 6) that
@@ -106,6 +108,80 @@ func (m *Manager) heartbeatTick(ctx context.Context) {
 			slog.Warn("heartbeat: lost ownership renewal for game — no longer the recorded owner",
 				"gameID", gameID, "instanceID", m.instanceID)
 		}
+	}
+
+	m.renewActiveGameMarkers(ctx, sessions)
+}
+
+// renewActiveGameMarkers batch-renews the matchmaking_active_game:{userID}
+// marker (DECISIONS_LOG_PHASE_3.md ADR-037) for every player in every
+// locally-active game, in the same tick that renews ownership. Best-effort,
+// same as ownership renewal above — a failure here is logged, never
+// propagated; the marker is a convenience cache for matchmaking-service's
+// check-before-enqueue logic, not a source of truth for anything (Postgres
+// is), so its failure mode is bounded staleness, not a correctness loss.
+//
+// Re-signs a fresh PlayerClaims token for each player on every tick rather
+// than reusing whatever token CreateGame/JoinGame/CreateMatchedGame
+// originally minted: PlayerClaims tokens are fully self-contained and
+// deterministically re-mintable from (gameID, userID, color, secret) at any
+// time — any correctly-signed, unexpired token is equally valid, so there is
+// no need to thread the ORIGINAL token bytes through GameSession just to
+// republish them unchanged. This also sidesteps a real structural problem:
+// JoinGame deliberately never touches a live GameSession (it may run on a
+// different instance than the one hosting it — see JoinGame's own doc
+// comment), so a GameSession-held-token design would have no way to
+// populate Black's token for renewal purposes in that case at all, only
+// White's.
+func (m *Manager) renewActiveGameMarkers(ctx context.Context, sessions []*GameSession) {
+	markers := make(map[string]ActiveGameMarker, len(sessions)*2)
+	for _, session := range sessions {
+		snap := session.CurrentStateSnapshot()
+		if snap.Status != store.GameStatusWaiting && snap.Status != store.GameStatusActive {
+			// A session can still be briefly registered in a terminal status
+			// between Transition succeeding and finalizeGame's Unregister
+			// running (the same narrow window ADR-030's own callers already
+			// tolerate elsewhere in this file) — skip it; a terminal game has
+			// no business holding either player in "has an active game" state.
+			continue
+		}
+
+		whiteToken, err := m.signToken(session.ID, snap.PlayerWhiteID, string(store.ColorWhite))
+		if err != nil {
+			slog.Error("heartbeat: failed to sign token for active-game marker renewal",
+				"gameID", session.ID, "userID", snap.PlayerWhiteID, "color", "WHITE", "error", err)
+		} else {
+			markers[snap.PlayerWhiteID] = ActiveGameMarker{
+				GameID:        session.ID,
+				ConnectToken:  whiteToken,
+				InstanceLabel: m.instanceID,
+				WSPath:        "/connect/" + m.instanceID,
+			}
+		}
+
+		if snap.PlayerBlackID == "" {
+			continue // WAITING_FOR_PLAYER shared-link game, nobody has joined yet.
+		}
+		blackToken, err := m.signToken(session.ID, snap.PlayerBlackID, string(store.ColorBlack))
+		if err != nil {
+			slog.Error("heartbeat: failed to sign token for active-game marker renewal",
+				"gameID", session.ID, "userID", snap.PlayerBlackID, "color", "BLACK", "error", err)
+		} else {
+			markers[snap.PlayerBlackID] = ActiveGameMarker{
+				GameID:        session.ID,
+				ConnectToken:  blackToken,
+				InstanceLabel: m.instanceID,
+				WSPath:        "/connect/" + m.instanceID,
+			}
+		}
+	}
+
+	if len(markers) == 0 {
+		return
+	}
+	if err := m.directory.RenewActiveGameMarkersBatch(ctx, markers); err != nil {
+		slog.Error("heartbeat: RenewActiveGameMarkersBatch failed",
+			"instanceID", m.instanceID, "count", len(markers), "error", err)
 	}
 }
 

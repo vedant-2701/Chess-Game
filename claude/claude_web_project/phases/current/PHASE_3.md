@@ -366,17 +366,17 @@ Full contract detail (gRPC methods, retry/dedup semantics, trust boundary): `DEC
 
 ### Step 2: Proto / gRPC Contract
 - [x] `proto/matchmakingv1/matchmaking.proto` (monorepo, ADR-033 §7): `MatchReportService` — `ReportMatchCreated`, `ReportMatchmakingFailed`, `MatchmakingFailureReason` enum
-- [ ] Codegen wiring for both chess-server (client) and matchmaking-service (server)
-- [ ] Shared-secret gRPC interceptor (trust boundary, ADR-033)
+- [x] Codegen wiring for both chess-server (client) and matchmaking-service (server)
+- [x] Shared-secret gRPC interceptor (trust boundary, ADR-033)
 
 ### Step 3: chess-server side — `internal/matchmaking` package
-- [ ] `internal/matchmaking/pairing.go`: pairing-loop goroutine, `ZPOPMIN`-driven, `MATCHMAKING_PAIRING_INTERVAL_MS`-configured
-- [ ] **GATE — read TD-P3-004 and the "Open Question" section below before writing this:** `Manager.CreateMatchedGame` (`internal/game`, new method mirroring `CreateGame`'s eager pattern): atomic insert, `GameRegistry` registration, `ClaimOwnership`. The connection-lifecycle half of this (what happens when an assigned opponent never connects while the other player waits, connected, indefinitely) is deliberately undesigned — do not invent an ad hoc fix for it here; get the dedicated ADR first, or explicitly carry TD-P3-004 forward as known-incomplete if this step proceeds anyway
-- [ ] Re-enqueue-on-failure path (`ZADD` at original score, chess-server-direct, ADR-034)
-- [ ] gRPC client: `ReportMatchCreated`/`ReportMatchmakingFailed`, bounded retry with backoff
-- [ ] `matchmaking_active_game:{userID}` key: write at `CreateGame`/`JoinGame`/`CreateMatchedGame` success, renew on the existing heartbeat tick (ADR-037) — extends `internal/game/heartbeat.go`, not a new goroutine
-- [ ] Redis client wiring decision for `internal/matchmaking`: reuse `main.go`'s existing `*redis.Client` (same process as `internal/game`) rather than opening a second connection — implementation-time detail, not requiring its own ADR
-- [ ] Integration tests (Redis + Postgres required): concurrent `ZPOPMIN` across two simulated instances, no double-match; `CreateMatchedGame` idempotency under retry
+- [x] `internal/matchmaking/pairing.go`: pairing-loop goroutine, `ZPOPMIN`-driven, `MATCHMAKING_PAIRING_INTERVAL_MS`-configured. `MatchReporter` defined as an interface (not a concrete gRPC type) so the loop's tick logic is fully testable without the generated protobuf stubs, which don't exist on disk yet (`make proto` not yet run) — a concrete gRPC-backed implementation satisfies this interface once the next checklist item lands, with no change to `pairing.go` itself.
+- [x] **GATE LIFTED (2026-08-10) — see `DECISIONS_LOG_PHASE_3.md` ADR-041/ADR-042.** `Manager.CreateMatchedGame` (`internal/game`): atomic insert, `GameRegistry` registration, `ClaimOwnership`, PLUS arming `matchedOpponentConnectTimeout` (ADR-042) in the same call — implemented, including the idempotent-retry path (`GameStore.GetGameByMatchmakingRequestID` + `GameRegistry.GetOrHydrate`). Both named prerequisites landed first: `games.activated_at` migration + `GameStore.ActivateGame` (ADR-041), and `internal/game/move.go`'s move-count-gated first-move-timer integration (arm Black's window after move #1, retire + disconnected-player bootstrap after move #2, via `MoveProcessor.onMovePersisted` → `Manager.onMovePersisted`). New, accepted, explicitly-flagged residual gap in the idempotent-retry branch: it does not re-arm `matchedOpponentConnectTimeout` or re-claim ownership, on the assumption neither step could plausibly fail independently of the insert itself — see `Manager.CreateMatchedGame`'s doc comment.
+- [x] Re-enqueue-on-failure path (`ZADD` at original score, chess-server-direct, ADR-034) — `PairingLoop.reenqueue`, part of the same commit as `pairing.go` above (the tick logic's failure branch requires it; they were never separable in practice)
+- [x] gRPC client: `ReportMatchCreated`/`ReportMatchmakingFailed`, bounded retry with backoff — `internal/matchmaking/reporter.go`'s `grpcMatchReporter`, using `internal/rpc`'s shared-secret client interceptor. Wired into `cmd/server/main.go` (optional — gated on `MATCHMAKING_SERVICE_ADDR` being set).
+- [x] `matchmaking_active_game:{userID}` key: write at `CreateGame`/`JoinGame`/`CreateMatchedGame` success, renew on the existing heartbeat tick (ADR-037) — extends `internal/game/heartbeat.go`, not a new goroutine. `RoutingDirectory.SetActiveGameMarker`/`RenewActiveGameMarkersBatch` (`directory.go`); renewal re-signs a fresh `PlayerClaims` token per tick rather than threading the original token through `GameSession` (see `renewActiveGameMarkers`'s doc comment for why — `JoinGame` never touches a live `GameSession`, so a session-held-token design has no way to populate Black's token in that case).
+- [x] Redis client wiring decision for `internal/matchmaking`: reuse `main.go`'s existing `*redis.Client` (same process as `internal/game`) rather than opening a second connection — implementation-time detail, not requiring its own ADR. `NewPairingLoop`'s signature enforces this directly (takes an already-connected `*redis.Client`, never constructs its own).
+- [~] Integration tests (Redis + Postgres required): concurrent `ZPOPMIN` across two simulated instances, no double-match ✅ (`TestPairingLoop_ConcurrentTicks_NoDoubleMatch`); `CreateMatchedGame` idempotency under retry ✅ (Step 1's `TestGameStore_CreateMatchedGame`, plus `pairing_test.go`'s pairing/odd-queue/re-enqueue-on-failure coverage). Not yet covered here, deliberately — depends on `matchmaking-service` (Step 4) existing: the full queue→SSE→connect end-to-end flow, and the 409-already-in-a-game check. See Step 7 below.
 
 ### Step 4: `matchmaking-service` — new deployable
 - [ ] New Go module/binary (monorepo, own `docker-compose.yml` entry per ADR-032's Consequences)
@@ -435,44 +435,51 @@ Full contract detail (gRPC methods, retry/dedup semantics, trust boundary): `DEC
 | TD-P3-001 | FIFO queue only — no ELO-based pairing | Phase 4 (ELO exists then) |
 | TD-P3-002 | Single time control (10+0) only | Phase 4 |
 | TD-P3-003 | `matchmaking-service`'s SSE connections live in an in-memory map, correct only at one replica (M=1). Scaling matchmaking-service itself beyond one replica reintroduces the same delivery-affinity problem this phase extracted matchmaking out of chess-server to avoid, at a smaller scale (ADR-036). | Revisit if/when matchmaking-service needs to scale, or at Phase 5 (spectator fan-out) if that phase's mechanism ends up related |
-| TD-P3-004 | **Do not implement `CreateMatchedGame`'s connection lifecycle without reading this first.** A matched player who connects and stays connected while their assigned opponent never connects at all has no abandonment mechanism — confirmed by tracing `HandleConnect`/`HandleDisconnect`/`onAbandonTimeout` directly: no disconnect event ever fires for either color in this scenario (the connected player never disconnects; the absent one never connected to disconnect from), so no timer of any kind ever arms, and the game sits in `WAITING_FOR_PLAYER` indefinitely. Structurally different from the already-resolved half of this same question (see "Open Question" below) — genuinely unaddressed, not just untested. Deliberately not designed here: it's entangled with `HandleConnect`/`HandleDisconnect`, failover grace-period persistence (ADR-030/031), and the existing abandonment timer machinery closely enough that it needs its own dedicated session working through all of them together, not a bolt-on fix to one path in isolation. | Before or during Step 3 of the Implementation Checklist below — see the explicit gate on that step |
+| TD-P3-004 | **CLOSED (2026-08-10, `DECISIONS_LOG_PHASE_3.md` ADR-041/ADR-042).** A matched player who connects and stays connected while their assigned opponent never connects at all now has a dedicated arm-at-creation-time timeout (`matchedOpponentConnectTimeout`, ADR-042) that fires regardless of any future disconnect/reconnect/resolve event, closing the steady-state gap unconditionally. Working through this surfaced a second, related but structurally distinct gap not originally named in this row — a game that reaches `ACTIVE` but never receives a first move, or a first reply — closed separately by ADR-041's move-triggered first-move grace period (new `ACTIVE→ABORTED` edge, scoped universally, not matchmaking-only). One accepted residual gap remains, of the same shape and severity as the already-tracked TD-P2-006 (a game nobody ever connects to or resolves, combined with an instance crash before the creation-armed timer fires): not solved here, deliberately, per ADR-042's Rationale (a heartbeat-tick alternative was traced through and shown to provide zero additional coverage for this specific residual case). | Resolved — see ADR-041/ADR-042 for design, `phases/current/PHASE_3_DESIGN_NOTES.md` §17 for full reasoning trail |
 
 ---
 
-## Open Question — Matched-Game Connection-Grace Semantics (STILL OPEN, deferred to a dedicated ADR)
+## Matched-Game Connection-Grace Semantics — RESOLVED (2026-08-10)
 
-**Status as of the independent review (2026-08-08): partially resolved, partially still open. Do not treat this as closed.**
+**Status: closed.** `DECISIONS_LOG_PHASE_3.md` ADR-041 and ADR-042 resolve
+this in full; full reasoning trail in `phases/current/PHASE_3_DESIGN_NOTES.md`
+§17. Summary, so this section still stands on its own:
 
-The original version of this question asked whether matchmaking needs its
-own abandonment/grace-period mechanism, since `ABORTED`
-(`DECISIONS_LOG_PHASE_2.md` ADR-029) and the 60s abandonment timer
-(ADR-015/030/031) were designed around shared-link semantics ("opponent
-never joined the game at all"), which doesn't have a direct analog once both
-players are pre-assigned at match time.
+**Resolved, first (2026-08-08), re-verified fresh rather than cited
+(2026-08-10):** if a matched player connects and their opponent never
+does, and the *connected* player then also disconnects, the existing
+mechanism handles this correctly with no new code — `onAbandonTimeout`
+branches purely on `snap.Status == store.GameStatusWaiting`, with no
+dependency on how the game was created. Re-confirmed by direct re-read of
+`HandleConnect`/`HandleDisconnect`/`onAbandonTimeout`, not assumed from
+this document's prior description of the trace.
 
-**Resolved (confirmed by re-tracing the actual code, not by assumption):**
-if a matched player connects and their opponent never does, and the
-*connected* player then also disconnects, the existing mechanism handles
-this correctly with no new code. `onAbandonTimeout` branches purely on
-`snap.Status == store.GameStatusWaiting`, with no dependency on how the game
-was created — a matched game that never left `WAITING_FOR_PLAYER` reaches
-`ABORTED` exactly the same way a shared-link game does. This closes the
-first half of the original question.
+**Resolved (2026-08-10), ADR-042:** a matched player who connects and
+stays connected — waiting — while their assigned opponent never connects
+at all now has a dedicated mechanism: a per-process timer armed
+synchronously at `CreateMatchedGame` time (`matchedOpponentConnectTimeout`,
+60s), cancelled the moment the opponent actually connects, firing straight
+to `ABORTED` (reusing the existing `WAITING→ABORTED` edge) if they never
+do. Crash+failover with at least one party later resolving is already
+covered as a side effect of `DECISIONS_LOG_PHASE_2.md` ADR-031's existing
+disconnect-timestamp fallback (traced through concretely in ADR-042's
+Context, not assumed). Crash+nobody-ever-resolves remains an accepted,
+bounded residual gap of the same shape as the already-tracked TD-P2-006 —
+not solved here, deliberately (see ADR-042's Rationale for why a
+heartbeat-tick alternative doesn't actually close it either).
 
-**Still open, not yet designed:** a matched player who connects and stays
-connected — waiting — while their assigned opponent never connects at all.
-No disconnect ever fires for either color in this scenario, so no
-abandonment timer ever arms, and the game sits in `WAITING_FOR_PLAYER`
-indefinitely with no mechanism to notice or resolve it. This is
-structurally different from the resolved case above and from shared-link
-semantics generally: here there is a specific, named opponent who was
-supposed to show up and didn't, and the waiting player has no way to know
-whether to keep waiting.
+**Found while resolving the above, not originally part of this question:**
+a second, structurally distinct gap — a game that reaches `ACTIVE` (both
+players connected) but never receives a first move, or receives White's
+first move with no reply from Black — had no termination mechanism at all,
+and the existing disconnect-triggered timer would in fact score it
+misleadingly (a `COMPLETED` win or `ABANDONED` draw for a game with zero
+real chess played) on the rare occasion it did fire. Closed by ADR-041's
+move-triggered first-move grace period, scoped universally (shared-link
+games too, not matchmaking-only) since the underlying defect is not
+matchmaking-specific — flagged there as a material behavior change to
+already-shipped Phase 1/2 code, worth explicit attention during regression
+testing.
 
-This is being deliberately deferred to its own dedicated session/ADR — there
-are several related abandonment/abort scenarios worth working through
-together, not resolving this one in isolation here. **Do not implement
-`CreateMatchedGame`'s connection lifecycle as if this is settled.** Whoever
-picks up Step 3 of the Implementation Checklist above should either wait for
-that ADR or explicitly flag this gap as unaddressed technical debt if
-implementation proceeds first.
+`CreateMatchedGame`'s connection lifecycle is no longer undesigned — see
+Step 3's checklist entry above for what implementing it now requires.
