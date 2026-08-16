@@ -103,6 +103,15 @@ type Manager struct {
 	directory  RoutingDirectory
 	instanceID string
 
+	// connectClaimsTTL is PHASE_3.md Step 5's fix: ConnectClaims' actual
+	// lifetime, resolved once at construction (NewManager) from
+	// CONNECT_CLAIMS_TTL_SECONDS, or auth.DefaultConnectClaimsTTL if unset.
+	// A Manager field, not a package-level var read directly at ResolveGame's
+	// mint site — CODING_GUIDELINES.md §5 forbids package-level mutable
+	// state; dependency injection through the constructor is the correct fix
+	// for "this needs to be configurable" here, not a global.
+	connectClaimsTTL time.Duration
+
 	// mu protects: abandonTimers.
 	//
 	// abandonTimers holds three distinct kinds of per-game timer, sharing one
@@ -132,6 +141,11 @@ type Manager struct {
 // never calls ResolveGame (e.g. Phase 1 single-instance wiring, or tests
 // exercising only CreateGame/JoinGame/HandleConnect/RestoreActiveGames) —
 // ResolveGame is the only method that touches either field.
+//
+// connectClaimsTTL is PHASE_3.md Step 5's addition — the caller (main.go)
+// resolves CONNECT_CLAIMS_TTL_SECONDS against auth.DefaultConnectClaimsTTL
+// once at startup and passes the result here; ResolveGame uses this field
+// directly rather than reading any package-level constant.
 func NewManager(
 	registry *GameRegistry,
 	processor *MoveProcessor,
@@ -142,18 +156,20 @@ func NewManager(
 	validator *internalchess.Validator,
 	directory RoutingDirectory,
 	instanceID string,
+	connectClaimsTTL time.Duration,
 ) *Manager {
 	m := &Manager{
-		registry:      registry,
-		processor:     processor,
-		gameStore:     gameStore,
-		moveStore:     moveStore,
-		eventBus:      eventBus,
-		jwtSecret:     jwtSecret,
-		validator:     validator,
-		directory:     directory,
-		instanceID:    instanceID,
-		abandonTimers: make(map[string]*time.Timer),
+		registry:         registry,
+		processor:        processor,
+		gameStore:        gameStore,
+		moveStore:        moveStore,
+		eventBus:         eventBus,
+		jwtSecret:        jwtSecret,
+		validator:        validator,
+		directory:        directory,
+		instanceID:       instanceID,
+		connectClaimsTTL: connectClaimsTTL,
+		abandonTimers:    make(map[string]*time.Timer),
 	}
 	// DECISIONS_LOG_PHASE_3.md ADR-041: wire the first-move grace period's
 	// move-pipeline hook, mirroring setClockTimeoutCallback's existing

@@ -1,0 +1,32 @@
+# ============================================================
+# matchmaking-service Dockerfile — PHASE_3.md Step 4
+# ============================================================
+# Mirrors chess-server's own Dockerfile exactly (multi-stage, static
+# binary, minimal alpine runtime) but builds cmd/matchmaking-service
+# instead of cmd/server — same module (github.com/vedant-2701/chess),
+# different binary, different container (ADR-032: separate deployable).
+# ============================================================
+
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /matchmaking-service ./cmd/matchmaking-service
+
+# ------------------------------------------------------------
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /matchmaking-service /matchmaking-service
+
+EXPOSE 8081
+EXPOSE 9090
+
+ENTRYPOINT ["/matchmaking-service"]

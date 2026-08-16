@@ -29,7 +29,7 @@ func newTestManager(t *testing.T) *Manager {
 	validator := internalchess.NewValidator()
 	processor := NewMoveProcessor(validator, gameStore, moveStore, bus)
 
-	return NewManager(registry, processor, gameStore, moveStore, bus, "test-jwt-secret-not-for-prod", validator, nil, "")
+	return NewManager(registry, processor, gameStore, moveStore, bus, "test-jwt-secret-not-for-prod", validator, nil, "", auth.DefaultConnectClaimsTTL)
 }
 
 // --- CreateGame ---------------------------------------------------------

@@ -131,7 +131,7 @@ func (m *Manager) ResolveGame(ctx context.Context, gameID, userID string, color 
 		Color:         string(color),
 		InstanceLabel: instanceLabel,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(auth.ConnectClaimsTTL)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(m.connectClaimsTTL)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}

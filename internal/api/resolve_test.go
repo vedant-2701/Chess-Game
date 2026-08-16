@@ -34,7 +34,7 @@ func newTestManagerWithDirectory(t *testing.T) *game.Manager {
 	eventBus := game.NewLocalEventBus()
 	processor := game.NewMoveProcessor(validator, gameStore, moveStore, eventBus)
 	directory := game.NewRedisDirectory(testRedisClient)
-	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator, directory, resolveTestInstanceID)
+	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator, directory, resolveTestInstanceID, auth.DefaultConnectClaimsTTL)
 }
 
 // newTestGameServerWithResolve wires GameHandler with resolve support

@@ -49,6 +49,12 @@ run: ## Run the server (requires .env)
 build: ## Build the server binary to ./bin/server
 	go build $(BUILD_FLAGS) -o $(BINARY) ./cmd/server/...
 
+run-matchmaking-service: ## Run matchmaking-service (Phase 3 Step 4, requires .env)
+	go run ./cmd/matchmaking-service/...
+
+build-matchmaking-service: ## Build the matchmaking-service binary to ./bin/matchmaking-service
+	go build $(BUILD_FLAGS) -o bin/matchmaking-service ./cmd/matchmaking-service/...
+
 # ---- Testing -----------------------------------------------
 
 test: ## Run unit tests (no database required)

@@ -1,3 +1,134 @@
+## PART 1 — SESSION SUMMARY
+
+## Session Summary — Phase 3 Steps 1 Through 3
+
+### What Was Built
+
+**Step 1 — DB layer for matchmaking idempotency:**
+- Migration 005: `games.matchmaking_request_id UUID UNIQUE`, nullable
+- `GameStore.CreateMatchedGame` (atomic two-player `INSERT ... ON CONFLICT (matchmaking_request_id) DO NOTHING`), `GameStore.GetGameByMatchmakingRequestID`
+- Full test coverage in `game_store_test.go` (fresh insert, idempotent retry, both validation-error paths)
+
+**Step 2 — gRPC contract + nginx:**
+- `proto/matchmakingv1/matchmaking.proto`: `MatchReportService` (`ReportMatchCreated`, `ReportMatchmakingFailed`), `MatchmakingFailureReason` enum. Codegen run by user (`make install-proto-tools && make proto`) — `.pb.go`/`_grpc.pb.go` now on disk.
+- `internal/rpc/interceptor.go`: shared-secret gRPC interceptor (client + server halves), `internal/rpc/interceptor_test.go`
+- `nginx.conf`: new `/matchmaking` location block, resolver-based dynamic `proxy_pass` (matchmaking-service has no `docker-compose.yml` entry yet, so a static `upstream{}` block would fail nginx startup)
+- `Makefile`: `proto`/`install-proto-tools` targets
+
+**ADR-041/042 — closes TD-P3-004 (first-move grace period + opponent-never-connects timeout):**
+- Migration 006: `games.activated_at`; `GameStore.ActivateGame` (atomic `WAITING→ACTIVE` + timestamp)
+- `session.go`: new `ACTIVE→ABORTED` edge (retroactive Phase 1/2 behavior change, explicitly confirmed with user before implementing)
+- `manager.go`: generalized timer plumbing (`armTimer`/`cancelTimer`) shared by the ordinary abandon timer and two new timer kinds; `onFirstMoveTimeout`, `onOpponentNeverConnectedTimeout`, `onMovePersisted`; `armTimersForGameStatus`/`armTimersForGame` replace `armAbandonTimersForGame` at all three hydration call sites
+- `move.go`: `MoveProcessor.onMovePersisted` hook (mirrors the existing `Clock→Manager` callback pattern), wired once in `NewManager`
+- `Manager.CreateMatchedGame`: atomic insert, `GameRegistry` registration, `ClaimOwnership`, arms `matchedOpponentConnectTimeout`; idempotent-retry path via `GetGameByMatchmakingRequestID` + `GetOrHydrate`
+- Fixed two categories of resulting Phase 1/2 test breakage: `session_test.go` (state-machine edge moved from invalid to valid), `resolve_test.go` (two crash/failover abandon-timer tests needed to play two moves before simulating the crash, since they test a mechanism ADR-041 now gates behind move count ≥ 2)
+
+**Step 3 — `internal/matchmaking` package:**
+- `pairing.go`: `PairingLoop` (`ZCARD`/`ZPOPMIN`-driven `tick`, `Start`/`stop` mirroring `StartHeartbeat`), `MatchReporter` interface, `pairAndReport` (bounded retries sharing one `matchmakingRequestID`), `reenqueue`
+- `reporter.go`: `grpcMatchReporter`, the concrete `MatchReporter`, context-aware bounded retry with backoff
+- `testmain_test.go`, `pairing_test.go`: integration tests including `TestPairingLoop_ConcurrentTicks_NoDoubleMatch` — two real `Manager`s racing `tick()` concurrently against shared Redis+Postgres, this phase's actual learning objective under direct test
+
+**`matchmaking_active_game:{userID}` marker (ADR-037):**
+- `directory.go`: `ActiveGameMarker`, `SetActiveGameMarker`/`RenewActiveGameMarkersBatch` on `RoutingDirectory`/`RedisDirectory` + tests
+- `heartbeat.go`: `renewActiveGameMarkers`, folded into `heartbeatTick` — re-signs a fresh token per player per tick rather than storing tokens on `GameSession`
+- `manager.go`: eager marker writes at `CreateGame`, `JoinGame` (via a `GetOwner` lookup for the correct `instanceLabel`), and both branches of `CreateMatchedGame`
+
+**Wiring:**
+- `cmd/server/main.go`: optional `PairingLoop`+`grpcMatchReporter` construction/start/stop, gated on `MATCHMAKING_SERVICE_ADDR`
+- `.env.example`: three new optional vars
+
+All confirmed via `go build`, `go vet`, `go test`, `go test -race`, `go test -tags integration -race -p 1`, and `gofmt -l` — all clean, per user-run output.
+
+### Decisions Made
+
+- **Module structure**: `matchmaking-service` builds into its own container but lives in the same `github.com/vedant-2701/chess` Go module (user's explicit call, not formalized as a numbered ADR per user instruction — resolves `internal/auth` importability for `MatchmakingClaims`).
+- **`GameStore.ActivateGame`** as a dedicated method rather than an optional field on `UpdateGameStatus` — every other call site of that method transitions to a terminal status and has no meaningful `activated_at`.
+- **`MatchReporter` as an interface**, not a concrete gRPC type, in `pairing.go` — decoupled `PairingLoop`'s tick logic from the generated protobuf stubs, which didn't exist on disk at the time. Should be flagged as a durable pattern worth keeping even now that the stubs exist.
+- **Heartbeat re-signs tokens fresh each tick** rather than storing them on `GameSession` — a real structural finding, not a style choice: `JoinGame` deliberately never touches a live `GameSession` (may run on a different instance), so a session-held-token design has no way to populate Black's token in that path at all.
+- **`JoinGame`'s marker `instanceLabel`** sourced via a `GetOwner` lookup, not just `m.instanceID` — `JoinGame` can land on a different instance than the one hosting the game; using the wrong label would just push a client to `/resolve` (harmless) but a lookup costs little and is more often correct.
+- **Phase 3 config is entirely optional** (`MATCHMAKING_SERVICE_ADDR` empty ⇒ pairing loop disabled) — every existing single-instance and Phase 2 deployment is unaffected by default.
+
+### Tradeoffs Considered
+
+- Single-module vs. second `go.mod` for matchmaking-service — single module won; a second module would force `MatchmakingClaims` out of `internal/auth` (Go's `internal/` visibility is enforced at the module boundary), duplicating signing code.
+- Re-signing tokens per heartbeat tick vs. storing originals on `GameSession` — re-signing won, for the structural reason above, not performance.
+- Plain `SET` vs. compare-and-swap for `ActiveGameMarker` — plain `SET` won; unlike ownership keys, there is no second legitimate writer per `userID` to race against.
+- Static nginx `upstream{}` block vs. resolver-based dynamic `proxy_pass` — dynamic won; matchmaking-service has no `docker-compose.yml` entry yet, and a static block resolves hostnames at nginx startup, which would take down `/games` and `/connect` too.
+
+### Lessons Learned
+
+- ADR-041's retroactive Phase 1/2 test breakage was real and exactly the shape predicted when confirmation was requested before implementing — worth treating "this will break existing tests" flags in future ADRs as reliable, not cautious over-statement.
+- `JoinGame`'s cross-instance constraint (established in Phase 2) has ripple effects into designs that don't obviously touch `JoinGame` at all — the active-game marker design had to route around it. Worth checking this constraint explicitly whenever a new feature needs anything from a live `GameSession`.
+- **A tool call can fail silently in a way that looks like partial success.** One `edit_file` call with two edits failed entirely (atomic, both-or-nothing) when the second edit's text didn't match — but this wasn't caught until a later, unrelated re-read of the file showed the first edit hadn't landed either. Worth re-reading a file after any multi-edit call whose full diff wasn't shown back, not just assuming "no error" means "fully applied" when a tool's atomicity semantics aren't already known.
+
+### Problems Encountered
+
+- Filesystem MCP server had a hard outage mid-session (two consecutive timeouts reading `resolve.go`) — required pausing and asking the user to restart it. Work resumed cleanly afterward with no lost state, since nothing had been written mid-outage.
+- Two real implementation bugs caught before shipping, not after: `&testBlackID` (Go doesn't allow taking the address of a `const`) in a test file, and `ProcessMove(ctx, session, san)` — missing the `color` argument `move.go`'s actual signature requires. Both caught by re-reading source rather than trusting memory of having written it correctly.
+- The `edit_file` atomic-failure issue described above under Lessons Learned — concretely, this left the "gRPC client" checkbox in `PHASE_3.md` unchecked for a full turn before being caught and fixed.
+
+### Checklist Progress
+
+- **Step 1** (DB + idempotency): ✅ Complete
+- **Step 2** (Proto/gRPC contract): ✅ Complete
+- **Step 3** (`internal/matchmaking`): ✅ Complete except Integration Tests, which is 🔄 partial by design — the remaining scenarios (full queue→SSE→connect flow, 409 check) genuinely depend on Step 4 existing
+- **Step 4** (`matchmaking-service` deployable): ❌ Not started
+- **Step 5** (`ConnectClaimsTTL` config fix): ❌ Not started
+- **Step 6** (nginx): ✅ Complete
+- **Step 7** (Integration Testing, full): ❌ Not started (partially subsumed by Step 3's own tests)
+- **Step 8** (Documentation): 🔄 Partial — `PHASE_3.md` fully current; `ARCHITECTURE.md` **not** updated this session to reflect what's now actually built (still describes decided-but-unimplemented state for everything touched this session); `CLAUDE.md` updated now, in this output
+
+### Technical Debt Introduced
+
+- **TD-P3-005** (new): `Manager.CreateMatchedGame`'s idempotent-retry path does not re-arm `matchedOpponentConnectTimeout` or re-claim ownership, on the assumption neither step could plausibly fail independently of the atomic insert itself. Documented in the method's own doc comment at introduction time, not discovered later. | Phase 3 (implementation) | Not scheduled — same accepted-gap shape as TD-P2-006
+
+### Files Modified
+
+**New:**
+```
+migrations/005_add_matchmaking_request_id.{up,down}.sql
+migrations/006_add_games_activated_at.{up,down}.sql
+proto/matchmakingv1/matchmaking.proto
+proto/matchmakingv1/matchmaking.pb.go          (generated)
+proto/matchmakingv1/matchmaking_grpc.pb.go     (generated)
+internal/rpc/interceptor.go
+internal/rpc/interceptor_test.go
+internal/matchmaking/pairing.go
+internal/matchmaking/reporter.go
+internal/matchmaking/testmain_test.go
+internal/matchmaking/pairing_test.go
+```
+
+**Modified:**
+```
+internal/store/models.go
+internal/store/game_store.go
+internal/store/game_store_test.go
+internal/game/session.go
+internal/game/session_test.go
+internal/game/manager.go
+internal/game/move.go
+internal/game/resolve.go
+internal/game/resolve_test.go
+internal/game/directory.go
+internal/game/directory_test.go
+internal/game/heartbeat.go
+cmd/server/main.go
+.env.example
+nginx.conf
+Makefile
+claude/claude_web_project/phases/current/PHASE_3.md
+```
+
+### Recommended Next Step
+
+**Step 4: stand up `matchmaking-service` as its own deployable.** Start with `cmd/matchmaking-service/main.go` (new binary in the existing module) plus the `docker-compose.yml` entry the nginx block and `PairingLoop`/`grpcMatchReporter` have both been waiting on. `POST /matchmaking/queue` (mint `MatchmakingClaims`, `ZADD ... NX`, ADR-037's two-read check-before-enqueue) is the natural first endpoint, since it's the only one the check-before-enqueue design actually depends on existing before anything else is testable end-to-end. Estimated 3-4 hours for the binary skeleton + first endpoint + its own test scaffolding.
+
+---
+
+## PART 2 — UPDATED CLAUDE.md
+
+```markdown
 # CLAUDE.md — Session Context Document
 
 This file is the authoritative context document for AI-assisted development sessions on this project.
@@ -243,3 +374,4 @@ TD-P3-005: Manager.CreateMatchedGame's idempotent-retry path does not re-arm mat
 ## Next Session
 
 **Step 4: stand up `matchmaking-service` as its own deployable.** Everything chess-server needs to talk to it — `PairingLoop`, `grpcMatchReporter`, the nginx routing block, the shared-secret interceptor — is built and tested, but has never talked to a real server. Start with `cmd/matchmaking-service/main.go` (new binary, same module) and its `docker-compose.yml` entry, then `POST /matchmaking/queue` first (mint `MatchmakingClaims`, `ZADD ... NX`, ADR-037's two-read check-before-enqueue) — the endpoint the check-before-enqueue design most directly depends on existing before anything else is end-to-end testable. **Also outstanding, lower priority**: `ARCHITECTURE.md` needs a reconciliation pass to reflect Steps 1–3's actual implemented state (currently still describes Phase 3 as decided-but-unbuilt for everything landed this session) — same discipline already applied to `PHASE_3.md` throughout, not yet extended to this document.
+```

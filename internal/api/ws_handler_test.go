@@ -49,7 +49,7 @@ func newTestManager(t *testing.T) *game.Manager {
 	validator := internalchess.NewValidator()
 	eventBus := game.NewLocalEventBus()
 	processor := game.NewMoveProcessor(validator, gameStore, moveStore, eventBus)
-	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator, nil, "")
+	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator, nil, "", auth.DefaultConnectClaimsTTL)
 }
 
 // newTestServer wires WSHandler behind a chi router exactly as
@@ -70,8 +70,11 @@ func newTestServer(t *testing.T, manager *game.Manager) *httptest.Server {
 // mustConnectToken mints a ConnectClaims token directly via
 // auth.SignConnectToken, bypassing the full resolve flow — see
 // testInstanceLabel's doc comment for why that's the right scope for these
-// tests. Uses auth.ConnectClaimsTTL (the real production value), not an
-// arbitrary test duration, so these tests exercise the actual expiry window.
+// tests. Uses auth.DefaultConnectClaimsTTL (the real production default
+// value — Manager.ResolveGame's actual injected field is what these tests
+// deliberately bypass, per this function's own doc comment), not an
+// arbitrary test duration, so these tests exercise a realistic expiry
+// window.
 func mustConnectToken(t *testing.T, gameID, userID string, color store.Color) string {
 	t.Helper()
 	claims := auth.ConnectClaims{
@@ -80,7 +83,7 @@ func mustConnectToken(t *testing.T, gameID, userID string, color store.Color) st
 		Color:         string(color),
 		InstanceLabel: testInstanceLabel,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(auth.ConnectClaimsTTL)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(auth.DefaultConnectClaimsTTL)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}
@@ -197,7 +200,7 @@ func TestWSHandler_ExpiredConnectToken_RejectsCleanly(t *testing.T) {
 	}
 
 	// Construct an already-expired ConnectClaims token directly — simulates
-	// the client taking longer than ConnectClaimsTTL (10s) between resolve
+	// the client taking longer than the real ConnectClaimsTTL between resolve
 	// returning and actually dialing.
 	claims := auth.ConnectClaims{
 		GameID:        session.ID,
@@ -206,7 +209,7 @@ func TestWSHandler_ExpiredConnectToken_RejectsCleanly(t *testing.T) {
 		InstanceLabel: testInstanceLabel,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(-1 * time.Second)),
-			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-auth.ConnectClaimsTTL - time.Second)),
+			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-auth.DefaultConnectClaimsTTL - time.Second)),
 		},
 	}
 	expiredToken, err := auth.SignConnectToken(claims, testJWTSecret)

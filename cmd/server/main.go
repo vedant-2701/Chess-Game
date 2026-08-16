@@ -24,6 +24,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/vedant-2701/chess/internal/api"
+	"github.com/vedant-2701/chess/internal/auth"
 	internalchess "github.com/vedant-2701/chess/internal/chess"
 	"github.com/vedant-2701/chess/internal/game"
 	"github.com/vedant-2701/chess/internal/matchmaking"
@@ -75,6 +76,13 @@ type config struct {
 	MatchmakingServiceAddr       string
 	MatchmakingSharedSecret      string
 	MatchmakingPairingIntervalMs int
+
+	// ConnectClaimsTTL is PHASE_3.md Step 5's fix — previously a hardcoded
+	// 60s constant in internal/auth (auth.ConnectClaimsTTL, now renamed
+	// DefaultConnectClaimsTTL and only a fallback default) despite that
+	// constant's own doc comment always claiming 10s. Optional — falls back
+	// to auth.DefaultConnectClaimsTTL if CONNECT_CLAIMS_TTL_SECONDS is unset.
+	ConnectClaimsTTL time.Duration
 }
 
 // loadConfig reads and validates required environment variables. DATABASE_URL
@@ -149,6 +157,18 @@ func loadConfig() (config, error) {
 		// explicitly left it as "sane default TBD at implementation time," not
 		// a decision requiring one.
 		cfg.MatchmakingPairingIntervalMs = 500
+	}
+
+	// CONNECT_CLAIMS_TTL_SECONDS: optional, PHASE_3.md Step 5. Same
+	// safe-default-on-any-parse-failure treatment as SKIP_MIGRATIONS above —
+	// an unrecognized or absent value falls back to
+	// auth.DefaultConnectClaimsTTL, not zero (a zero-second TTL would mint
+	// tokens that expire before any client could possibly use them).
+	connectClaimsTTLSeconds, parseErr := strconv.Atoi(os.Getenv("CONNECT_CLAIMS_TTL_SECONDS"))
+	if parseErr != nil || connectClaimsTTLSeconds <= 0 {
+		cfg.ConnectClaimsTTL = auth.DefaultConnectClaimsTTL
+	} else {
+		cfg.ConnectClaimsTTL = time.Duration(connectClaimsTTLSeconds) * time.Second
 	}
 
 	return cfg, nil
@@ -237,7 +257,7 @@ func main() {
 	eventBus := game.NewLocalEventBus()
 	processor := game.NewMoveProcessor(validator, gameStore, moveStore, eventBus)
 	registry := game.NewGameRegistry()
-	manager := game.NewManager(registry, processor, gameStore, moveStore, eventBus, cfg.JWTSecret, validator, directory, cfg.InstanceID)
+	manager := game.NewManager(registry, processor, gameStore, moveStore, eventBus, cfg.JWTSecret, validator, directory, cfg.InstanceID, cfg.ConnectClaimsTTL)
 
 	// PHASE_2.md Step 8 / DECISIONS_LOG_PHASE_2.md ADR-024: RestoreActiveGames
 	// is deliberately NOT called here anymore. Manager.HandleConnect's

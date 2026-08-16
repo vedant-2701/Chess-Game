@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/vedant-2701/chess/internal/auth"
 	internalchess "github.com/vedant-2701/chess/internal/chess"
 	"github.com/vedant-2701/chess/internal/game"
 	"github.com/vedant-2701/chess/internal/store"
@@ -115,5 +116,5 @@ func newTestManager(t *testing.T, instanceID string) *game.Manager {
 	moveStore := store.NewMoveStore(testPool)
 	processor := game.NewMoveProcessor(validator, gameStore, moveStore, eventBus)
 	registry := game.NewGameRegistry()
-	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator, directory, instanceID)
+	return game.NewManager(registry, processor, gameStore, moveStore, eventBus, testJWTSecret, validator, directory, instanceID, auth.DefaultConnectClaimsTTL)
 }

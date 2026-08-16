@@ -34,7 +34,7 @@ func newTestManagerWithDirectory(t *testing.T, instanceID string) *Manager {
 	validator := internalchess.NewValidator()
 	processor := NewMoveProcessor(validator, gameStore, moveStore, bus)
 	directory := NewRedisDirectory(testRedisClient)
-	return NewManager(registry, processor, gameStore, moveStore, bus, resolveTestJWTSecret, validator, directory, instanceID)
+	return NewManager(registry, processor, gameStore, moveStore, bus, resolveTestJWTSecret, validator, directory, instanceID, auth.DefaultConnectClaimsTTL)
 }
 
 func TestManager_ResolveGame_FreshClaim(t *testing.T) {

@@ -201,8 +201,9 @@ func TestVerifyPlayerToken(t *testing.T) {
 
 const testInstanceLabel = "instance-a"
 
-// validConnectClaims returns a ConnectClaims set with auth.ConnectClaimsTTL's
-// expiry — ADR-022's actual production shape, not an arbitrary test value.
+// validConnectClaims returns a ConnectClaims set with
+// auth.DefaultConnectClaimsTTL's expiry — ADR-022's actual production
+// default shape, not an arbitrary test value.
 func validConnectClaims() auth.ConnectClaims {
 	return auth.ConnectClaims{
 		GameID:        testGameID,
@@ -210,7 +211,7 @@ func validConnectClaims() auth.ConnectClaims {
 		Color:         testColor,
 		InstanceLabel: testInstanceLabel,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(auth.ConnectClaimsTTL)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(auth.DefaultConnectClaimsTTL)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}
@@ -289,7 +290,7 @@ func TestVerifyConnectToken(t *testing.T) {
 						// bug), just past its short window — e.g. the client took
 						// too long between resolve and dialing the WS.
 						ExpiresAt: jwt.NewNumericDate(time.Now().Add(-1 * time.Second)),
-						IssuedAt:  jwt.NewNumericDate(time.Now().Add(-auth.ConnectClaimsTTL - time.Second)),
+						IssuedAt:  jwt.NewNumericDate(time.Now().Add(-auth.DefaultConnectClaimsTTL - time.Second)),
 					},
 				}
 				tok, err := auth.SignConnectToken(claims, testSecret)
@@ -428,12 +429,16 @@ func TestVerifyConnectToken(t *testing.T) {
 }
 
 // TestConnectClaims_TTLIsShort guards against a regression where someone
-// "fixes" a perceived bug by widening ConnectClaimsTTL to something
+// "fixes" a perceived bug by widening DefaultConnectClaimsTTL to something
 // PlayerClaims-like (hours) — that would silently defeat ADR-022's whole
 // point (a routing credential that's only ever valid for the resolve→dial
-// gap, not a general-purpose session token).
+// gap, not a general-purpose session token). Only guards the DEFAULT value
+// — the actual enforced TTL is internal/game.Manager's injected field
+// (PHASE_3.md Step 5), which this package-level test cannot see; a
+// misconfigured CONNECT_CLAIMS_TTL_SECONDS env var is not something this
+// test can catch.
 func TestConnectClaims_TTLIsShort(t *testing.T) {
-	if auth.ConnectClaimsTTL > time.Minute {
-		t.Fatalf("ConnectClaimsTTL = %s, expected a short (seconds-scale) routing-credential lifetime, not a session-token-scale one", auth.ConnectClaimsTTL)
+	if auth.DefaultConnectClaimsTTL > time.Minute {
+		t.Fatalf("DefaultConnectClaimsTTL = %s, expected a short (seconds-scale) routing-credential lifetime, not a session-token-scale one", auth.DefaultConnectClaimsTTL)
 	}
 }

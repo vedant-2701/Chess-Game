@@ -69,13 +69,26 @@ func VerifyPlayerToken(tokenString string, secret string) (*PlayerClaims, error)
 
 // --- PHASE_2.md Step 4: ConnectClaims ---------------------------------------
 
-// ConnectClaimsTTL is the fixed lifetime of a ConnectClaims token, per
+// DefaultConnectClaimsTTL is ConnectClaimsTTL's default value
+// (PHASE_3.md Step 5) when CONNECT_CLAIMS_TTL_SECONDS is unset, per
 // DECISIONS_LOG_PHASE_2.md ADR-022: deliberately short (10s) since it only
 // needs to survive the gap between a resolve response and the client's
 // immediately-following WebSocket dial — not a reconnection window like
-// PlayerClaims' 24h. Exported so Step 5's resolve handler has a single
-// source of truth rather than hardcoding "10 * time.Second" at the mint site.
-const ConnectClaimsTTL = 60 * time.Second
+// PlayerClaims' 24h.
+//
+// **Fixed here (PHASE_3.md Step 5):** this was hardcoded at 60s, with this
+// exact doc comment already claiming "10s" — changed for local
+// manual-testing convenience at some point and never reverted. Corrected to
+// match the value the doc comment (and ADR-022) always claimed.
+//
+// Not read directly by SignConnectToken's production call site anymore
+// (internal/game.Manager holds its own resolved TTL, injected via
+// NewManager, per CODING_GUIDELINES.md §5's no-global-state rule — a
+// package-level var read directly at the mint site would have been the
+// simpler fix but violates that rule). This constant is now only the
+// well-known default value cmd/server/main.go falls back to when
+// CONNECT_CLAIMS_TTL_SECONDS is unset, and token_test.go's fixture value.
+const DefaultConnectClaimsTTL = 10 * time.Second
 
 // ConnectClaims are the JWT claims embedded in the short-lived routing
 // credential minted by the Step 5 resolve endpoint (GET /games/:id/resolve)
@@ -102,11 +115,13 @@ type ConnectClaims struct {
 
 // SignConnectToken creates a signed HS256 JWT from the provided claims.
 // The caller must set ExpiresAt in RegisteredClaims before calling —
-// time.Now().Add(ConnectClaimsTTL) per ADR-022. Signed with the same secret
-// as SignPlayerToken (ADR-022: "same signing key as PlayerClaims") — there is
-// only ever one JWT signing secret in this codebase; ConnectClaims and
-// PlayerClaims are distinguished by their claim shape and by which endpoint
-// accepts which, not by using different keys.
+// time.Now().Add(<the resolved ConnectClaimsTTL>) per ADR-022 — see
+// internal/game.Manager's connectClaimsTTL field, not this package's
+// DefaultConnectClaimsTTL directly (PHASE_3.md Step 5). Signed with the same
+// secret as SignPlayerToken (ADR-022: "same signing key as PlayerClaims") —
+// there is only ever one JWT signing secret in this codebase; ConnectClaims
+// and PlayerClaims are distinguished by their claim shape and by which
+// endpoint accepts which, not by using different keys.
 func SignConnectToken(claims ConnectClaims, secret string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString([]byte(secret))
@@ -120,11 +135,10 @@ func SignConnectToken(claims ConnectClaims, secret string) (string, error) {
 // VerifyConnectToken parses and validates a signed connect token.
 //
 // Returns ErrTokenExpired if the token is structurally valid but past its
-// expiry time — the expected, common case given ConnectClaimsTTL's
-// deliberately short 10s window (PHASE_2.md Step 5 requires the WebSocket
-// upgrade handler to reject this cleanly, not panic or hang, and to signal
-// the client should re-call resolve rather than retry the stale masked URL).
-// Returns ErrTokenInvalid for all other failures: wrong secret, tampered
+// expiry time — the expected, common case given ConnectClaims' deliberately
+// short window (PHASE_2.md Step 5 requires the WebSocket upgrade handler to
+// reject this cleanly, not panic or hang, and to signal the client should
+// re-call resolve rather than retry the stale masked URL). Returns ErrTokenInvalid for all other failures: wrong secret, tampered
 // payload, unsupported signing algorithm, or malformed token string. Reuses
 // the same two sentinels as VerifyPlayerToken rather than introducing
 // ConnectClaims-specific ones — the failure semantics are identical for both
@@ -142,6 +156,80 @@ func SignConnectToken(claims ConnectClaims, secret string) (string, error) {
 // against?), not a property the auth package can enforce generically.
 func VerifyConnectToken(tokenString string, secret string) (*ConnectClaims, error) {
 	claims := &ConnectClaims{}
+
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (any, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+
+	if err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, ErrTokenExpired
+		}
+		return nil, fmt.Errorf("%w: %v", ErrTokenInvalid, err)
+	}
+
+	if !token.Valid {
+		return nil, ErrTokenInvalid
+	}
+
+	return claims, nil
+}
+
+// --- PHASE_3.md Step 4: MatchmakingClaims -----------------------------------
+
+// DefaultMatchmakingClaimsTTL is MatchmakingClaimsTTL's default value
+// (DECISIONS_LOG_PHASE_3.md ADR-036 §15's addendum: "MatchmakingClaimsTTL
+// env-configurable, default 10s") when MATCHMAKING_CLAIMS_TTL_SECONDS is
+// unset. Not read directly by SignMatchmakingToken's production call site
+// (internal/mmsvc.Handler holds its own resolved TTL, injected via
+// NewHandler — same no-global-state reasoning as
+// DefaultConnectClaimsTTL above). Only the well-known default value
+// cmd/matchmaking-service/main.go falls back to when unset.
+const DefaultMatchmakingClaimsTTL = 10 * time.Second
+
+// MatchmakingClaims are the JWT claims scoping a player's matchmaking queue
+// session: POST /matchmaking/queue's response, and the credential presented
+// to GET /matchmaking/stream, GET /matchmaking/status, and
+// DELETE /matchmaking/queue (DECISIONS_LOG_PHASE_3.md ADR-036). A distinct
+// type from PlayerClaims — not a reuse with an empty GameID — because
+// PlayerClaims.GameID has no meaningful value at queue-time (the whole
+// point of matchmaking is that no game exists yet), and inventing a
+// placeholder would corrupt PlayerClaims' meaning for every other consumer.
+// Same signing secret as PlayerClaims/ConnectClaims — this codebase's
+// existing one-secret/multiple-claim-shapes convention, not a new key.
+type MatchmakingClaims struct {
+	UserID string `json:"user_id"`
+	jwt.RegisteredClaims
+}
+
+// SignMatchmakingToken creates a signed HS256 JWT from the provided claims.
+// The caller must set ExpiresAt in RegisteredClaims before calling —
+// time.Now().Add(<the resolved MatchmakingClaimsTTL>), same pattern as
+// SignConnectToken — see internal/mmsvc.Handler's matchmakingClaimsTTL
+// field, not this package's DefaultMatchmakingClaimsTTL directly.
+func SignMatchmakingToken(claims MatchmakingClaims, secret string) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("auth.SignMatchmakingToken userID=%s: %w", claims.UserID, err)
+	}
+	return signed, nil
+}
+
+// VerifyMatchmakingToken parses and validates a signed matchmaking token.
+// Same sentinel-error contract as VerifyPlayerToken/VerifyConnectToken
+// (ErrTokenExpired vs. ErrTokenInvalid) and the same HS256-only enforcement
+// against algorithm confusion attacks. Not yet called anywhere in this
+// commit — the endpoints that verify this token (GET /matchmaking/stream,
+// GET /matchmaking/status, DELETE /matchmaking/queue) are later Step 4
+// checklist items — but defined alongside Sign for the same reason
+// VerifyConnectToken sits next to SignConnectToken: one token type, one
+// place its full Sign/Verify contract lives.
+func VerifyMatchmakingToken(tokenString string, secret string) (*MatchmakingClaims, error) {
+	claims := &MatchmakingClaims{}
 
 	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {

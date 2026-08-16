@@ -100,6 +100,8 @@ services:
       REDIS_ADDR: redis:6379
       INSTANCE_ID: server1
       SKIP_MIGRATIONS: "true"
+      MATCHMAKING_SERVICE_ADDR: matchmaking-service:9090
+      MATCHMAKING_SHARED_SECRET: ${MATCHMAKING_SHARED_SECRET}
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,6 +127,8 @@ services:
       REDIS_ADDR: redis:6379
       INSTANCE_ID: server2
       SKIP_MIGRATIONS: "true"
+      MATCHMAKING_SERVICE_ADDR: matchmaking-service:9090
+      MATCHMAKING_SHARED_SECRET: ${MATCHMAKING_SHARED_SECRET}
     depends_on:
       postgres:
         condition: service_healthy
@@ -134,6 +138,37 @@ services:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- PHASE_3.md Step 4: matchmaking-service ---------------------------
+  # A separate deployable in the same github.com/vedant-2701/chess Go
+  # module (DECISIONS_LOG_PHASE_3.md ADR-032) but its own container/image,
+  # built from Dockerfile.matchmaking-service rather than the root
+  # Dockerfile. No DATABASE_URL — this service never talks to Postgres
+  # (ARCHITECTURE.md's Matchmaking section). Port 8081 matches nginx.conf's
+  # /matchmaking location block's own hardcoded assumption
+  # (matchmaking-service:8081) — that assumption is what this entry
+  # finalizes.
+  matchmaking-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.matchmaking-service
+    container_name: chess_matchmaking_service
+    profiles: ["cluster"]
+    environment:
+      REDIS_ADDR: redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      MATCHMAKING_SHARED_SECRET: ${MATCHMAKING_SHARED_SECRET}
+      MATCHMAKING_SVC_PORT: "8081"
+      MATCHMAKING_SVC_GRPC_PORT: "9090"
+      LOG_LEVEL: info
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/health"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -151,6 +186,12 @@ services:
         condition: service_healthy
       server2:
         condition: service_healthy
+      # Deliberately NOT depends_on: matchmaking-service here — nginx.conf's
+      # /matchmaking location block uses a resolver-based dynamic
+      # proxy_pass specifically so nginx starts fine independent of this
+      # service's health (nginx.conf's own comment on that location block).
+      # Adding a hard dependency here would defeat that design: it would
+      # make /games and /connect wait on matchmaking-service's health too.
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
       interval: 5s
