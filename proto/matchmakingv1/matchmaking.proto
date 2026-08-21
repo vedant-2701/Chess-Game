@@ -32,12 +32,28 @@ service MatchReportService {
 // (short-TTL "reported:<gameID>" Redis key, checked before pushing SSE) —
 // covers a chess-server retry after a lost ACK without double-delivering
 // MATCH_FOUND.
+//
+// Two token pairs, not one — PHASE_3_DESIGN_NOTES.md §18 (2026-08-17):
+// *_player_token is the long-lived PlayerClaims (unchanged from this
+// proto's original design — same tokens already used for the active-game
+// marker, ADR-037), kept as the fallback credential for a LATER reconnect
+// via GET /games/{id}/resolve. *_connect_token is a freshly-minted,
+// short-lived ConnectClaims (carries instance_label, unlike PlayerClaims)
+// — safe to mint here because CreateMatchedGame runs on the exact instance
+// that will own the game, synchronously, so there is no staleness window
+// between minting and delivery, unlike the marker's read pattern (which
+// may be read an arbitrary time after being written and genuinely needs
+// PlayerClaims + a fresh /resolve call). matchmaking-service relays
+// connect_token as MATCH_FOUND's directly-dialable credential and
+// player_token as the fallback if that dial is ever rejected as stale.
 message MatchCreatedRequest {
-  string game_id        = 1;
-  string white_user_id  = 2;
-  string black_user_id  = 3;
-  string white_token    = 4;  // signed PlayerClaims, same shape /resolve issues today
-  string black_token    = 5;
+  string game_id             = 1;
+  string white_user_id       = 2;
+  string black_user_id       = 3;
+  string white_player_token  = 4;  // signed PlayerClaims — renamed from white_token (§18); same value/shape, honest name
+  string black_player_token  = 5;
+  string white_connect_token = 7;  // signed ConnectClaims — NEW (§18), directly dialable, no /resolve needed
+  string black_connect_token = 8;
   // instance_label, not instance_id — matches the field name already used
   // end-to-end in the real codebase (auth.ConnectClaims.InstanceLabel,
   // Manager.ResolveGame's instanceLabel return value, nginx.conf's

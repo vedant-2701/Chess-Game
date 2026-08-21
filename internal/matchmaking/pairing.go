@@ -54,8 +54,12 @@ const defaultMaxCreateAttempts = 3
 // with bounded backoff and log-and-return on final exhaustion — PairingLoop
 // does not retry on top of whatever the implementation already did.
 type MatchReporter interface {
-	// ReportMatchCreated reports a successful CreateMatchedGame.
-	ReportMatchCreated(ctx context.Context, gameID, whiteUserID, blackUserID, whiteToken, blackToken, instanceLabel string) error
+	// ReportMatchCreated reports a successful CreateMatchedGame. Takes
+	// game.MatchedGameTokens (PHASE_3_DESIGN_NOTES.md §18, 2026-08-17), not
+	// four bare token strings — both a PlayerClaims pair and a ConnectClaims
+	// pair now need reporting, not just the PlayerClaims pair this method
+	// originally took.
+	ReportMatchCreated(ctx context.Context, gameID, whiteUserID, blackUserID string, tokens game.MatchedGameTokens, instanceLabel string) error
 
 	// ReportMatchmakingFailed reports a confirmed, terminal CreateMatchedGame
 	// failure (retries exhausted) for a specific pair.
@@ -198,12 +202,12 @@ func (l *PairingLoop) pairAndReport(ctx context.Context, whiteUserID string, whi
 	requestID := uuid.New().String()
 
 	var (
-		session                *game.GameSession
-		whiteToken, blackToken string
-		err                    error
+		session *game.GameSession
+		tokens  game.MatchedGameTokens
+		err     error
 	)
 	for attempt := 1; attempt <= l.maxCreateAttempts; attempt++ {
-		session, whiteToken, blackToken, err = l.manager.CreateMatchedGame(ctx, whiteUserID, blackUserID, requestID)
+		session, tokens, err = l.manager.CreateMatchedGame(ctx, whiteUserID, blackUserID, requestID)
 		if err == nil {
 			break
 		}
@@ -226,7 +230,7 @@ func (l *PairingLoop) pairAndReport(ctx context.Context, whiteUserID string, whi
 		return
 	}
 
-	if reportErr := l.reporter.ReportMatchCreated(ctx, session.ID, whiteUserID, blackUserID, whiteToken, blackToken, l.instanceID); reportErr != nil {
+	if reportErr := l.reporter.ReportMatchCreated(ctx, session.ID, whiteUserID, blackUserID, tokens, l.instanceID); reportErr != nil {
 		slog.Error("PairingLoop: ReportMatchCreated failed",
 			"gameID", session.ID, "whiteUserID", whiteUserID, "blackUserID", blackUserID, "error", reportErr)
 	}

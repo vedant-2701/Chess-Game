@@ -563,7 +563,7 @@ func TestRedisDirectory_SetActiveGameMarker_ThenRenew(t *testing.T) {
 
 	marker := ActiveGameMarker{
 		GameID:        uuid.NewString(),
-		ConnectToken:  "fake-token",
+		PlayerToken:   "fake-token",
 		InstanceLabel: "instance-a",
 		WSPath:        "/connect/instance-a",
 	}
@@ -596,7 +596,7 @@ func TestRedisDirectory_SetActiveGameMarker_ThenRenew(t *testing.T) {
 	// re-signs a fresh token every tick (Manager.renewActiveGameMarkers), so
 	// the content genuinely does change between renewals in production.
 	updated := marker
-	updated.ConnectToken = "fake-token-v2"
+	updated.PlayerToken = "fake-token-v2"
 	if err := d.RenewActiveGameMarkersBatch(ctx, map[string]ActiveGameMarker{userID: updated}); err != nil {
 		t.Fatalf("RenewActiveGameMarkersBatch: %v", err)
 	}
@@ -609,8 +609,8 @@ func TestRedisDirectory_SetActiveGameMarker_ThenRenew(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &gotAfterRenew); err != nil {
 		t.Fatalf("unmarshal renewed marker: %v", err)
 	}
-	if gotAfterRenew.ConnectToken != "fake-token-v2" {
-		t.Errorf("ConnectToken after renew: got %q, want %q", gotAfterRenew.ConnectToken, "fake-token-v2")
+	if gotAfterRenew.PlayerToken != "fake-token-v2" {
+		t.Errorf("PlayerToken after renew: got %q, want %q", gotAfterRenew.PlayerToken, "fake-token-v2")
 	}
 }
 
@@ -621,8 +621,8 @@ func TestRedisDirectory_RenewActiveGameMarkersBatch_MultipleUsers(t *testing.T) 
 
 	userA, userB := uuid.NewString(), uuid.NewString()
 	markers := map[string]ActiveGameMarker{
-		userA: {GameID: "game-a", ConnectToken: "token-a", InstanceLabel: "instance-a", WSPath: "/connect/instance-a"},
-		userB: {GameID: "game-b", ConnectToken: "token-b", InstanceLabel: "instance-a", WSPath: "/connect/instance-a"},
+		userA: {GameID: "game-a", PlayerToken: "token-a", InstanceLabel: "instance-a", WSPath: "/connect/instance-a"},
+		userB: {GameID: "game-b", PlayerToken: "token-b", InstanceLabel: "instance-a", WSPath: "/connect/instance-a"},
 	}
 	if err := d.RenewActiveGameMarkersBatch(ctx, markers); err != nil {
 		t.Fatalf("RenewActiveGameMarkersBatch: %v", err)

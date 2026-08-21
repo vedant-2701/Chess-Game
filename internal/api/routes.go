@@ -26,6 +26,7 @@ import (
 // process, instead of routes.go silently creating its own.
 func NewRouter(manager *game.Manager, userStore *store.UserStore, wsRegistry *ws.Registry, jwtSecret string, wsCtx context.Context) http.Handler {
 	gameHandler := NewGameHandler(manager, userStore, jwtSecret)
+	authHandler := NewAuthHandler(userStore)
 	wsHandler := NewWSHandler(wsCtx, manager, wsRegistry, jwtSecret)
 
 	r := chi.NewRouter()
@@ -42,6 +43,8 @@ func NewRouter(manager *game.Manager, userStore *store.UserStore, wsRegistry *ws
 	r.Post("/games/{id}/join", gameHandler.JoinGame)
 	r.Get("/games/{id}", gameHandler.GetGame)
 	r.Get("/games/{id}/resolve", gameHandler.Resolve)
+	r.Post("/users", authHandler.Register)
+	r.Post("/login", authHandler.Login)
 	r.Get("/health", gameHandler.Health)
 	r.Get("/connect/{instanceLabel}", wsHandler.ServeHTTP)
 

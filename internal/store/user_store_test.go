@@ -102,3 +102,89 @@ func TestUserStore_GetUser(t *testing.T) {
 		}
 	})
 }
+
+// --- PHASE_3.md addendum: username/password login (fixes TD-P3-007) -------
+
+func TestUserStore_CreateUserWithCredentials(t *testing.T) {
+	us := newUserStore()
+	ctx := context.Background()
+
+	t.Run("creates a new user and returns a generated ID", func(t *testing.T) {
+		truncateAll(t)
+
+		user, err := us.CreateUserWithCredentials(ctx, "alice", "$2a$10$fakehashfaketestingonly")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if user.ID == "" {
+			t.Error("expected a generated (non-empty) ID")
+		}
+		if user.CreatedAt.IsZero() {
+			t.Error("CreatedAt should be non-zero")
+		}
+	})
+
+	t.Run("returns ErrUsernameTaken on a duplicate username", func(t *testing.T) {
+		truncateAll(t)
+
+		if _, err := us.CreateUserWithCredentials(ctx, "bob", "$2a$10$firsthash"); err != nil {
+			t.Fatalf("first call: %v", err)
+		}
+
+		_, err := us.CreateUserWithCredentials(ctx, "bob", "$2a$10$secondhash")
+		if !errors.Is(err, ErrUsernameTaken) {
+			t.Errorf("expected ErrUsernameTaken, got: %v", err)
+		}
+	})
+
+	t.Run("two different usernames do not collide", func(t *testing.T) {
+		truncateAll(t)
+
+		u1, err := us.CreateUserWithCredentials(ctx, "carol", "$2a$10$hash1")
+		if err != nil {
+			t.Fatalf("carol: %v", err)
+		}
+		u2, err := us.CreateUserWithCredentials(ctx, "dave", "$2a$10$hash2")
+		if err != nil {
+			t.Fatalf("dave: %v", err)
+		}
+		if u1.ID == u2.ID {
+			t.Errorf("expected distinct IDs, both got %q", u1.ID)
+		}
+	})
+}
+
+func TestUserStore_GetUserIDAndPasswordHashByUsername(t *testing.T) {
+	us := newUserStore()
+	ctx := context.Background()
+
+	t.Run("returns the ID and hash for a registered username", func(t *testing.T) {
+		truncateAll(t)
+
+		const hash = "$2a$10$knownhashvalue"
+		created, err := us.CreateUserWithCredentials(ctx, "erin", hash)
+		if err != nil {
+			t.Fatalf("CreateUserWithCredentials: %v", err)
+		}
+
+		id, gotHash, err := us.GetUserIDAndPasswordHashByUsername(ctx, "erin")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if id != created.ID {
+			t.Errorf("ID: got %q, want %q", id, created.ID)
+		}
+		if gotHash != hash {
+			t.Errorf("hash: got %q, want %q", gotHash, hash)
+		}
+	})
+
+	t.Run("returns ErrUserNotFound for an unregistered username", func(t *testing.T) {
+		truncateAll(t)
+
+		_, _, err := us.GetUserIDAndPasswordHashByUsername(ctx, "nobody")
+		if !errors.Is(err, ErrUserNotFound) {
+			t.Errorf("expected ErrUserNotFound, got: %v", err)
+		}
+	})
+}

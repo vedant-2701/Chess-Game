@@ -742,3 +742,189 @@ both.
   eliminate, the window for the two to partially diverge under the
   existing best-effort/non-fatal persistence semantics already governing
   that write.
+
+---
+
+## 18. Matched-Game Connect Flow — Skip `/resolve` on First Connect (IMPLEMENTED, 2026-08-17)
+
+**Status: IMPLEMENTED and verified (`go build`/`vet`/`test -race`/
+`test -tags integration -race`/`gofmt` all clean, 2026-08-17). Formal ADR
+written as `DECISIONS_LOG_PHASE_3.md` ADR-044, per this document's own
+rule (§16: "a formal ADR should be written once resolved, not before") —
+this section is retained as the full trace/rationale record, same relation
+to its ADR as §17 has to ADR-041/042.**
+
+### 18.1 The bug that surfaced this
+
+Running `e2e-phase3.sh scenario1` against a live cluster: `WSHandler`
+rejected the WebSocket dial from `MATCH_FOUND`'s `connectToken` with 401,
+logging `token instanceLabel does not match URL, tokenInstanceLabel=""`.
+Decoding the JWT confirmed why: `{"game_id":...,"user_id":...,"color":
+"WHITE","exp":...}` — a `PlayerClaims` payload, no `instance_label` claim
+at all. Traced to §13's own decision, confirmed accurate: `connectToken` in
+the active-game marker (and everything downstream of it — the 409
+response, and, it turns out, `MATCH_FOUND` too, since `ReportMatchCreated`
+relays the exact same `white_token`/`black_token` gRPC fields into both)
+is deliberately the player's long-lived `PlayerClaims`, not a dialable
+`ConnectClaims` — §13's own text: *"confirmed safe to mint once and
+republish unchanged on every renewal with no staleness risk."*
+
+That reasoning is correct **for the marker's actual read pattern**: a 409
+check or a heartbeat-renewed key might be read an arbitrary, unbounded time
+after it was last written, so a short-lived `ConnectClaims` minted at write
+time would frequently already be dead by read time — `PlayerClaims` +
+force a fresh `/resolve` call at read time is the right call there.
+
+**But `MATCH_FOUND` doesn't have that staleness problem.**
+`CreateMatchedGame` runs on one specific instance, claims ownership on
+itself synchronously, right there — and the gRPC report to
+matchmaking-service happens essentially instantly afterward. There is no
+meaningful time for staleness to accumulate between minting and delivery.
+The current design reuses the *marker's* token (built for a different
+read pattern) for `MATCH_FOUND` purely because both happen to be minted in
+the same `CreateMatchedGame` call — not because it's the right credential
+for that moment. §13 never actually traced `MATCH_FOUND`'s own read
+pattern separately from the marker's; it should have.
+
+### 18.2 What changes, and what doesn't
+
+**Confirmed by the person, explicitly:** skip `/resolve` on the initial
+"just matched" connection; keep `/resolve` required for any *later*
+reconnect. This is not a shortcut around `/resolve` — it's recognizing
+that `MATCH_FOUND` delivery and a later reconnect attempt are genuinely
+different moments with genuinely different staleness exposure, the same
+distinction §13 already draws between the marker (needs `/resolve`) and
+nothing (nothing in this codebase currently skips it) — this proposal adds
+the first case that does, for a reasoned, specific reason, not a general
+relaxation.
+
+**A consequence traced through that wasn't in the person's original ask,
+worth confirming before implementing:** if `MATCH_FOUND` (and the
+equivalent `GET /matchmaking/status` "matched" response, which reads the
+same `matchmaking_result:{userID}` record `ReportMatchCreated` writes) only
+ever carried the fresh `ConnectClaims` and nothing else, a client that
+receives it late — offline when the SSE push fired, only polls `/status`
+minutes later — would get back an *already-expired* `ConnectClaims`
+(exactly the marker's own staleness problem, just relocated one level up).
+The fix has to include a fallback credential in the same response, not
+just the fast path: **`MATCH_FOUND` and the "matched" status payload both
+carry the fresh `connectToken` (dial immediately) AND the `playerToken`
+(24h, unaffected by any of this) side by side.** A client that gets an
+expired/rejected `connectToken` falls back to `/resolve` using
+`playerToken` — identical recovery shape to the marker's own
+"stale `instanceLabel` fails cleanly, client falls back to `/resolve`"
+property (§13, Failover staleness paragraph), just applied one layer up.
+This is why `/resolve` isn't being removed from the system anywhere — it
+remains the correct, necessary fallback for exactly the case it already
+covers; this proposal only skips it for the one case where skipping it is
+provably safe (zero elapsed time between mint and delivery).
+
+**A second consequence, purely a naming problem, but a real one:** once
+`MATCH_FOUND`'s `connectToken` field becomes a genuinely different *type*
+of credential than the 409 response's `connectToken` field (dialable vs.
+not), they can no longer share the exact same field name across both
+response shapes — that is precisely the "same JSON shape, different actual
+meaning" trap that caused 18.1's bug in the first place, just moved to a
+different pair of endpoints instead of fixed. The 409/marker's field is
+renamed `playerToken` throughout (it always was one; the current name was
+simply wrong, not a new decision) — propagating into `directory.go`'s
+`ActiveGameMarker`, `mmsvc/queue.go`'s mirrored `activeGameMarker`, and
+`mmsvc/response.go`'s `existingGame`. `matchFoundData` stops being a type
+alias of `existingGame` (`internal/mmsvc/hub.go`'s `type matchFoundData =
+existingGame`) — the two shapes have genuinely diverged now, and forcing
+them to stay identical would just reintroduce the same trap under a
+different name.
+
+### 18.3 Proposed new flow
+
+```
+1. Client A/B  -> POST /matchmaking/queue   -> matchmaking-service  (unchanged)
+2. Client A/B  -> GET  /matchmaking/stream  -> matchmaking-service  (unchanged, SSE held open)
+
+3. instance-2's pairing loop wins the pair, runs CreateMatchedGame:
+       -> atomic INSERT                                    -> Postgres
+       -> registry.Register(session), ClaimOwnership        -> local + Redis   (unchanged)
+       -> mints whitePlayerToken/blackPlayerToken  (PlayerClaims, 24h)         (unchanged —
+          same tokens already used for the active-game marker, ADR-037)
+       -> ALSO mints whiteConnectToken/blackConnectToken    (ConnectClaims,
+          m.connectClaimsTTL, instanceLabel="instance-2")   <-- NEW
+
+4. instance-2 -> gRPC MatchCreated(gameID, userA, userB,
+                    whitePlayerToken, blackPlayerToken,      <-- renamed from white_token/black_token
+                    whiteConnectToken, blackConnectToken,    <-- NEW proto fields
+                    instanceLabel="instance-2")
+             -> matchmaking-service
+
+5. matchmaking-service:
+       -> SetResult(userA, {status:"matched", gameID, connectToken:whiteConnectToken,
+                             playerToken:whitePlayerToken, instanceLabel, wsPath})
+       -> Hub.Notify(userA, MATCH_FOUND, <same shape>)
+       -> (mirror for userB)
+
+6. Client A/B: dial wsPath directly with connectToken — NO /resolve call.
+   If that dial is rejected (connectToken expired/stale — late SSE delivery,
+   long offline gap before a /status poll): fall back to
+   GET /games/{gameID}/resolve with Authorization: Bearer playerToken,
+   exactly the existing reconnect path, unchanged.
+```
+
+**Unrelated, unaffected by any of this:** the active-game marker itself
+(written directly by `CreateGame`/`JoinGame`/`CreateMatchedGame`, read by
+matchmaking-service's 409 check) keeps using `playerToken` exactly as §13
+already decided — that read pattern's staleness exposure is real and
+unchanged by this proposal.
+
+### 18.4 Concrete touch points (for review, not yet applied)
+
+| File | Change |
+|---|---|
+| `proto/matchmakingv1/matchmaking.proto` | `MatchCreatedRequest`: rename `white_token`/`black_token` → `white_player_token`/`black_player_token`; add `white_connect_token`/`black_connect_token`. Requires `make proto` regen. |
+| `internal/auth/token.go` | `DefaultConnectClaimsTTL`: 10s → **30s** (person's explicit request — "10s is too short, network blip or reopen, 20-30s won't cause issues"; picking 30s as the round value). Already env-configurable since Step 5 (`CONNECT_CLAIMS_TTL_SECONDS`) — only the *default* changes. `TestConnectClaims_TTLIsShort`'s `> time.Minute` threshold still holds (30s < 60s), no test change needed. |
+| `internal/game/manager.go` (`CreateMatchedGame`) | Mint `whiteConnectToken`/`blackConnectToken` (ConnectClaims, `m.connectClaimsTTL`, `InstanceLabel: m.instanceID`) alongside the existing PlayerClaims mint — reuses the exact minting call `resolve.go` already makes, no new logic, just a second call site. Return shape grows from 2 tokens to 4 (or a small struct — open to either). |
+| `internal/matchmaking/pairing.go`, `reporter.go` | Thread the two new tokens through into `MatchCreatedRequest`. |
+| `internal/game/directory.go` (`ActiveGameMarker`) | JSON field `connectToken` → `playerToken` (rename only — the stored value was always a PlayerClaims). |
+| `internal/mmsvc/queue.go` (`activeGameMarker`, `matchmakingResult`) | `activeGameMarker`: same rename. `matchmakingResult`: keep `ConnectToken` (now genuinely a ConnectClaims), add `PlayerToken`. |
+| `internal/mmsvc/response.go` (`existingGame`) | `ConnectToken` → `PlayerToken` (json `playerToken`). |
+| `internal/mmsvc/hub.go` (`matchFoundData`) | Stop aliasing `existingGame` — becomes its own struct: `GameID`, `ConnectToken`, `PlayerToken`, `InstanceLabel`, `WSPath`. |
+| `internal/mmsvc/reportserver.go` (`ReportMatchCreated`) | Populate both `ConnectToken` and `PlayerToken` in `SetResult` and `Hub.Notify`, from the two new gRPC fields. |
+| `internal/mmsvc/handler.go` (`statusResponseData`) | Add `PlayerToken` field. |
+| `internal/auth/token.go` | `DefaultMatchmakingClaimsTTL`: 10s → **60s** (§18.5, resolved) — sized to safely outlive the longest legitimate queue wait, not tuned independently. |
+| `cmd/matchmaking-service/main.go` (`loadConfig`) | New startup validation: `MatchmakingClaimsTTL >= QueueTimeout + 15s`. Fails fast (same panic-on-bad-config treatment every other required-value check in this file already gets) if the two are configured inconsistently — e.g. `MATCHMAKING_QUEUE_TIMEOUT_SECONDS` raised without `MATCHMAKING_CLAIMS_TTL_SECONDS` following it up. | 
+| `e2e-phase3.sh`, `phase3_step7_e2e_walkthrough.md` | Scenario 1's `/resolve` detour (added to work around 18.1's bug) reverts to a direct dial using `connectToken`. Worth *adding*, not removing, a demonstration of the `playerToken` + `/resolve` fallback path — e.g. disconnect after matching, reconnect via `/resolve`, confirm it still works — since that path remains real and needs its own coverage. |
+
+### 18.5 `MatchmakingClaimsTTL` — RESOLVED
+
+Same bug shape as `ConnectClaimsTTL`'s 10s default (§18.4): a player
+sitting in queue past 10s who then polls `GET /matchmaking/status` or calls
+`DELETE /matchmaking/queue` would find their own token already expired,
+for a completely ordinary wait — not an edge case.
+
+**Decision:** tie `MatchmakingClaimsTTL`'s default to safely exceed
+`MATCHMAKING_QUEUE_TIMEOUT_SECONDS`, and validate the relationship at
+startup rather than hope the two stay in sync across independent env vars.
+A player's `MatchmakingClaims` token only ever needs to outlive the longest
+they could legitimately still be queued — that's bounded: queue timeout
+(default 30s) plus one sweep tick's worst-case delay (`sweep.go`'s fixed
+5s interval) plus round-trip margin. Once a player is no longer queued
+(matched, cancelled, or swept), an expired token no longer matters —
+there's nothing left to check or cancel.
+
+- `DefaultMatchmakingClaimsTTL`: 10s → **60s** (30s queue timeout + 5s
+  sweep interval + comfortable slack — a round, generous number, not
+  tightly optimized, since there is no cost to it being generous).
+- `cmd/matchmaking-service/main.go`'s `loadConfig`: after resolving both
+  `QueueTimeout` and `MatchmakingClaimsTTL`, require
+  `MatchmakingClaimsTTL >= QueueTimeout + 15*time.Second` and fail fast
+  (panic, same as every other required-config check in this file) if
+  violated — catches exactly the case where `MATCHMAKING_QUEUE_TIMEOUT_SECONDS`
+  gets raised in some future deployment without `MATCHMAKING_CLAIMS_TTL_SECONDS`
+  following it up.
+
+**Explicitly not built:** a `Status`-mints-a-fresh-token-on-every-call
+refresh pattern (mirroring `Queue`'s idempotent re-mint on repeat calls).
+Considered and rejected — the TTL-vs-queue-timeout invariant above already
+fully closes the problem; adding a second mechanism on top would be
+building config/behavior surface ahead of demonstrated need, the same
+instinct against speculative machinery this project already applies
+elsewhere (ADR-014, ADR-016).
+

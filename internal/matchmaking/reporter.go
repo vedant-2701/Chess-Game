@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/vedant-2701/chess/internal/game"
 	"github.com/vedant-2701/chess/internal/rpc"
 	matchmakingv1 "github.com/vedant-2701/chess/proto/matchmakingv1"
 )
@@ -91,14 +92,16 @@ func sleepOrDone(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (r *grpcMatchReporter) ReportMatchCreated(ctx context.Context, gameID, whiteUserID, blackUserID, whiteToken, blackToken, instanceLabel string) error {
+func (r *grpcMatchReporter) ReportMatchCreated(ctx context.Context, gameID, whiteUserID, blackUserID string, tokens game.MatchedGameTokens, instanceLabel string) error {
 	req := &matchmakingv1.MatchCreatedRequest{
-		GameId:        gameID,
-		WhiteUserId:   whiteUserID,
-		BlackUserId:   blackUserID,
-		WhiteToken:    whiteToken,
-		BlackToken:    blackToken,
-		InstanceLabel: instanceLabel,
+		GameId:            gameID,
+		WhiteUserId:       whiteUserID,
+		BlackUserId:       blackUserID,
+		WhitePlayerToken:  tokens.WhitePlayerToken,
+		BlackPlayerToken:  tokens.BlackPlayerToken,
+		WhiteConnectToken: tokens.WhiteConnectToken,
+		BlackConnectToken: tokens.BlackConnectToken,
+		InstanceLabel:     instanceLabel,
 	}
 
 	var lastErr error

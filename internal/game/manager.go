@@ -250,7 +250,7 @@ func (m *Manager) CreateGame(ctx context.Context, userID string) (*GameSession, 
 		// non-fatal, same reasoning as ClaimOwnership immediately above.
 		if err := m.directory.SetActiveGameMarker(ctx, userID, ActiveGameMarker{
 			GameID:        gameID,
-			ConnectToken:  token,
+			PlayerToken:   token,
 			InstanceLabel: m.instanceID,
 			WSPath:        "/connect/" + m.instanceID,
 		}); err != nil {
@@ -334,7 +334,7 @@ func (m *Manager) JoinGame(ctx context.Context, gameID, userID string) (string, 
 		}
 		if err := m.directory.SetActiveGameMarker(ctx, userID, ActiveGameMarker{
 			GameID:        gameID,
-			ConnectToken:  token,
+			PlayerToken:   token,
 			InstanceLabel: instanceLabel,
 			WSPath:        "/connect/" + instanceLabel,
 		}); err != nil {
@@ -345,6 +345,34 @@ func (m *Manager) JoinGame(ctx context.Context, gameID, userID string) (string, 
 
 	slog.Info("player joined game", "gameID", gameID, "userID", userID, "color", "BLACK")
 	return token, nil
+}
+
+// MatchedGameTokens holds the four tokens CreateMatchedGame mints for its
+// two players (PHASE_3_DESIGN_NOTES.md §18, 2026-08-17). A struct, not four
+// more positional return values — CreateMatchedGame already returns
+// (session, ..., err); a fifth/sixth bare string return would be error-prone
+// to keep straight at call sites, especially once white/black and
+// player/connect both vary independently.
+//
+//   - WhitePlayerToken/BlackPlayerToken: the long-lived (24h) PlayerClaims
+//     pair, unchanged in kind from what this method originally returned —
+//     used for the active-game marker (ActiveGameMarker.PlayerToken) and as
+//     the fallback credential for any later reconnect via
+//     GET /games/{id}/resolve.
+//   - WhiteConnectToken/BlackConnectToken: a freshly-minted, short-lived
+//     ConnectClaims pair (Manager.signConnectToken), carrying instanceLabel
+//     — directly dialable, no /resolve round-trip needed. Safe to mint here
+//     specifically because CreateMatchedGame runs synchronously on the exact
+//     instance that is about to claim ownership of the new game, so there is
+//     zero elapsed time between minting and the instance actually being the
+//     correct owner — contrast with the marker's PlayerToken, which may be
+//     read an arbitrary, unbounded time after being written (see
+//     ActiveGameMarker's own doc comment).
+type MatchedGameTokens struct {
+	WhitePlayerToken  string
+	BlackPlayerToken  string
+	WhiteConnectToken string
+	BlackConnectToken string
 }
 
 // CreateMatchedGame atomically creates a new game for two players already
@@ -381,10 +409,15 @@ func (m *Manager) JoinGame(ctx context.Context, gameID, userID string) (string, 
 // its next connect/resolve event — same shape and severity as the already-
 // accepted residual gaps this project tracks elsewhere (TD-P2-006, ADR-042's
 // own accepted residual for the crash+nobody-ever-resolves case).
-func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBlackID, matchmakingRequestID string) (session *GameSession, whiteToken, blackToken string, err error) {
+//
+// Returns MatchedGameTokens (PHASE_3_DESIGN_NOTES.md §18, 2026-08-17), not
+// four bare string values — see that struct's own doc comment for why both
+// a PlayerClaims pair AND a ConnectClaims pair are minted here, not just
+// the PlayerClaims pair this method originally returned.
+func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBlackID, matchmakingRequestID string) (session *GameSession, tokens MatchedGameTokens, err error) {
 	gameUUID, err := uuid.NewV7()
 	if err != nil {
-		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame whiteID=%s blackID=%s: generate game ID: %w",
+		return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame whiteID=%s blackID=%s: generate game ID: %w",
 			playerWhiteID, playerBlackID, err)
 	}
 	gameID := gameUUID.String()
@@ -404,7 +437,7 @@ func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBl
 
 	inserted, err := m.gameStore.CreateMatchedGame(ctx, game)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame whiteID=%s blackID=%s requestID=%s: %w",
+		return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame whiteID=%s blackID=%s requestID=%s: %w",
 			playerWhiteID, playerBlackID, matchmakingRequestID, err)
 	}
 
@@ -412,14 +445,14 @@ func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBl
 		// Idempotent retry — see doc comment above for the accepted gap here.
 		existing, getErr := m.gameStore.GetGameByMatchmakingRequestID(ctx, matchmakingRequestID)
 		if getErr != nil {
-			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: retry lookup: %w",
+			return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame requestID=%s: retry lookup: %w",
 				matchmakingRequestID, getErr)
 		}
 		if existing.PlayerBlackID == nil {
 			// Unreachable in practice: this method is the only writer of a row
 			// with this MatchmakingRequestID, and it always sets PlayerBlackID.
 			// Defensive, not a real expected path.
-			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: existing game %s has no PlayerBlackID",
+			return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame requestID=%s: existing game %s has no PlayerBlackID",
 				matchmakingRequestID, existing.ID)
 		}
 
@@ -427,17 +460,31 @@ func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBl
 			return m.hydrateGameSession(hydrateCtx, existing.ID)
 		})
 		if hydrateErr != nil {
-			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: hydrate existing game %s: %w",
+			return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame requestID=%s: hydrate existing game %s: %w",
 				matchmakingRequestID, existing.ID, hydrateErr)
 		}
 
-		whiteToken, err = m.signToken(existing.ID, existing.PlayerWhiteID, string(store.ColorWhite))
+		var t MatchedGameTokens
+		t.WhitePlayerToken, err = m.signToken(existing.ID, existing.PlayerWhiteID, string(store.ColorWhite))
 		if err != nil {
-			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: %w", matchmakingRequestID, err)
+			return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame requestID=%s: %w", matchmakingRequestID, err)
 		}
-		blackToken, err = m.signToken(existing.ID, *existing.PlayerBlackID, string(store.ColorBlack))
+		t.BlackPlayerToken, err = m.signToken(existing.ID, *existing.PlayerBlackID, string(store.ColorBlack))
 		if err != nil {
-			return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame requestID=%s: %w", matchmakingRequestID, err)
+			return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame requestID=%s: %w", matchmakingRequestID, err)
+		}
+		// PHASE_3_DESIGN_NOTES.md §18: mint fresh ConnectClaims here too, same as
+		// the main (inserted==true) path below — the retry path's own doc
+		// comment already treats reissuing tokens as safe/expected on this
+		// branch (no different for the connect-token pair than the player-token
+		// pair it already reissues).
+		t.WhiteConnectToken, err = m.signConnectToken(existing.ID, existing.PlayerWhiteID, string(store.ColorWhite), m.instanceID)
+		if err != nil {
+			return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame requestID=%s: %w", matchmakingRequestID, err)
+		}
+		t.BlackConnectToken, err = m.signConnectToken(existing.ID, *existing.PlayerBlackID, string(store.ColorBlack), m.instanceID)
+		if err != nil {
+			return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame requestID=%s: %w", matchmakingRequestID, err)
 		}
 
 		slog.Info("matched game idempotent retry resolved to existing game",
@@ -457,29 +504,46 @@ func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBl
 			// owns the session.
 			wsPath := "/connect/" + m.instanceID
 			if err := m.directory.SetActiveGameMarker(ctx, existing.PlayerWhiteID, ActiveGameMarker{
-				GameID: existing.ID, ConnectToken: whiteToken, InstanceLabel: m.instanceID, WSPath: wsPath,
+				GameID: existing.ID, PlayerToken: t.WhitePlayerToken, InstanceLabel: m.instanceID, WSPath: wsPath,
 			}); err != nil {
 				slog.Error("Manager.CreateMatchedGame: failed to set white active-game marker (retry path)",
 					"gameID", existing.ID, "userID", existing.PlayerWhiteID, "error", err)
 			}
 			if err := m.directory.SetActiveGameMarker(ctx, *existing.PlayerBlackID, ActiveGameMarker{
-				GameID: existing.ID, ConnectToken: blackToken, InstanceLabel: m.instanceID, WSPath: wsPath,
+				GameID: existing.ID, PlayerToken: t.BlackPlayerToken, InstanceLabel: m.instanceID, WSPath: wsPath,
 			}); err != nil {
 				slog.Error("Manager.CreateMatchedGame: failed to set black active-game marker (retry path)",
 					"gameID", existing.ID, "userID", *existing.PlayerBlackID, "error", err)
 			}
 		}
 
-		return hydrated, whiteToken, blackToken, nil
+		return hydrated, t, nil
 	}
 
-	whiteToken, err = m.signToken(gameID, playerWhiteID, string(store.ColorWhite))
+	var t MatchedGameTokens
+	t.WhitePlayerToken, err = m.signToken(gameID, playerWhiteID, string(store.ColorWhite))
 	if err != nil {
-		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame gameID=%s: %w", gameID, err)
+		return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame gameID=%s: %w", gameID, err)
 	}
-	blackToken, err = m.signToken(gameID, playerBlackID, string(store.ColorBlack))
+	t.BlackPlayerToken, err = m.signToken(gameID, playerBlackID, string(store.ColorBlack))
 	if err != nil {
-		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame gameID=%s: %w", gameID, err)
+		return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame gameID=%s: %w", gameID, err)
+	}
+	// PHASE_3_DESIGN_NOTES.md §18 (2026-08-17): also mint a fresh ConnectClaims
+	// pair right here, at creation — safe to do because this call runs
+	// synchronously on the exact instance that is about to claim ownership of
+	// gameID (below), so there is zero elapsed time between minting and the
+	// instance actually being the correct owner, unlike the active-game
+	// marker's PlayerToken (read an arbitrary, unbounded time later — see
+	// ActiveGameMarker's doc comment). This is what lets MATCH_FOUND skip
+	// GET /games/:id/resolve for the initial connection.
+	t.WhiteConnectToken, err = m.signConnectToken(gameID, playerWhiteID, string(store.ColorWhite), m.instanceID)
+	if err != nil {
+		return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame gameID=%s: %w", gameID, err)
+	}
+	t.BlackConnectToken, err = m.signConnectToken(gameID, playerBlackID, string(store.ColorBlack), m.instanceID)
+	if err != nil {
+		return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame gameID=%s: %w", gameID, err)
 	}
 
 	// NewGameSessionFromDB (not NewGameSession+SetPlayerBlack): game already
@@ -492,7 +556,7 @@ func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBl
 
 	ch, unsubscribe, err := m.eventBus.Subscribe(ctx, gameID)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("Manager.CreateMatchedGame gameID=%s: subscribe: %w", gameID, err)
+		return nil, MatchedGameTokens{}, fmt.Errorf("Manager.CreateMatchedGame gameID=%s: subscribe: %w", gameID, err)
 	}
 	m.startEventSubscriber(session, ch, unsubscribe)
 
@@ -516,13 +580,13 @@ func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBl
 		// CreateGame+JoinGame.
 		wsPath := "/connect/" + m.instanceID
 		if err := m.directory.SetActiveGameMarker(ctx, playerWhiteID, ActiveGameMarker{
-			GameID: gameID, ConnectToken: whiteToken, InstanceLabel: m.instanceID, WSPath: wsPath,
+			GameID: gameID, PlayerToken: t.WhitePlayerToken, InstanceLabel: m.instanceID, WSPath: wsPath,
 		}); err != nil {
 			slog.Error("Manager.CreateMatchedGame: failed to set white active-game marker",
 				"gameID", gameID, "userID", playerWhiteID, "error", err)
 		}
 		if err := m.directory.SetActiveGameMarker(ctx, playerBlackID, ActiveGameMarker{
-			GameID: gameID, ConnectToken: blackToken, InstanceLabel: m.instanceID, WSPath: wsPath,
+			GameID: gameID, PlayerToken: t.BlackPlayerToken, InstanceLabel: m.instanceID, WSPath: wsPath,
 		}); err != nil {
 			slog.Error("Manager.CreateMatchedGame: failed to set black active-game marker",
 				"gameID", gameID, "userID", playerBlackID, "error", err)
@@ -538,7 +602,7 @@ func (m *Manager) CreateMatchedGame(ctx context.Context, playerWhiteID, playerBl
 
 	slog.Info("matched game created", "gameID", gameID, "whiteID", playerWhiteID, "blackID", playerBlackID,
 		"requestID", matchmakingRequestID)
-	return session, whiteToken, blackToken, nil
+	return session, t, nil
 }
 
 // HandleConnect registers a player's WebSocket connection into the correct
@@ -1843,6 +1907,31 @@ func (m *Manager) signToken(gameID, userID, color string) (string, error) {
 	token, err := auth.SignPlayerToken(claims, m.jwtSecret)
 	if err != nil {
 		return "", fmt.Errorf("Manager.signToken gameID=%s userID=%s: %w", gameID, userID, err)
+	}
+	return token, nil
+}
+
+// signConnectToken mints a short-lived, directly-dialable ConnectClaims
+// (carries instanceLabel, unlike PlayerClaims/signToken above). Extracted
+// from ResolveGame's original inline minting code (PHASE_3_DESIGN_NOTES.md
+// §18, 2026-08-17) so CreateMatchedGame can mint the identical shape of
+// token without duplicating the claim-construction logic — both call sites
+// now share one source of truth for what a ConnectClaims looks like and how
+// it's signed.
+func (m *Manager) signConnectToken(gameID, userID, color, instanceLabel string) (string, error) {
+	claims := auth.ConnectClaims{
+		GameID:        gameID,
+		UserID:        userID,
+		Color:         color,
+		InstanceLabel: instanceLabel,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(m.connectClaimsTTL)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+	}
+	token, err := auth.SignConnectToken(claims, m.jwtSecret)
+	if err != nil {
+		return "", fmt.Errorf("Manager.signConnectToken gameID=%s userID=%s: %w", gameID, userID, err)
 	}
 	return token, nil
 }

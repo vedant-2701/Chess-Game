@@ -4,10 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/vedant-2701/chess/internal/auth"
 	internalchess "github.com/vedant-2701/chess/internal/chess"
 	"github.com/vedant-2701/chess/internal/store"
 )
@@ -125,17 +122,7 @@ func (m *Manager) ResolveGame(ctx context.Context, gameID, userID string, color 
 		}
 	}
 
-	claims := auth.ConnectClaims{
-		GameID:        gameID,
-		UserID:        userID,
-		Color:         string(color),
-		InstanceLabel: instanceLabel,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(m.connectClaimsTTL)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
-	}
-	token, err := auth.SignConnectToken(claims, m.jwtSecret)
+	token, err := m.signConnectToken(gameID, userID, string(color), instanceLabel)
 	if err != nil {
 		return "", "", fmt.Errorf("Manager.ResolveGame gameID=%s: %w", gameID, err)
 	}

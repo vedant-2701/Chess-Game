@@ -223,9 +223,23 @@ type RoutingDirectory interface {
 // formats for two different audiences (a browser client vs. a gRPC peer),
 // and there is no reason to make this one match the other just because both
 // happen to exist in the same phase.
+//
+// PlayerToken (PHASE_3_DESIGN_NOTES.md §18, 2026-08-17 — renamed from
+// ConnectToken): this field holds the player's long-lived PlayerClaims, not
+// a dialable ConnectClaims — it always has, the original field name was
+// simply wrong. A marker read (matchmaking-service's 409 check, or a
+// heartbeat-renewed value read at some arbitrary later time) has no bound on
+// how long ago it was written, so a short-lived ConnectClaims minted at
+// write time would frequently already be dead by read time — the reader is
+// always expected to call GET /games/{id}/resolve using this token to get a
+// fresh, genuinely dialable credential. Contrast with MATCH_FOUND's
+// connectToken (internal/mmsvc/hub.go's matchFoundData), which IS a fresh,
+// directly-dialable ConnectClaims — that field is populated from a separate
+// mint at CreateMatchedGame time (Manager.signConnectToken), not from this
+// marker at all.
 type ActiveGameMarker struct {
 	GameID        string `json:"gameID"`
-	ConnectToken  string `json:"connectToken"`
+	PlayerToken   string `json:"playerToken"`
 	InstanceLabel string `json:"instanceLabel"`
 	WSPath        string `json:"wsPath"`
 }

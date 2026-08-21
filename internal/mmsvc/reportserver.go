@@ -50,15 +50,13 @@ func NewReportServer(redisClient *redis.Client, queue *Queue, hub *Hub) *ReportS
 // "game_id is the idempotency key... matchmaking-service keeps a short-TTL
 // Redis dedup key checked before pushing SSE").
 //
-// white_token/black_token are opaque PlayerClaims JWT strings, already
-// signed by chess-server (DECISIONS_LOG_PHASE_3.md ADR-037's Consequences:
-// "connectToken is the player's existing PlayerClaims [24h TTL]" — despite
-// the field name matching /resolve's ConnectClaims-shaped response,
-// ADR-037 is explicit its actual content is the long-lived PlayerClaims
-// token, minted once by chess-server, republished unchanged). This method
-// never parses or verifies them, only relays them unchanged into the
-// connectToken field of both the result record (Queue.SetResult) and the
-// MATCH_FOUND SSE event (Hub.Notify) — same reasoning as this package's
+// Two token pairs relayed, not one (PHASE_3_DESIGN_NOTES.md §18,
+// 2026-08-17): *_player_token are opaque, long-lived PlayerClaims JWT
+// strings; *_connect_token are opaque, short-lived ConnectClaims JWT
+// strings, freshly minted by CreateMatchedGame essentially synchronously
+// with this call. This method never parses or verifies either — only
+// relays them unchanged into matchFoundData/matchmakingResult's
+// ConnectToken and PlayerToken fields — same reasoning as this package's
 // other refusals to import internal/auth for anything beyond what it
 // strictly needs.
 func (s *ReportServer) ReportMatchCreated(ctx context.Context, req *matchmakingv1.MatchCreatedRequest) (*matchmakingv1.MatchCreatedResponse, error) {
@@ -81,13 +79,15 @@ func (s *ReportServer) ReportMatchCreated(ctx context.Context, req *matchmakingv
 
 	whiteData := matchFoundData{
 		GameID:        req.GetGameId(),
-		ConnectToken:  req.GetWhiteToken(),
+		ConnectToken:  req.GetWhiteConnectToken(),
+		PlayerToken:   req.GetWhitePlayerToken(),
 		InstanceLabel: req.GetInstanceLabel(),
 		WSPath:        wsPath,
 	}
 	blackData := matchFoundData{
 		GameID:        req.GetGameId(),
-		ConnectToken:  req.GetBlackToken(),
+		ConnectToken:  req.GetBlackConnectToken(),
+		PlayerToken:   req.GetBlackPlayerToken(),
 		InstanceLabel: req.GetInstanceLabel(),
 		WSPath:        wsPath,
 	}
@@ -109,6 +109,7 @@ func (s *ReportServer) recordAndNotifyMatched(ctx context.Context, userID string
 		Status:        "matched",
 		GameID:        data.GameID,
 		ConnectToken:  data.ConnectToken,
+		PlayerToken:   data.PlayerToken,
 		InstanceLabel: data.InstanceLabel,
 		WSPath:        data.WSPath,
 	}); err != nil {

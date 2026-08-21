@@ -10,6 +10,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/vedant-2701/chess/internal/game"
 	"github.com/vedant-2701/chess/internal/store"
 )
 
@@ -24,17 +25,18 @@ type fakeMatchReporter struct {
 }
 
 type matchCreatedCall struct {
-	gameID, whiteUserID, blackUserID, whiteToken, blackToken, instanceLabel string
+	gameID, whiteUserID, blackUserID, instanceLabel string
+	tokens                                          game.MatchedGameTokens
 }
 
 type matchFailedCall struct {
 	whiteUserID, blackUserID string
 }
 
-func (f *fakeMatchReporter) ReportMatchCreated(ctx context.Context, gameID, whiteUserID, blackUserID, whiteToken, blackToken, instanceLabel string) error {
+func (f *fakeMatchReporter) ReportMatchCreated(ctx context.Context, gameID, whiteUserID, blackUserID string, tokens game.MatchedGameTokens, instanceLabel string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.created = append(f.created, matchCreatedCall{gameID, whiteUserID, blackUserID, whiteToken, blackToken, instanceLabel})
+	f.created = append(f.created, matchCreatedCall{gameID, whiteUserID, blackUserID, instanceLabel, tokens})
 	return nil
 }
 
@@ -121,8 +123,11 @@ func TestPairingLoop_Tick_PairsSuccessfully(t *testing.T) {
 		t.Errorf("player IDs: got white=%s black=%s, want white=%s black=%s",
 			call.whiteUserID, call.blackUserID, whiteID, blackID)
 	}
-	if call.whiteToken == "" || call.blackToken == "" {
-		t.Error("expected non-empty tokens for both players")
+	if call.tokens.WhitePlayerToken == "" || call.tokens.BlackPlayerToken == "" {
+		t.Error("expected non-empty PlayerClaims tokens for both players")
+	}
+	if call.tokens.WhiteConnectToken == "" || call.tokens.BlackConnectToken == "" {
+		t.Error("expected non-empty ConnectClaims tokens for both players (PHASE_3_DESIGN_NOTES.md §18)")
 	}
 	if call.instanceLabel != "instance-1" {
 		t.Errorf("instanceLabel: got %q, want %q", call.instanceLabel, "instance-1")

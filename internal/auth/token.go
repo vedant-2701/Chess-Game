@@ -88,7 +88,7 @@ func VerifyPlayerToken(tokenString string, secret string) (*PlayerClaims, error)
 // simpler fix but violates that rule). This constant is now only the
 // well-known default value cmd/server/main.go falls back to when
 // CONNECT_CLAIMS_TTL_SECONDS is unset, and token_test.go's fixture value.
-const DefaultConnectClaimsTTL = 10 * time.Second
+const DefaultConnectClaimsTTL = 30 * time.Second
 
 // ConnectClaims are the JWT claims embedded in the short-lived routing
 // credential minted by the Step 5 resolve endpoint (GET /games/:id/resolve)
@@ -188,7 +188,7 @@ func VerifyConnectToken(tokenString string, secret string) (*ConnectClaims, erro
 // NewHandler — same no-global-state reasoning as
 // DefaultConnectClaimsTTL above). Only the well-known default value
 // cmd/matchmaking-service/main.go falls back to when unset.
-const DefaultMatchmakingClaimsTTL = 10 * time.Second
+const DefaultMatchmakingClaimsTTL = 60 * time.Second
 
 // MatchmakingClaims are the JWT claims scoping a player's matchmaking queue
 // session: POST /matchmaking/queue's response, and the credential presented

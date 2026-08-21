@@ -1,6 +1,7 @@
 # Phase 3 — Matchmaking
 
-**Status: ⬜ Not Started (implementation). Pre-planning: ✅ Complete.**
+**Status: 🟨 Implementation substantially complete (Steps 1–7 done, Step 8 nearly done — `CLAUDE.md` outstanding). Pre-planning: ✅ Complete.**
+**Remaining before phase close-out: `ARCHITECTURE.md` full reconciliation (deferred to end-of-phase by design), full Phase 1/2 regression via `e2e-phase2.sh` (Acceptance Criterion #8, also deferred to end-of-phase), `CLAUDE.md` rewrite.**
 **Prerequisite: Phase 2 all acceptance criteria met**
 
 > **Note on this document's status (added 2026-08-08):** This document has
@@ -397,12 +398,14 @@ Full contract detail (gRPC methods, retry/dedup semantics, trust boundary): `DEC
 - [x] New `location /matchmaking { ... }` block: `proxy_buffering off`, `proxy_read_timeout 3600s` (ADR-035, ADR-036)
 
 ### Step 7: Integration Testing
-- [ ] Two players enter queue → both receive `MATCH_FOUND` via SSE → game connects normally through the existing resolve/connect flow
-- [ ] Three players enter queue → first two matched, third waits
-- [ ] Player enters queue then disconnects before the sweep fires → cancels cleanly if `DELETE` is called, or times out via the sweep otherwise
-- [ ] Simulate two chess-server instances running pairing loops simultaneously → no player double-matched
-- [ ] `CreateMatchedGame` insert failure (simulated) → re-enqueue at original score, `ReportMatchmakingFailed` fires, player sees `MATCHMAKING_FAILED` via SSE
-- [ ] Player already in an active shared-link game attempts to queue → 409 with existing game's connect info, not silently re-enqueued
+- [x] Two players enter queue → both receive `MATCH_FOUND` via SSE → game connects normally through the existing resolve/connect flow — verified live via `./e2e-phase3.sh scenario1` (2026-08-17): identical `gameID` on both players, `WAITING_FOR_PLAYER→ACTIVE` transition confirmed via `OPPONENT_CONNECTED`, `MOVE_APPLIED` delivered cross-player. Also exercises the `playerToken`+`/resolve` reconnect fallback (`DECISIONS_LOG_PHASE_3.md` ADR-044) independently within the same scenario — confirmed working after a live disconnect/reconnect.
+- [x] Three players enter queue → first two matched, third waits — verified via `scenario2`: third player's status `"waiting"`, queue depth `1`.
+- [x] Player enters queue then disconnects before the sweep fires → cancels cleanly if `DELETE` is called, or times out via the sweep otherwise — verified via `scenario3a` (voluntary cancel: queue depth drops by one, status remains `"waiting"`, not an error) and `scenario3b` (real ~40s wall-clock wait: queue depth drops to 0, `MATCHMAKING_FAILED`/`QUEUE_TIMEOUT` delivered via both SSE and `/status`).
+- [x] Simulate two chess-server instances running pairing loops simultaneously → no player double-matched — verified via `scenario4` (10 pairs / 20 players queued rapidly against the real two-container cluster): exactly 10 matched games created, queue drained to 0 — confirms `ZPOPMIN`'s atomicity under real concurrent instances over the network, not just `internal/matchmaking`'s existing in-process `-race` simulation (`TestPairingLoop_ConcurrentTicks_NoDoubleMatch`).
+- [x] `CreateMatchedGame` insert failure (simulated) → re-enqueue at original score, `ReportMatchmakingFailed` fires, player sees `MATCHMAKING_FAILED` via SSE — verified via `scenario5` (deliberately-unregistered userIDs, FK violation): both players receive `MATCHMAKING_FAILED`/`RETRIES_EXHAUSTED` via SSE. Live run also confirmed the unbounded-retry-loop finding recorded in the script's own comments — real observed behavior, not speculation, worth its own tech-debt entry (no distinction anywhere in this system between a transient `CreateMatchedGame` failure and a deterministic one).
+- [x] Player already in an active shared-link game attempts to queue → 409 with existing game's connect info, not silently re-enqueued — verified via `scenario6`: `HTTP 409`, `ALREADY_IN_ACTIVE_GAME`, `existingGame.playerToken` present (confirms ADR-044's field rename took effect end-to-end against the live cluster, not just in source), player confirmed absent from the queue afterward.
+
+**All six scenarios run against the live cluster (2026-08-17), full transcript reviewed against expected "Watch for" criteria — all passed. `go test -race ./...` and `go test -tags integration -race -p 1 ./...` (Acceptance Criterion #9) independently confirmed clean multiple times across this phase's implementation sessions.**
 
 ### Step 8: Documentation
 - [x] Reconcile this document against ADR-032–038 (this pass)

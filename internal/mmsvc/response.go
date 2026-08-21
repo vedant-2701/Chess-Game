@@ -29,14 +29,17 @@ type errorDetail struct {
 	ExistingGame *existingGame `json:"existingGame,omitempty"`
 }
 
-// existingGame mirrors PHASE_3.md's 409 response shape exactly — same field
-// names as internal/api's resolveResponseData, so client-side parsing
-// doesn't need a special case (ARCHITECTURE.md's Match Notification
-// section states this convention explicitly for the SSE payload; the same
-// reasoning applies here).
+// existingGame mirrors the active-game marker's shape (PHASE_3.md's 409
+// response). PlayerToken, not ConnectToken (PHASE_3_DESIGN_NOTES.md §18,
+// 2026-08-17) — this token is always a long-lived PlayerClaims, read from
+// a marker that may have been written an arbitrary time ago; a client MUST
+// call GET /games/{id}/resolve with it before dialing. Contrast with
+// matchFoundData (hub.go), which carries a genuinely dialable ConnectToken
+// — the two are no longer the same shape, deliberately, since they are no
+// longer the same kind of credential.
 type existingGame struct {
 	GameID        string `json:"gameID"`
-	ConnectToken  string `json:"connectToken"`
+	PlayerToken   string `json:"playerToken"`
 	InstanceLabel string `json:"instanceLabel"`
 	WSPath        string `json:"wsPath"`
 }

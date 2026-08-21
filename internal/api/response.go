@@ -30,9 +30,11 @@ type errorDetail struct {
 // reused here directly rather than duplicated, since the same failure modes
 // apply over HTTP.
 const (
-	errCodeInvalidRequest   = "INVALID_REQUEST"
-	errCodeGameNotJoinable  = "GAME_NOT_JOINABLE"
-	errCodeSelfPlayDisallow = "SELF_PLAY_NOT_ALLOWED"
+	errCodeInvalidRequest     = "INVALID_REQUEST"
+	errCodeGameNotJoinable    = "GAME_NOT_JOINABLE"
+	errCodeSelfPlayDisallow   = "SELF_PLAY_NOT_ALLOWED"
+	errCodeUsernameTaken      = "USERNAME_TAKEN"
+	errCodeInvalidCredentials = "INVALID_CREDENTIALS"
 )
 
 func writeData(w http.ResponseWriter, status int, data any) {

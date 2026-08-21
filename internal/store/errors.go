@@ -8,6 +8,14 @@ var (
 	ErrGameNotFound = errors.New("game not found")
 	ErrUserNotFound = errors.New("user not found")
 
+	// ErrUsernameTaken is returned by UserStore.CreateUserWithCredentials
+	// when the requested username is already registered (PHASE_3.md
+	// addendum, fixes TD-P3-007). Detected via the same ON CONFLICT ...
+	// RETURNING idiom this store already uses for compare-and-swap writes
+	// (see UpdatePlayerBlack/UpdateGameStatus's RowsAffected()==0 handling)
+	// rather than parsing a driver-specific unique-violation error code.
+	ErrUsernameTaken = errors.New("username already taken")
+
 	// ErrGameNotJoinable is returned by UpdatePlayerBlack when its conditional
 	// UPDATE (id match, status = WAITING_FOR_PLAYER, player_black_id IS NULL)
 	// affects zero rows because the row exists but the predicate failed — i.e.

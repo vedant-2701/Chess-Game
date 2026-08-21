@@ -12,63 +12,82 @@ This document describes how the chess server is built, why it is built that way,
 > Game State Machine, Database Schema, and Dependency Graph all now reflect
 > Phase 2 as built, not Phase 1 as originally documented here.
 
-> **Note on Phase 3 (added 2026-08-08):** Phase 3 (matchmaking) pre-planning
-> is complete and independently reviewed — see `DECISIONS_LOG_PHASE_3.md`
-> ADR-032 through ADR-038 and `phases/current/PHASE_3.md`. **Implementation
-> has not started.** A new "Matchmaking (Phase 3 — Design Decided, Not Yet
-> Implemented)" section has been added near the end of this document,
-> clearly separated from the sections below, which continue to describe only
-> what is actually built (Phase 1/2). Do not treat the Phase 3 section as
-> current system state — it is a forward-looking design record, following
-> the same convention this document used for Phase 2 before that phase was
-> implemented.
+> **Note on Phase 3 (added 2026-08-08, updated 2026-08-17):** Phase 3
+> (matchmaking) is now **implemented and E2E-verified** — all 6 integration
+> scenarios run against the live cluster (`e2e-phase3.sh`), full `go
+> build`/`vet`/`test -race`/`test -tags integration -race` gate clean. Full
+> reasoning trail: `DECISIONS_LOG_PHASE_3.md` ADR-032 through ADR-044,
+> `phases/current/PHASE_3.md`. The "Matchmaking" section near the end of
+> this document has been rewritten to describe the actual built system, not
+> a forward-looking design record — same treatment this document gave
+> Phase 2 once that phase was implemented. Two smaller additions from this
+> same pass, also now real: username/password registration/login
+> (`DECISIONS_LOG_PHASE_3.md` ADR-043, `POST /users`/`POST /login`), and a
+> universally-scoped `ACTIVE→ABORTED` first-move grace period
+> (ADR-041) that changes Phase 1/2 behavior retroactively — see the Game
+> State Machine section below. Phase 3's remaining open items (`ARCHITECTURE.md`
+> reconciliation, this pass; the Phase 1/2 regression pass; `CLAUDE.md`) are
+> tracked in `phases/current/PHASE_3.md`'s Step 7/8 checklist, not here.
 
 ---
 
-## System Overview (Phase 2 — current)
+## System Overview (Phase 2/3 — current)
 
 ```
                     nginx Edge Proxy
-           (round-robin REST; static /connect/{instanceLabel} map)
-                    │                    │
-         ┌──────────┘                    └──────────┐
-         ▼                                           ▼
-┌─────────────────────────┐              ┌─────────────────────────┐
-│   Server Instance 1      │              │   Server Instance 2      │
-│   api.WSHandler          │              │   api.WSHandler          │
-│   api.GameHandler        │              │   api.GameHandler        │
+   (round-robin REST/matchmaking; static /connect/{instanceLabel} map)
+           │            │                     │            │
+     /games,/users  /connect      /matchmaking (Phase 3, ADR-035)
+     /login          │                     │
+         │            │                     │            │
+         ▼            ▼                     ▼            ▼
+┌─────────────────────────┐              ┌─────────────────────────┐   ┌──────────────────────────┐
+│   Server Instance 1      │              │   Server Instance 2      │   │  matchmaking-service      │
+│   api.WSHandler          │              │   api.WSHandler          │   │  (own container, Phase 3) │
+│   api.GameHandler        │              │   api.GameHandler        │   │  mmsvc.Handler (HTTP/SSE) │
+│   api.AuthHandler        │              │   api.AuthHandler        │   │  mmsvc.ReportServer (gRPC)│
+│        │                 │              │        │                 │   │  mmsvc.Sweep (queue TTL)  │
+│        ▼                 │              │        ▼                 │   └──────────┬────────────────┘
+│   game.Manager           │              │   game.Manager           │              │
+│        │                 │              │        │                 │              │ gRPC
+│        ▼                 │              │        ▼                 │◄─────────────┘ (MatchReportService,
+│   game.GameRegistry      │              │   game.GameRegistry      │                shared-secret
+│   ──► game.GameSession   │              │   ──► game.GameSession   │                interceptor, ADR-033)
 │        │                 │              │        │                 │
 │        ▼                 │              │        ▼                 │
-│   game.Manager           │              │   game.Manager           │
-│        │                 │              │        │                 │
-│        ▼                 │              │        ▼                 │
-│   game.GameRegistry      │              │   game.GameRegistry      │
-│   ──► game.GameSession   │              │   ──► game.GameSession   │
-│        │                 │              │        │                 │
+│ internal/matchmaking     │              │ internal/matchmaking     │
+│ (pairing loop, ZPOPMIN)  │              │ (pairing loop, ZPOPMIN)  │
 └────────┼─────────────────┘              └────────┼─────────────────┘
          │                                           │
          └──────────────────┬────────────────────────┘
                              ▼
-                  ┌──────────────────────┐
-                  │  Redis (routing only) │  game:{id}→instanceID,
-                  │                        │  instance_alive:{id}
-                  └──────────────────────┘
+                  ┌───────────────────────────────┐
+                  │  Redis (routing + matchmaking)  │  game:{id}→instanceID,
+                  │                                  │  instance_alive:{id},
+                  │                                  │  matchmaking:queue:10+0 (ZSET),
+                  │                                  │  matchmaking_active_game:{userID},
+                  │                                  │  matchmaking_result:{userID},
+                  │                                  │  reported:{gameID}
+                  └───────────────────────────────┘
                              │
                              ▼
                       PostgreSQL 16
-              (shared source of truth for every instance)
+              (shared source of truth for every chess-server instance —
+               matchmaking-service never connects to it, ADR-032)
 ```
 
 **A game's live `GameSession` exists on exactly one instance at a time —
-co-location, not state sync.** Redis holds only routing/coordination facts
-(who owns this game, is that instance alive, and — as of ADR-030/031 —
-nothing else; disconnect-grace-period state is in Postgres, not Redis, see
-the Database Schema section below). There is never a second live
-`GameSession` for the same game on a different instance simultaneously; the
-entire Phase 2 design exists to make that structurally impossible rather
-than to reconcile it if it happened. Full connection-flow detail
-(resolve-then-connect, the two-token split, ownership claim/takeover):
-`phases/current/PHASE_2.md`.
+co-location, not state sync.** Redis holds routing/coordination facts (who
+owns this game, is that instance alive) plus, as of Phase 3, the
+matchmaking queue and its supporting keys — a new namespace on the same
+Redis instance, not new infrastructure (`DECISIONS_LOG_PHASE_3.md`
+ADR-032). There is never a second live `GameSession` for the same game on a
+different instance simultaneously; the entire Phase 2 design exists to make
+that structurally impossible rather than to reconcile it if it happened.
+Full connection-flow detail (resolve-then-connect, the two-token split,
+ownership claim/takeover): `phases/current/PHASE_2.md`. Full matchmaking
+flow (queue, pairing, SSE notification, the two connect paths): the
+Matchmaking section below.
 
 The original Phase 1 single-process diagram (no Redis, no nginx, no second
 instance) remains accurate as a description of local/dev-mode single-instance
@@ -160,13 +179,46 @@ Responsible for: All database interaction. Returns domain types, not database ro
 
 ### `internal/auth` — Authentication Layer
 
-Responsible for: Signing and verifying JWT player tokens. Nothing else.
+Responsible for: signing/verifying JWTs, and (as of Phase 3, ADR-043)
+hashing/verifying passwords. Nothing else — no HTTP, no persistence; those
+are `internal/api`'s and `internal/store`'s jobs respectively.
 
-Player tokens encode: `{ gameID, userID, color, iat, exp }`. They are signed with HMAC-SHA256. They are not stored in the database. Verification is stateless.
+Four JWT claim shapes exist, one signing secret shared across all of them
+(this codebase's consistent one-secret/multiple-claim-shapes convention):
 
-Two token types exist:
-- `playerToken`: Scoped to a specific game and color. Used for WebSocket authentication and reconnection.
-- (Phase 3+) `userToken`: Persistent identity across games. Not in Phase 1.
+- `PlayerClaims{GameID, UserID, Color}`: long-lived (24h). Minted by
+  `CreateGame`/`JoinGame`/`CreateMatchedGame`. Used for WebSocket
+  reconnection authentication indirectly — via `/resolve`, never dialed
+  directly — and as `ActiveGameMarker.PlayerToken`, the credential a client
+  falls back to via `/resolve` when a fresher token has expired.
+- `ConnectClaims{GameID, UserID, Color, InstanceLabel}`: short-lived
+  (`ConnectClaimsTTL`, default 30s). Minted in two places, both inside
+  `internal/game.Manager`, sharing one helper (`signConnectToken`,
+  `DECISIONS_LOG_PHASE_3.md` ADR-044): `ResolveGame` (the ordinary
+  reconnect path) and `CreateMatchedGame` (the initial post-match
+  connection, ADR-044 — safe to mint here because the instance minting it
+  is synchronously about to claim ownership of the game, so there is zero
+  staleness window). The only claim shape that includes `InstanceLabel`,
+  which is what `WSHandler` checks against the URL.
+- `MatchmakingClaims{UserID}` (Phase 3, ADR-036): scopes a
+  `POST /matchmaking/queue` session (`GET /matchmaking/stream`/`status`,
+  `DELETE /matchmaking/queue`). `MatchmakingClaimsTTL` (default 60s) is
+  deliberately sized to safely exceed `MATCHMAKING_QUEUE_TIMEOUT_SECONDS` —
+  validated at `matchmaking-service` startup, not just hoped for
+  (`DECISIONS_LOG_PHASE_3.md` §18.5).
+
+**Password hashing (Phase 3, ADR-043):** `HashPassword`/`VerifyPassword`
+(`internal/auth/password.go`), bcrypt, default cost. Backs the minimal
+username/password registration described in the Authentication
+(username/password) section below — not a general session/auth layer,
+deliberately.
+
+Token TTLs (`DefaultConnectClaimsTTL`, `DefaultMatchmakingClaimsTTL`) are
+only fallback defaults in `internal/auth` — the enforced values are
+injected constructor fields on `internal/game.Manager`/`internal/mmsvc.Handler`
+respectively (`CODING_GUIDELINES.md` §5: no package-level mutable state),
+resolved from `CONNECT_CLAIMS_TTL_SECONDS`/`MATCHMAKING_CLAIMS_TTL_SECONDS`
+at each binary's startup.
 
 ### `internal/api` — HTTP API Layer
 
@@ -180,6 +232,11 @@ bridges the two.
 - `GameHandler` (`internal/api/game_handler.go`): `POST /games`,
   `POST /games/:id/join`, `GET /games/:id`, `GET /games/:id/resolve`,
   `GET /health`.
+- `AuthHandler` (`internal/api/auth_handler.go`, added Phase 3,
+  `DECISIONS_LOG_PHASE_3.md` ADR-043, fixes TD-P3-007): `POST /users`,
+  `POST /login`. See the Authentication Layer section below for the full
+  scope — deliberately minimal, returns a bare `userID`, no token, no
+  session, no expiration.
 - `WSHandler` (`internal/api/ws_handler.go`, fully rewritten in Phase 2 for
   `ConnectClaims`): `GET /connect/{instanceLabel}`. Verifies the
   short-lived `ConnectClaims` token (not `PlayerClaims` — that's checked
@@ -224,6 +281,25 @@ GET /games/:id/resolve
   Response: { "data": { "connectToken": "jwt", "instanceLabel": "...", "wsPath": "/connect/..." } }
   Determines (or claims) the owning instance and mints a short-lived
   ConnectClaims token. See WebSocket Connection Lifecycle below.
+
+POST /users  (Phase 3, ADR-043)
+  Body: { "username": "...", "password": "..." }
+  Response 201: { "data": { "userID": "uuid" } }
+  Response 409: { "error": { "code": "USERNAME_TAKEN", "message": "..." } }
+  Creates a new user identified by username+password, returns its generated
+  userID — used exactly like an anonymously-generated one everywhere else
+  in this API (POST /games, POST /matchmaking/queue, etc.). No token, no
+  session, no expiration, by deliberate design — see Authentication Layer
+  below.
+
+POST /login  (Phase 3, ADR-043)
+  Body: { "username": "...", "password": "..." }
+  Response 200: { "data": { "userID": "uuid" } }
+  Response 401: { "error": { "code": "INVALID_CREDENTIALS", "message": "..." } }
+  Recovers the userID Register originally handed out — e.g. from a new
+  device. An unknown username gets the IDENTICAL response as a wrong
+  password (same code, same status) — deliberate, closes a
+  username-enumeration side channel.
 
 GET /health
   Response: { "status": "ok" }
@@ -274,6 +350,14 @@ GET /connect/{instanceLabel}  (WebSocket upgrade)
 **ADDED (Phase 2, `DECISIONS_LOG_PHASE_2.md` ADR-029): `ABORTED`.** A game that never left `WAITING_FOR_PLAYER` — the creator connected, but nobody ever joined as the opponent, and the creator then disconnected — has no meaningful winner and was never actually contested. Distinct from `ABANDONED`: `outcome` and `outcome_reason` both stay `NULL`, not `DRAW`. Real chess platforms treat an opponent-never-showed-up game as void, not a scored draw — the same principle applies here. This closed a pre-existing gap (tracked as TD-P2-005, now resolved) where `WAITING_FOR_PLAYER` had no path to any terminal state at all. The trigger is the same abandonment timer as above, started from `HandleDisconnect` — the only difference is which branch `onAbandonTimeout` takes, gated on whether the game ever reached `ACTIVE`.
 
 **ADDED (Phase 2, ADR-030/ADR-031): abandonment-timer continuity across instance failover.** The 60-second grace period above is armed via an in-process `time.Timer` (`Manager.abandonTimers`), which does not survive the owning instance dying. `white_disconnected_at`/`black_disconnected_at` columns (Database Schema below) persist the disconnect moment so a surviving instance can resume the correct remaining duration on hydration. If neither timestamp was ever written — the instance died before either individual disconnect could be observed, e.g. a crash while both players were still connected — the surviving instance assumes disconnected as of the hydration moment rather than assuming fine (ADR-031); a player who is in fact still connected self-cancels this defensive timer within their own reconnect. Not closed by this: a game where nobody ever calls `/resolve` again after a crash (tracked as TD-P2-006) — nothing runs if nobody triggers a hydrate.
+
+**ADDED (Phase 3, `DECISIONS_LOG_PHASE_3.md` ADR-041): first-move grace period — `ACTIVE → ABORTED`, universally scoped.** A game that reaches `ACTIVE` (both players connected) but never receives a first move, or receives White's first move with no reply from Black, previously had no termination mechanism at all — and the existing disconnect-triggered abandonment timer would in fact score it misleadingly (a `COMPLETED` win or `ABANDONED` draw for a game with zero real chess played) on the rare occasion it did fire. Closed by a move-count-gated timer, armed at the same points the abandonment timer already is:
+
+- After `ACTIVE` with **zero moves played**: a timer arms for Black's first move. If it fires, `ACTIVE → ABORTED` (reusing the same terminal state `WAITING_FOR_PLAYER → ABORTED` already uses — void, no `outcome`/`outcome_reason`, not a scored draw).
+- After **exactly one move played** (White's first move, Black hasn't replied): the timer re-arms for Black's reply specifically, retired once move #2 lands.
+- After **two or more moves**: this mechanism retires permanently for that game — the ordinary disconnect-triggered abandonment timer is the only termination path from then on, exactly as before this ADR.
+
+**This is a retroactive behavior change to already-shipped Phase 1/2 code, not a matchmaking-only addition** — the underlying defect (a stalled game with zero real chess played having no termination path) was never specific to how the game was created. Implementation: `internal/game/move.go`'s `MoveProcessor.onMovePersisted` hook (mirrors the existing `Clock→Manager` callback pattern) notifies `Manager.onMovePersisted` after every persisted move, which arms/retires this timer based on the game's current move count. **Flagged explicitly for the Phase 1/2 regression pass** (`phases/current/PHASE_3.md` acceptance criterion #8) — this is the one change in this phase most likely to surface as an unexpected new termination path in an existing Phase 1/2 test scenario that plays zero or one moves before asserting on game state.
 
 **State definitions:**
 
@@ -474,10 +558,19 @@ type LocalEventBus struct {
 ## Database Schema
 
 ```sql
--- Minimal anonymous user identity
+-- Minimal anonymous user identity, PLUS optional username/password
+-- (Phase 3, DECISIONS_LOG_PHASE_3.md ADR-043 — fixes TD-P3-007). The two
+-- identity paths coexist: CreateOrGetUser (anonymous, client-supplied ID,
+-- unchanged since Phase 1) and CreateUserWithCredentials (registered,
+-- server-generated UUID v7). username/password_hash nullable together
+-- (CHECK constraint enforces both-or-neither) — an anonymous user has
+-- neither.
 CREATE TABLE users (
-    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username      TEXT UNIQUE,
+    password_hash TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK ((username IS NULL) = (password_hash IS NULL))
 );
 
 -- Game record
@@ -504,6 +597,21 @@ CREATE TABLE games (
     -- resume (or immediately resolve) the grace period on hydration.
     white_disconnected_at TIMESTAMPTZ,
     black_disconnected_at TIMESTAMPTZ,
+    -- matchmaking_request_id (migration 005, Phase 3, ADR-034): NULL unless
+    -- this game was created via CreateMatchedGame. UUID v4 (a
+    -- correlation/idempotency token generated once per pairing attempt and
+    -- reused across retries of that attempt), not v7 like id above — this
+    -- is not a DB-primary-key generation, it's a caller-supplied dedup key.
+    -- UNIQUE + ON CONFLICT DO NOTHING is what makes CreateMatchedGame safe
+    -- to retry after an ambiguous failure.
+    matchmaking_request_id UUID UNIQUE,
+    -- activated_at (migration 006, Phase 3, ADR-041/042): NULL until the
+    -- game transitions WAITING_FOR_PLAYER → ACTIVE. Set atomically with
+    -- that transition (GameStore.ActivateGame). Anchors ADR-041's
+    -- move-count-gated first-move-grace-period timer and ADR-042's
+    -- matched-opponent-never-connected timeout — both need to know exactly
+    -- when a game actually went live, not just when it was created.
+    activated_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -540,6 +648,8 @@ cmd/server/main.go
     │
     ├── internal/api         (chi router, HTTP handlers, WS upgrade)
     │       ├── internal/game (game.Manager)
+    │       ├── internal/store (AuthHandler's UserStore)
+    │       ├── internal/auth  (AuthHandler's password hashing)
     │       └── internal/ws   (ws.Connection, ws.Registry — types only, not the reverse)
     │
     ├── internal/ws          (WebSocket infrastructure)
@@ -554,39 +664,70 @@ cmd/server/main.go
     │           mode, so internal/game has no HARD dependency on Redis being
     │           reachable, only a conditional one)
     │
+    ├── internal/matchmaking (Phase 3 — pairing loop, chess-server side only)
+    │       ├── internal/game     (Manager.CreateMatchedGame, MatchedGameTokens)
+    │       ├── internal/rpc      (shared-secret gRPC client interceptor)
+    │       ├── proto/matchmakingv1 (generated gRPC client stubs)
+    │       └── github.com/redis/go-redis/v9 (reuses main.go's existing client —
+    │           implementation-time decision, not requiring its own ADR; see
+    │           NewPairingLoop's signature, which only accepts an
+    │           already-connected client, never constructs its own)
+    │
     ├── internal/store       (PostgreSQL via pgx/v5)
     │       └── (no application dependencies)
     │
-    ├── internal/auth        (JWT tokens — PlayerClaims and, as of Phase 2, ConnectClaims)
+    ├── internal/auth        (JWT tokens — PlayerClaims, ConnectClaims,
+    │                        MatchmakingClaims — plus bcrypt password hashing, Phase 3)
     │       └── (no application dependencies)
     │
     └── internal/chess       (notnil/chess wrapper)
             └── (no application dependencies)
+
+cmd/matchmaking-service/main.go   (Phase 3 — separate binary, separate container)
+    │
+    └── internal/mmsvc       (HTTP/SSE handlers, gRPC server, queue-timeout sweep)
+            ├── internal/auth     (MatchmakingClaims sign/verify — the only
+            │                       internal/auth capability this binary uses;
+            │                       ConnectClaims/PlayerClaims are minted by
+            │                       chess-server and relayed here as opaque strings,
+            │                       never parsed or reconstructed)
+            ├── internal/rpc      (shared-secret gRPC server interceptor)
+            ├── proto/matchmakingv1 (generated gRPC server stubs)
+            └── github.com/redis/go-redis/v9 (own client, internal/mmsvc.NewRedisClient
+                — deliberately duplicated from internal/game's rather than
+                imported, so this binary never depends on internal/game/
+                internal/store/internal/chess/internal/ws at all — ADR-032's
+                "matchmaking-service never talks to GameStore/GameRegistry"
+                boundary, enforced at the import graph level, not just by
+                convention)
 ```
 
-Dependencies flow downward only. No circular imports. `internal/ws` does not know about `internal/game`. This is enforced by the Go compiler — not just a style convention: `internal/api` is the only package permitted to import both `internal/ws` and `internal/game`, since it is the one place both are genuinely needed (bridging an HTTP-upgraded WebSocket connection to a game session). `internal/game` is the only package that talks to Redis, and only for routing/ownership — no other package imports a Redis client.
-
-**Forward note (Phase 3, not yet implemented):** Phase 3's design
-(`DECISIONS_LOG_PHASE_3.md` ADR-032) adds a new `internal/matchmaking`
-package on the chess-server side that also needs to talk to Redis (its own
-pairing loop against the matchmaking queue). This invariant — "`internal/game`
-is the only package that talks to Redis" — will need an explicit amendment
-when that lands: either `internal/matchmaking` gets its own client (simplest,
-reuses `main.go`'s existing connection, no cross-package coupling), or it's
-routed through an `internal/game`-exposed accessor. This is an
-implementation-time wiring decision, not something requiring its own ADR —
-flagged here so it isn't silently forgotten when Step 3 of
-`phases/current/PHASE_3.md`'s Implementation Checklist is picked up.
+Dependencies flow downward only. No circular imports. `internal/ws` does
+not know about `internal/game`. This is enforced by the Go compiler — not
+just a style convention: `internal/api` is the only package permitted to
+import both `internal/ws` and `internal/game`, since it is the one place
+both are genuinely needed (bridging an HTTP-upgraded WebSocket connection
+to a game session). `internal/game` is the only chess-server-side package
+that talks to Redis for routing/ownership; `internal/matchmaking` is a
+second chess-server-side Redis client, but for the matchmaking queue only
+(a different key namespace, not routing/ownership), and reuses `main.go`'s
+already-connected client rather than opening its own connection.
+`matchmaking-service` is a genuinely separate binary with its own `main.go`
+and its own Redis client — it shares no Go package import, and no process,
+with chess-server; the gRPC contract (`proto/matchmakingv1`) is the only
+link between the two binaries.
 
 ---
 
-## Matchmaking (Phase 3 — Design Decided, Not Yet Implemented)
+## Matchmaking (Phase 3 — Implemented, 2026-08-17)
 
-> Everything in this section describes a decided design
-> (`DECISIONS_LOG_PHASE_3.md` ADR-032–038, independently reviewed 2026-08-08),
-> not built state. No code in this section exists in the repository yet. See
-> `phases/current/PHASE_3.md` for the full checklist and the still-open
-> connection-grace-semantics question this design does not yet resolve.
+> This section describes the built system — `DECISIONS_LOG_PHASE_3.md`
+> ADR-032 through ADR-044, all six `e2e-phase3.sh` integration scenarios
+> verified against the live cluster. Superseded framing: this section
+> previously described a design-decided-not-yet-implemented state; that
+> framing no longer applies. See `phases/current/PHASE_3.md` for the full
+> checklist and `phases/current/PHASE_3_DESIGN_NOTES.md` for the complete
+> reasoning trail, including §18's connect-flow redesign (ADR-044).
 
 ### Component overview
 
@@ -596,108 +737,189 @@ flagged here so it isn't silently forgotten when Step 3 of
          │ /games, /connect             │ /matchmaking       │
          ▼                              ▼                    │
   chess-server instances          matchmaking-service            │
-  (existing, Phase 1/2)           (NEW — separate deployable)    │
+  (existing, Phase 1/2)           (own container, own binary)    │
          │                              │                    │
-         │ internal/matchmaking         │ SSE conns          │
-         │ (NEW, chess-server side)     │ (userID→flusher,   │
-         │ pairing loop: ZPOPMIN         │  in-memory, M=1)   │
-         │                              │                    │
+         │ internal/matchmaking         │ internal/mmsvc     │
+         │ pairing loop: ZPOPMIN         │ Handler (HTTP/SSE) │
+         │                              │ Hub (SSE fan-out,   │
+         │                              │   userID→chan, M=1) │
+         │                              │ ReportServer (gRPC) │
+         │                              │ Sweep (queue TTL)   │
          ▼                              ▼                    │
      Redis (existing instance, new namespace)
        matchmaking:queue:10+0 (ZSET)
-       matchmaking_active_game:{userID} (lease key, written by chess-server only)
+       matchmaking_active_game:{userID}  (PlayerToken lease, chess-server-written)
+       matchmaking_result:{userID}       (ReportServer/Sweep-written, 5min TTL)
+       reported:{gameID}                 (ReportMatchCreated dedup, 5min TTL)
          │
          ▼
-     PostgreSQL (existing — new matchmaking_request_id column on games)
+     PostgreSQL (existing — matchmaking_request_id + activated_at columns on games)
 
   chess-server ── gRPC (MatchReportService, shared-secret interceptor) ──▶ matchmaking-service
 ```
 
-**Key structural facts, all decided in ADR-032:**
+**Key structural facts, all confirmed as-built:**
 - `matchmaking-service` never picks or assigns a pair, and never talks to
-  `GameStore`, `GameRegistry`, or the Redis ownership keys — it only sees
-  outcomes reported to it after the fact.
+  `GameStore`, `GameRegistry`, Postgres, or the Redis ownership keys —
+  confirmed at the import-graph level (Dependency Graph above), not just by
+  convention: `cmd/matchmaking-service` has no transitive dependency on
+  `internal/game`/`internal/store` at all.
 - chess-server instances never talk to each other directly, and never hold
   or know about any SSE connection. `ZPOPMIN`'s atomicity is the entire
-  cross-instance coordination mechanism for pairing — the same primitive
-  `ClaimOwnership` already uses.
-- The two services share the existing Redis instance (new key namespace, not
-  new infrastructure) and the existing nginx edge proxy (new `location
-  /matchmaking` block, ADR-035), but are otherwise independent deployables
-  with their own container, own `docker-compose.yml` entry, and a gRPC
-  contract (not a shared database or shared in-process types) as the only
-  link between them.
+  cross-instance coordination mechanism for pairing — verified under real
+  concurrent load, not just `-race`-simulated (`e2e-phase3.sh scenario4`:
+  20 players queued rapidly against both live instances, exactly 10 matched
+  games, zero double-matches).
+- The two services share the existing Redis instance (new key namespace,
+  not new infrastructure) and the existing nginx edge proxy (`location
+  /matchmaking`, ADR-035), but are otherwise independent deployables with
+  their own container, own `docker-compose.yml` entry, and a gRPC contract
+  (`proto/matchmakingv1`, not a shared database or shared in-process types)
+  as the only link between them.
 
 ### Component responsibilities
 
 | Component | Owns | Does NOT do |
 |---|---|---|
-| **matchmaking-service** | `POST /matchmaking/queue` (mint `MatchmakingClaims` + `ZADD NX`), `GET /matchmaking/stream` (SSE), `GET /matchmaking/status` (polling backstop), `DELETE /matchmaking/queue` (cancel), queue-timeout sweep, `MatchReportService` gRPC server | Never picks or assigns a chess-server instance. Never touches `GameStore`/`GameRegistry`/Redis ownership keys. Never decides who plays whom. |
-| **chess-server (`internal/matchmaking`, new)** | Per-instance pairing loop (`ZPOPMIN queue 2`), `Manager.CreateMatchedGame` (atomic two-player insert, `GameRegistry` registration, `ClaimOwnership`), re-enqueue-on-failure, gRPC client reporting outcomes, `matchmaking_active_game:{userID}` writes (folded into the existing heartbeat tick in `internal/game/heartbeat.go`) | Never talks to another chess-server instance. Never holds or knows about an SSE connection. |
+| **matchmaking-service** (`cmd/matchmaking-service`, `internal/mmsvc`) | `POST /matchmaking/queue` (mint `MatchmakingClaims` + `ZADD NX`), `GET /matchmaking/stream` (SSE), `GET /matchmaking/status` (polling backstop), `DELETE /matchmaking/queue` (cancel), queue-timeout sweep (`Sweep`, own 5s ticker), `MatchReportService` gRPC server (`ReportServer`) | Never picks or assigns a chess-server instance. Never touches `GameStore`/`GameRegistry`/Redis ownership keys/Postgres at all. Never decides who plays whom. |
+| **chess-server (`internal/matchmaking`)** | Per-instance pairing loop (`ZPOPMIN queue 2`), `Manager.CreateMatchedGame` (atomic two-player insert, `GameRegistry` registration, `ClaimOwnership`, arms `matchedOpponentConnectTimeout`, mints both `MatchedGameTokens` pairs), re-enqueue-on-failure, gRPC client reporting outcomes, `matchmaking_active_game:{userID}` writes (folded into the existing heartbeat tick in `internal/game/heartbeat.go`) | Never talks to another chess-server instance. Never holds or knows about an SSE connection. |
 
-### New database column (planned, not yet migrated)
+### Database columns (implemented — migrations 005/006)
 
 ```sql
--- Planned migration, Phase 3 Step 1 (DECISIONS_LOG_PHASE_3.md ADR-034):
+-- migration 005 (ADR-034):
 ALTER TABLE games ADD COLUMN matchmaking_request_id UUID UNIQUE;
 -- Nullable: only matched games populate it. UUID v4 (correlation/idempotency
 -- token generated per pairing attempt, reused across retries of that same
--- attempt) — NOT the same convention as games.id, which is UUID v7
--- (confirmed via internal/game/manager.go's CreateGame: `uuid.NewV7()`,
--- "time-ordered, better B-tree index locality than v4"). ADR-034's original
--- text incorrectly claimed v4 was this codebase's general DB-primary-key
--- convention, based on a stale doc comment in game_store.go rather than the
--- actual generation call site — corrected during independent review.
+-- attempt) — NOT the same convention as games.id, which is UUID v7.
 -- Insert issued with ON CONFLICT (matchmaking_request_id) DO NOTHING,
 -- making CreateMatchedGame safe to retry under ACK loss.
+
+-- migration 006 (ADR-041/042):
+ALTER TABLE games ADD COLUMN activated_at TIMESTAMPTZ;
+-- NULL until WAITING_FOR_PLAYER → ACTIVE, set atomically with that
+-- transition (GameStore.ActivateGame). Anchors both ADR-041's first-move
+-- grace period and ADR-042's matched-opponent-never-connected timeout.
 ```
 
-### New Redis keys (planned)
+See the Database Schema section above for the full current `games`/`users`
+table definitions, including migration 007's `username`/`password_hash`
+(ADR-043).
+
+### Redis keys (implemented)
 
 ```
 matchmaking:queue:10+0                    ZSET, member=userID, score=enqueue timestamp
-matchmaking_active_game:{userID}          STRING (JSON), TTL=OwnershipTTL (30s, reused constant),
-                                           renewed every OwnershipRenewInterval (10s) by chess-server's
-                                           existing heartbeat loop — written only by chess-server,
-                                           read-only for matchmaking-service (ADR-037)
+matchmaking_active_game:{userID}          STRING (JSON: gameID, playerToken, instanceLabel,
+                                           wsPath), TTL=OwnershipTTL (30s), renewed every
+                                           OwnershipRenewInterval (10s) by chess-server's
+                                           existing heartbeat loop — written only by
+                                           chess-server, read-only for matchmaking-service.
+                                           playerToken (renamed from connectToken, ADR-044 —
+                                           see Match Notification below) is a long-lived
+                                           PlayerClaims, deliberately safe to leave unrenewed
+                                           between heartbeat ticks.
+matchmaking_result:{userID}               STRING (JSON), TTL=5min. Written by ReportServer
+                                           (on match/failure) or Sweep (on queue timeout);
+                                           read by GET /matchmaking/status. The lost-RPC/
+                                           lost-SSE-push backstop.
+reported:{gameID}                         STRING ("1"), TTL=5min. ReportMatchCreated's own
+                                           idempotency key — covers a chess-server gRPC retry
+                                           after a lost ACK without double-delivering MATCH_FOUND.
 ```
 
-### gRPC contract (planned)
+### gRPC contract (implemented)
 
 Unary, two methods, shared-secret interceptor for the trust boundary (Docker
 Compose has no `NetworkPolicy` equivalent — deliberate interim choice,
 mTLS post-Phase-3). Full `.proto` and reasoning: `DECISIONS_LOG_PHASE_3.md`
-ADR-033, `phases/current/PHASE_3_DESIGN_NOTES.md` §6.
+ADR-033, ADR-044; `phases/current/PHASE_3_DESIGN_NOTES.md` §6, §18.
 
 ```
 service MatchReportService {
   rpc ReportMatchCreated(MatchCreatedRequest) returns (MatchCreatedResponse);
   rpc ReportMatchmakingFailed(MatchmakingFailedRequest) returns (MatchmakingFailedResponse);
 }
+
+message MatchCreatedRequest {
+  string game_id             = 1;
+  string white_user_id       = 2;
+  string black_user_id       = 3;
+  string white_player_token  = 4;  // signed PlayerClaims — 24h, fallback for a later /resolve
+  string black_player_token  = 5;
+  string white_connect_token = 7;  // signed ConnectClaims — short-lived, directly dialable (ADR-044)
+  string black_connect_token = 8;
+  string instance_label      = 6;
+}
 ```
 
-### Match notification: SSE, a new token type
+### Match notification: SSE, two connect paths (ADR-044)
 
 Match notification does **not** reuse the WebSocket infrastructure
 (`internal/ws`) at all — it's plain HTTP `text/event-stream` served by
-matchmaking-service, authenticated by a new `MatchmakingClaims{UserID}` JWT
-(same signing secret as `PlayerClaims`/`ConnectClaims`, distinguished by
-claim shape, per this codebase's existing one-secret convention). Once
-`MATCH_FOUND` is delivered, the client's connect flow is the ordinary
-existing `/resolve` → `ConnectClaims` → `/connect/{instanceLabel}` path —
-not a new connection mechanism.
+matchmaking-service, authenticated by `MatchmakingClaims{UserID}` (same
+signing secret as `PlayerClaims`/`ConnectClaims`, distinguished by claim
+shape).
 
-### Known gap in this design (see `phases/current/PHASE_3.md`'s Open Question)
+```
+event: MATCH_FOUND
+data: {"gameID":"...","connectToken":"...","playerToken":"...","instanceLabel":"...","wsPath":"/connect/..."}
 
-A matched player who connects and stays connected while their assigned
-opponent never connects at all has no timer of any kind protecting them —
-the existing abandonment mechanism only arms on an actual `HandleDisconnect`
-call, which never fires for a player who never connected in the first
-place. Confirmed NOT to be a problem for the case where the connected player
-also later disconnects (the existing `WAITING_FOR_PLAYER → ABORTED` path,
-ADR-029, handles that correctly with no matchmaking-specific code). The
-indefinite-wait case is explicitly deferred to its own future ADR, not
-solved by this design.
+event: MATCHMAKING_FAILED
+data: {"reason":"RETRIES_EXHAUSTED"}   // or "QUEUE_TIMEOUT" (Sweep, generated natively — never
+                                       // translated from the gRPC enum, which only ever carries
+                                       // RETRIES_EXHAUSTED)
+```
+
+**Two distinct tokens, two distinct connect paths — this is the corrected
+design, not the original one** (`DECISIONS_LOG_PHASE_3.md` ADR-044,
+2026-08-17, superseding this section's original claim that `connectToken`
+was a reused `PlayerClaims` requiring `/resolve` for every connection):
+
+- **`connectToken`**: a genuinely fresh, short-lived `ConnectClaims`
+  (carries `instanceLabel`), minted directly inside `CreateMatchedGame` at
+  match time. Dial `/connect/{instanceLabel}` with it **immediately, no
+  `/resolve` call** — safe specifically because the instance minting it is
+  synchronously about to claim ownership of the new game, so there is zero
+  elapsed time between minting and the instance actually being correct.
+- **`playerToken`**: the player's ordinary long-lived `PlayerClaims`,
+  fallback for any *later* reconnect. If `connectToken` is ever rejected as
+  stale (SSE push missed, `/status` polled minutes later, connection
+  dropped and reopened), the client falls back to
+  `GET /games/{id}/resolve` with `Authorization: Bearer <playerToken>` —
+  the exact same path an ordinary shared-link reconnect already uses, not a
+  matchmaking-specific mechanism.
+
+The same distinction applies to the active-game marker's 409 response
+(`ALREADY_IN_ACTIVE_GAME`) and `GET /matchmaking/status`'s `"matched"`
+shape — the marker's field is `playerToken` only (that read pattern is
+genuinely unbounded-time-since-write, so `PlayerClaims` + forced `/resolve`
+is correct there, unchanged from the original design); `"matched"` status
+carries both tokens, same as `MATCH_FOUND`, since it's populated by the
+same `ReportMatchCreated` write.
+
+### Known gaps (as-built, not aspirational)
+
+**CLOSED (2026-08-10, ADR-041/ADR-042):** the original version of this
+section described an unsolved gap — a matched player who connects and
+stays connected while their assigned opponent never connects at all had no
+timer protecting them. `matchedOpponentConnectTimeout`, armed synchronously
+in `CreateMatchedGame`, closes this. See the Game State Machine section
+above for full detail, including the related first-move grace period
+(ADR-041) this same work surfaced and closed.
+
+**Open, found during Step 7's live E2E run (`scenario5`), not yet closed:**
+when `CreateMatchedGame` fails deterministically (e.g. a userID with no
+corresponding `users` row — an FK violation, not a transient error),
+`PairingLoop.reenqueue` puts both players back at their original queue
+scores (ADR-034) — but their underlying problem is permanent, so the very
+next pairing-loop tick (500ms later) immediately re-picks them and fails
+again, in an unbounded retry loop with no backoff. There is currently no
+distinction anywhere in this system between a transient `CreateMatchedGame`
+failure (worth retrying) and a deterministic one (never will succeed,
+should stop retrying and surface differently). Not solved here — flagged
+for its own future ADR, same treatment the original opponent-never-connects
+gap received before ADR-041/042 closed it.
 
 ---
 
@@ -706,6 +928,6 @@ solved by this design.
 - **No ORM**: Raw SQL via pgx/v5. ORMs hide query behavior and generate inefficient queries. You must know what your queries are.
 - **No global state**: Everything is injected. No `var db *pgxpool.Pool` at package level.
 - **No client-side game authority**: The client is a display terminal. It validates moves for UX only.
-- **No match queue**: Players use shared links. Matchmaking is Phase 3.
-- **No account system**: Anonymous userIDs generated client-side, signed into JWT. Full auth is post-Phase 1.
+- **No ELO-based or skill-based matching**: Phase 3's queue is FIFO by wait time only. ELO doesn't exist yet (Phase 4).
+- **No general account/session system**: `POST /users`/`POST /login` (Phase 3, ADR-043) let a client obtain or recover a stable `userID` via username+password — that is the full extent of it. No issued token, no session, no expiration, no authorization checks anywhere else in the system: every endpoint still accepts a client-supplied `userID` at face value, exactly as before this addition. A real session/auth layer remains explicitly deferred, not implemented.
 - **No cross-instance state synchronization**: Phase 2 deliberately routes to a single owning instance instead — there is never a second live `GameSession` for one game to synchronize with (`DECISIONS_LOG_PHASE_2.md` ADR-021). If a future phase needs genuine multi-writer state, that is a different, harder problem this project has not attempted.

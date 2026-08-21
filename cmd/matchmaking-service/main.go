@@ -139,6 +139,26 @@ func loadConfig() (config, error) {
 		cfg.MatchmakingClaimsTTL = time.Duration(claimsTTLSeconds) * time.Second
 	}
 
+	// PHASE_3_DESIGN_NOTES.md §18.5 (2026-08-17): MatchmakingClaimsTTL must
+	// safely outlive the longest a player could legitimately still be
+	// queued — QueueTimeout itself, plus Sweep's fixed 5s tick interval
+	// (worst case, a timed-out player waits up to one extra tick before the
+	// sweep notices and removes them), plus round-trip margin. Validated
+	// here, at startup, rather than left to two independently-configured env
+	// vars staying in sync by luck — catches exactly the case where
+	// MATCHMAKING_QUEUE_TIMEOUT_SECONDS is raised in some future deployment
+	// without MATCHMAKING_CLAIMS_TTL_SECONDS following it up. Fails fast
+	// (panics, same treatment every other required-config check in this
+	// function already gets) rather than silently letting queued players'
+	// tokens expire out from under them mid-wait.
+	const minClaimsTTLMargin = 15 * time.Second
+	if cfg.MatchmakingClaimsTTL < cfg.QueueTimeout+minClaimsTTLMargin {
+		return config{}, fmt.Errorf(
+			"MATCHMAKING_CLAIMS_TTL_SECONDS (%s) must be at least MATCHMAKING_QUEUE_TIMEOUT_SECONDS (%s) + %s — "+
+				"otherwise a player's own matchmaking token can expire while they are still legitimately queued",
+			cfg.MatchmakingClaimsTTL, cfg.QueueTimeout, minClaimsTTLMargin)
+	}
+
 	return cfg, nil
 }
 

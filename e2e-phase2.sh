@@ -364,8 +364,9 @@ scenario0() {
   echo "--- white log ---"; tail -n 20 "$WHITE_WS_LOG"
   echo "--- black log ---"; tail -n 20 "$BLACK_WS_LOG"
   echo "Watch for: White sees GAME_STATE then OPPONENT_CONNECTED; Black sees GAME_STATE (ACTIVE)."
-  pause
-  echo "Sending e4 as White..."
+  echo "Sending e4 as White now — no interactive pause here anymore: DECISIONS_LOG_PHASE_3.md"
+  echo "ADR-041 added a 20s first-move grace period (universally scoped, not matchmaking-only)"
+  echo "that would silently ABORT this game if a human paused here longer than 20s."
   move white e4
   sleep 1
   load_state
@@ -421,13 +422,23 @@ scenario2() {
 }
 
 scenario3() {
-  echo "=== Scenario 3: One player never reconnects (abandonment) ==="
+  echo "=== Scenario 3: One player never reconnects (ordinary abandonment) ==="
   new_game
   load_state
   local owner_id; owner_id=$(get_owner_raw)
   ws_connect white; ws_connect black
   ws_wait_ready white
   ws_wait_ready black
+  echo "Playing 2 moves first (White e4, Black e5) — DECISIONS_LOG_PHASE_3.md ADR-041 added a"
+  echo "20s first-move grace period that governs an ACTIVE game with fewer than 2 moves played,"
+  echo "SUPPRESSING the ordinary 60s per-color abandon timer entirely during that window. This"
+  echo "scenario tests the ORIGINAL ordinary-abandonment path, so it needs the first-move"
+  echo "mechanism to have already retired (move count >= 2) before the disconnect sequence below"
+  echo "— see scenario7 for dedicated coverage of the first-move mechanism itself."
+  move white e4
+  sleep 1
+  move black e5
+  sleep 1
   echo "Stopping owner $owner_id (only White will reconnect)..."
   kill_instance "$owner_id"
   ws_disconnect white; ws_disconnect black

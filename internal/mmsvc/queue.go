@@ -39,11 +39,14 @@ func activeGameMarkerKey(userID string) string {
 }
 
 // activeGameMarker mirrors internal/game.ActiveGameMarker's JSON shape
-// exactly (DECISIONS_LOG_PHASE_3.md ADR-037: camelCase tags, four fields) —
-// a local copy, not an import, per this file's package doc comment.
+// exactly (DECISIONS_LOG_PHASE_3.md ADR-037: camelCase tags, four fields;
+// PlayerToken renamed from ConnectToken per PHASE_3_DESIGN_NOTES.md §18,
+// 2026-08-17 — this field was always a PlayerClaims, the original name was
+// simply wrong) — a local copy, not an import, per this file's package doc
+// comment.
 type activeGameMarker struct {
 	GameID        string `json:"gameID"`
-	ConnectToken  string `json:"connectToken"`
+	PlayerToken   string `json:"playerToken"`
 	InstanceLabel string `json:"instanceLabel"`
 	WSPath        string `json:"wsPath"`
 }
@@ -135,34 +138,43 @@ func resultKey(userID string) string {
 
 // resultTTL bounds how long a written match outcome stays queryable via
 // GET /matchmaking/status after the gRPC server writes it — long enough to
-// comfortably outlast MatchmakingClaimsTTL (10s) plus whatever polling
-// delay a client's fallback path uses, short enough that a stale outcome
-// for a long-since-requeued userID does not linger indefinitely. Not an
-// ADR-tracked constant — no ADR fixes this number; revisit if status
-// polling in practice needs a longer window.
+// comfortably outlast MatchmakingClaimsTTL (60s, per PHASE_3_DESIGN_NOTES.md
+// §18.5) plus whatever polling delay a client's fallback path uses, short
+// enough that a stale outcome for a long-since-requeued userID does not
+// linger indefinitely. Not an ADR-tracked constant — no ADR fixes this
+// number; revisit if status polling in practice needs a longer window.
 const resultTTL = 5 * time.Minute
 
 // matchmakingResult is the outcome record GET /matchmaking/status reads.
 // Status is either "matched" or "failed" (never "waiting" — that state is
 // the absence of a record, see Handler.Status). omitempty on every other
 // field: a "matched" result never carries Reason, a "failed" result never
-// carries the connect fields, and the JSON shape should reflect that rather
-// than spraying empty strings.
+// carries the connect/player fields, and the JSON shape should reflect that
+// rather than spraying empty strings.
+//
+// Two token fields for a "matched" result (PHASE_3_DESIGN_NOTES.md §18,
+// 2026-08-17): ConnectToken is a freshly-minted, short-lived ConnectClaims
+// — directly dialable, no /resolve round-trip needed, safe because
+// ReportMatchCreated (reportserver.go) writes this essentially
+// synchronously with CreateMatchedGame minting it. PlayerToken is the
+// long-lived (24h) PlayerClaims fallback — if a client reads this result
+// late enough that ConnectToken has expired (e.g. polled minutes after the
+// match, having missed the SSE push), it falls back to
+// GET /games/{id}/resolve using PlayerToken, the same recovery shape the
+// active-game marker's own staleness handling already uses.
 type matchmakingResult struct {
 	Status        string `json:"status"`
 	GameID        string `json:"gameID,omitempty"`
 	ConnectToken  string `json:"connectToken,omitempty"`
+	PlayerToken   string `json:"playerToken,omitempty"`
 	InstanceLabel string `json:"instanceLabel,omitempty"`
 	WSPath        string `json:"wsPath,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 }
 
-// SetResult writes userID's matchmaking outcome. Not called anywhere in
-// this commit — the gRPC server that will call it (ReportMatchCreated /
-// ReportMatchmakingFailed) is a later, separate Step 4 checklist item — but
-// defined now alongside GetResult so the two form one complete, reviewable
-// contract rather than half of one landing now and the other half assumed
-// later.
+// SetResult writes userID's matchmaking outcome, called by ReportServer
+// (reportserver.go, ReportMatchCreated/ReportMatchmakingFailed) and Sweep
+// (sweep.go, on a queue timeout) and read back by Handler.Status.
 func (q *Queue) SetResult(ctx context.Context, userID string, result matchmakingResult) error {
 	payload, err := json.Marshal(result)
 	if err != nil {

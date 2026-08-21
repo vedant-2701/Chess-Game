@@ -153,7 +153,7 @@ func (m *Manager) renewActiveGameMarkers(ctx context.Context, sessions []*GameSe
 		} else {
 			markers[snap.PlayerWhiteID] = ActiveGameMarker{
 				GameID:        session.ID,
-				ConnectToken:  whiteToken,
+				PlayerToken:   whiteToken,
 				InstanceLabel: m.instanceID,
 				WSPath:        "/connect/" + m.instanceID,
 			}
@@ -169,7 +169,7 @@ func (m *Manager) renewActiveGameMarkers(ctx context.Context, sessions []*GameSe
 		} else {
 			markers[snap.PlayerBlackID] = ActiveGameMarker{
 				GameID:        session.ID,
-				ConnectToken:  blackToken,
+				PlayerToken:   blackToken,
 				InstanceLabel: m.instanceID,
 				WSPath:        "/connect/" + m.instanceID,
 			}

@@ -6,22 +6,33 @@ import (
 )
 
 // Event names and payload shapes for SSE pushes over GET /matchmaking/stream
-// (PHASE_3.md's "Match Notification" section). Defined here, not in a
-// future gRPC-server-specific file, because both this file's Stream handler
-// and the not-yet-built MatchReportService gRPC server (a later Step 4
-// checklist item) need the same two shapes — one to serialize, one to
+// (PHASE_3.md's "Match Notification" section). Defined here, not in
+// reportserver.go, because both handler.go's Stream and reportserver.go's
+// ReportServer need the same two shapes — one to serialize, one to
 // document what a caller of Hub.Notify should pass.
 const (
 	EventMatchFound        = "MATCH_FOUND"
 	EventMatchmakingFailed = "MATCHMAKING_FAILED"
 )
 
-// matchFoundData mirrors PHASE_3.md's MATCH_FOUND payload exactly, and
-// deliberately reuses existingGame's field set (not a new struct with
-// different names) — same reasoning as existingGame's own doc comment:
-// one client-side shape for "here is a game to connect to," used
-// identically by the 409 response and this event.
-type matchFoundData = existingGame
+// matchFoundData mirrors PHASE_3.md's MATCH_FOUND payload — its own
+// struct, no longer a type alias of existingGame (PHASE_3_DESIGN_NOTES.md
+// §18, 2026-08-17: the two shapes have genuinely diverged). ConnectToken
+// here is a freshly-minted, short-lived ConnectClaims — directly dialable,
+// no /resolve round-trip needed, safe because ReportServer
+// (reportserver.go) relays it essentially synchronously with
+// CreateMatchedGame minting it. PlayerToken is the long-lived (24h)
+// PlayerClaims fallback, included for the same staleness-recovery reason
+// matchmakingResult.PlayerToken is (queue.go's doc comment): a client that
+// receives this late enough for ConnectToken to have expired falls back to
+// GET /games/{id}/resolve using PlayerToken.
+type matchFoundData struct {
+	GameID        string `json:"gameID"`
+	ConnectToken  string `json:"connectToken"`
+	PlayerToken   string `json:"playerToken"`
+	InstanceLabel string `json:"instanceLabel"`
+	WSPath        string `json:"wsPath"`
+}
 
 // matchmakingFailedData mirrors PHASE_3.md's MATCHMAKING_FAILED payload.
 type matchmakingFailedData struct {
@@ -29,10 +40,10 @@ type matchmakingFailedData struct {
 }
 
 // Hub holds each connected player's outbound SSE event channel, keyed by
-// userID, so a later event — MATCH_FOUND from the gRPC server,
-// MATCHMAKING_FAILED from either the gRPC server or the queue-timeout sweep
-// (both later Step 4 checklist items) — can be pushed to whichever open
-// stream belongs to that player.
+// userID, so an event — MATCH_FOUND/MATCHMAKING_FAILED from ReportServer
+// (reportserver.go), or MATCHMAKING_FAILED from Sweep (sweep.go, on a queue
+// timeout) — can be pushed to whichever open stream belongs to that
+// player.
 //
 // In-memory, single-map, correct only at one matchmaking-service replica
 // (M=1) — this is TD-P3-003, already tracked in PHASE_3.md, not a new

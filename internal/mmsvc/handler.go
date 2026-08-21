@@ -18,13 +18,9 @@ import (
 // thin struct holding its dependencies, one method per endpoint,
 // CODING_GUIDELINES.md §7's envelope on every response.
 //
-// Queue, Stream, Status, Cancel, and Health are all implemented. The
-// MatchReportService gRPC server and the queue-timeout sweep goroutine —
-// the two remaining producers that will actually call Hub.Notify and
-// Queue.SetResult — are separate, later Step 4 checklist items; see
-// phases/current/PHASE_3.md. Until one of them exists, Status always
-// reports "waiting" and Stream never receives an event — correct, not
-// broken, behavior for the system's current build state.
+// Queue, Stream, Status, Cancel, and Health are all implemented, and both
+// producers Stream/Status depend on — reportserver.go's ReportServer and
+// sweep.go's Sweep — now exist and call Hub.Notify/Queue.SetResult.
 type Handler struct {
 	queue                *Queue
 	hub                  *Hub
@@ -101,7 +97,7 @@ func (h *Handler) Queue(w http.ResponseWriter, r *http.Request) {
 		writeErrorWithExistingGame(w, http.StatusConflict, errCodeAlreadyInActiveGame,
 			"player already has an active game", existingGame{
 				GameID:        marker.GameID,
-				ConnectToken:  marker.ConnectToken,
+				PlayerToken:   marker.PlayerToken,
 				InstanceLabel: marker.InstanceLabel,
 				WSPath:        marker.WSPath,
 			})
@@ -174,11 +170,6 @@ func (h *Handler) verifyMatchmakingTokenFromQuery(w http.ResponseWriter, r *http
 // connect flow verifies its own claims once, the same way, not per-message),
 // then holds the connection, relaying whatever this player's Hub channel
 // receives as SSE events until the client disconnects.
-//
-// Not yet exercised end-to-end in this commit — nothing produces events on
-// the Hub yet (the gRPC server and queue-timeout sweep are later Step 4
-// checklist items) — but the connection lifecycle (register, relay, clean
-// unregister on disconnect) is complete and independently testable now.
 func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 	claims, ok := h.verifyMatchmakingTokenFromQuery(w, r)
 	if !ok {
@@ -227,11 +218,15 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 // statusResponseData is the union of GET /matchmaking/status's three
 // possible shapes (PHASE_3.md's New Endpoints). omitempty on every field
 // but Status so "waiting" serializes as exactly {"status":"waiting"}, not
-// with a spray of empty strings.
+// with a spray of empty strings. Two token fields for a "matched" result,
+// same reasoning as matchFoundData/matchmakingResult (PHASE_3_DESIGN_NOTES.md
+// §18): ConnectToken is directly dialable but may have expired if this is
+// polled late; PlayerToken is the always-valid fallback for /resolve.
 type statusResponseData struct {
 	Status        string `json:"status"`
 	GameID        string `json:"gameID,omitempty"`
 	ConnectToken  string `json:"connectToken,omitempty"`
+	PlayerToken   string `json:"playerToken,omitempty"`
 	InstanceLabel string `json:"instanceLabel,omitempty"`
 	WSPath        string `json:"wsPath,omitempty"`
 	Reason        string `json:"reason,omitempty"`
@@ -239,14 +234,12 @@ type statusResponseData struct {
 
 // Status implements GET /matchmaking/status?token=<matchmakingToken>
 // (PHASE_3.md's New Endpoints — the lost-RPC/lost-SSE-push backstop,
-// ADR-033's Consequences). Reads the same outcome record the gRPC server
-// (a later Step 4 checklist item) will write via Queue.SetResult;
+// ADR-033's Consequences). Reads the same outcome record ReportServer
+// (reportserver.go) and Sweep (sweep.go) write via Queue.SetResult;
 // "waiting" is simply the absence of that record, not a distinct tracked
 // state — this endpoint has no independent notion of "still queued" versus
 // "was never queued at all," matching PHASE_3.md's own three-state contract
-// exactly. Until the gRPC server exists, every call returns "waiting" —
-// correct, if uninteresting, behavior for the state this system is
-// actually in right now.
+// exactly.
 func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 	claims, ok := h.verifyMatchmakingTokenFromQuery(w, r)
 	if !ok {
@@ -268,6 +261,7 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		Status:        result.Status,
 		GameID:        result.GameID,
 		ConnectToken:  result.ConnectToken,
+		PlayerToken:   result.PlayerToken,
 		InstanceLabel: result.InstanceLabel,
 		WSPath:        result.WSPath,
 		Reason:        result.Reason,

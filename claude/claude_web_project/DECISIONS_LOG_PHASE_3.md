@@ -1145,3 +1145,250 @@ content) for genuinely different populations, and are scoped accordingly.
   mistaken for one later.
 
 ---
+
+## ADR-043: Username/Password Registration and Login — Bare-UserID Return, No Token, No Session (Fixes TD-P3-007)
+
+**Date:** 2026-08-16
+**Status:** ACCEPTED
+
+**Context:**
+
+While building `e2e-phase3.sh`, a real gap surfaced: `POST /matchmaking/queue`
+can never create a `users` row, since matchmaking-service never touches
+Postgres at all (`ARCHITECTURE.md`'s Matchmaking section, `DECISIONS_LOG_PHASE_3.md`
+ADR-032). Only `POST /games`/`POST /games/:id/join` call
+`userStore.CreateOrGetUser`. Since `CreateMatchedGame`'s `INSERT` carries an
+FK constraint on `users`, a `userID` that has never gone through `/games` at
+least once fails to match deterministically — indistinguishable from a
+genuine `CreateMatchedGame` failure from the outside. There is no
+user-registration endpoint independent of game creation anywhere in this
+codebase; tracked as TD-P3-007 pending this ADR.
+
+Raised directly by the person, with explicit scope: a way to obtain (or
+recover) a stable `userID` via username+password, kept deliberately minimal
+— "without expiration, we can add that afterwards, that's not our main aim."
+
+**Options considered:**
+
+**Option A: Full session/token layer** — login mints a JWT (or similar),
+client sends it as a bearer token on every subsequent request, chess-server
+verifies it before trusting the embedded `userID`.
+- Pros: closes the (pre-existing) gap that any client can already claim any
+  `userID` at face value — CreateGame/JoinGame have never verified
+  "ownership" of a client-supplied anonymous UUID.
+- Cons: rejected for this pass, on the person's explicit instruction. Also
+  a materially larger change: every existing endpoint's trust model would
+  need revisiting, not just two new ones — out of proportion to "keep it
+  simple."
+
+**Option B: Register/Login return a bare `userID`, no token, no session, no
+expiration (CHOSEN).**
+- Pros: matches the explicit instruction exactly. Introduces no new trust
+  boundary — every endpoint already accepted a client-supplied `userID` at
+  face value before this addition; this only offers an alternative way to
+  obtain one, not a new guarantee about what possessing one means. Minimal
+  surface: two endpoints, no middleware, no change to any existing
+  endpoint's signature or behavior.
+- Cons: a `userID` obtained via login carries no more proof-of-possession
+  than one a client invents itself — accepted, explicitly, as the same
+  status quo this addition does not change, not a regression it introduces.
+
+**Decision:** Option B. `POST /users` (register) and `POST /login` both
+return `{"data": {"userID": "..."}}` and nothing else — no token field of
+any kind.
+
+**Rationale:**
+
+The deciding factor is that the person's instruction was explicit and the
+simpler option introduces no correctness or security regression relative to
+the status quo: `userID` was already an unauthenticated, client-supplied
+value everywhere in this system before this ADR, and remains exactly that
+after it. Password storage itself is the one place "keep it simple" does
+NOT extend to — bcrypt (not a faster/lighter hash) is used regardless,
+since storing passwords at all obligates a slow, salted, adaptive hash;
+endpoint-surface simplicity and hash-strength are independent axes, and only
+the first was the actual instruction.
+
+**Consequences:**
+- Migration 007: `users.username TEXT UNIQUE`, `users.password_hash TEXT`,
+  both nullable (anonymous users created via `CreateOrGetUser` have
+  neither), plus a `CHECK ((username IS NULL) = (password_hash IS NULL))`
+  constraint enforcing both-or-neither at the DB level. The two identity
+  paths (anonymous, registered) coexist — this does not retire
+  `CreateOrGetUser`.
+- `internal/auth/password.go`: `HashPassword`/`VerifyPassword` (bcrypt,
+  default cost). `VerifyPassword` returns `(false, nil)` for a normal
+  mismatch, reserving a non-nil error for genuine infrastructure/format
+  failures — callers must not conflate the two.
+- `internal/store/user_store.go`: `CreateUserWithCredentials` (mints a UUID
+  v7 server-side, matching `games.id`'s convention for DB primary keys —
+  unlike `CreateOrGetUser`'s client-supplied anonymous ID, a credentialed
+  registration has no client-side ID to submit in the first place),
+  `GetUserIDAndPasswordHashByUsername`. The latter deliberately does NOT
+  return through the general-purpose `User` struct (which carries no
+  password-hash field anywhere else in this package) — a narrowly-scoped
+  positional return keeps the hash from ever being reachable through a
+  struct other callers pass around freely.
+- `internal/api/auth_handler.go`: `AuthHandler.Register`/`Login`. Login
+  gives an unknown-username result the IDENTICAL response (401,
+  `INVALID_CREDENTIALS`) as a wrong-password result — load-bearing, not
+  incidental: distinguishing the two would open a username-enumeration side
+  channel this design specifically avoids.
+- `nginx.conf`: `/users` and `/login` added to the existing REST
+  round-robin treatment (`chess_rest` upstream), same as `/games`.
+- `e2e-phase3.sh`'s `mm_seed_user` now calls `POST /users` directly instead
+  of a throwaway `POST /games` call — the workaround it used to document is
+  now the actual fix.
+- Deferred, explicitly, not forgotten: token-based sessions with
+  expiration, on the person's own instruction ("we can add that
+  afterwards"). No interface in this design blocks adding one later —
+  Register/Login's response shape can grow a `token` field additively
+  without breaking the bare-`userID` contract existing callers rely on.
+
+---
+
+## ADR-044: Matched-Game Connect Flow Skips `/resolve` on First Connect — Dual-Token `MATCH_FOUND`, Renamed Marker/409 Field
+
+**Date:** 2026-08-17
+**Status:** ACCEPTED
+
+**Context:**
+
+Running `e2e-phase3.sh scenario1` against a live cluster surfaced a real
+bug: `WSHandler` rejected the WebSocket dial from `MATCH_FOUND`'s
+`connectToken` with 401 (`token instanceLabel does not match URL,
+tokenInstanceLabel=""`). Decoding the JWT confirmed why — it was a
+`PlayerClaims` payload (`game_id`/`user_id`/`color`/`exp`, no
+`instance_label` claim), not a dialable `ConnectClaims`. Traced to ADR-037:
+`ReportMatchCreated` relays the same `white_token`/`black_token` used for
+the active-game marker into `MATCH_FOUND` too. ADR-037's reasoning
+("confirmed safe to mint once and republish unchanged on every renewal with
+no staleness risk") is correct **for the marker's actual read pattern** —
+a 409 check or heartbeat-renewed key may be read an arbitrary, unbounded
+time after being written, so a short-lived `ConnectClaims` minted at write
+time would frequently already be dead by read time. It was never traced
+separately for `MATCH_FOUND`'s own read pattern, which has no such
+staleness exposure: `CreateMatchedGame` runs on one specific instance,
+claims ownership on itself synchronously, and reports to matchmaking-service
+essentially instantly afterward. Full trace: `PHASE_3_DESIGN_NOTES.md` §18.
+
+**Options considered:**
+
+**Option A: Client always calls `GET /games/{id}/resolve` after
+`MATCH_FOUND`, using the existing `PlayerClaims`-shaped token unchanged
+(i.e., fix the bug by keeping the current token, adding a `/resolve`
+round-trip client-side).**
+- Pros: zero backend changes — proto, chess-server, and matchmaking-service
+  are all untouched; `MATCH_FOUND` simply becomes "here's a game to look
+  up," identical in shape to the 409 response.
+- Cons: rejected by the person directly, on the grounds that the extra
+  round-trip is unnecessary latency on the one path where chess-server
+  already knows the complete, correct answer at delivery time with zero
+  staleness risk. Confirmed technically correct, not just a preference —
+  see Rationale.
+
+**Option B: Mint a fresh `ConnectClaims` in `CreateMatchedGame` and relay it
+directly via `MATCH_FOUND`/status, skipping `/resolve` for the initial
+connection; keep `/resolve` required for any later reconnect (CHOSEN).**
+- Pros: removes the unnecessary round-trip on the hot path (the moment a
+  player is told "you have a game" is exactly when minimum latency to
+  start playing matters most) without touching the correctness of the
+  reconnect path at all — `/resolve` remains untouched, still required,
+  still the only mechanism for a later reconnect. Zero new capability
+  needed on matchmaking-service's side — it already relays opaque tokens
+  through the gRPC report it receives; this adds one more opaque string to
+  relay, not new logic. Does not violate ADR-032's "matchmaking-service
+  never talks to GameStore/GameRegistry/Redis ownership keys" boundary —
+  minting happens entirely on chess-server's side, inside
+  `CreateMatchedGame`, which already has full access to everything needed.
+- Cons: requires a proto change (two new fields) and a field rename
+  (`connectToken`→`playerToken` on the marker/409 side) to keep the two
+  now-genuinely-different credential types from sharing one ambiguous field
+  name — see the naming consequence below.
+
+**Decision:** Option B, explicitly confirmed by the person: *"right after
+the match is found we can send the connectToken directly to player, and
+after that if player wants to rejoin or reconnect then we use /resolve at
+that time."*
+
+**Rationale:**
+
+The deciding factor is that `MATCH_FOUND`'s delivery moment and a later
+reconnect attempt have genuinely different staleness exposure — the same
+distinction ADR-037 already drew between the marker (needs `/resolve`,
+correctly) and nothing (nothing in this codebase skipped `/resolve` before
+this ADR). Skipping it for `MATCH_FOUND` specifically is not a general
+relaxation of the resolve-before-connect discipline; it's recognizing one
+specific case where the staleness risk that discipline exists to guard
+against is provably zero (synchronous minting on the instance that already
+owns the game, essentially-immediate gRPC delivery).
+
+A consequence traced through during design, not in the person's original
+ask but necessary for correctness: a client that receives `MATCH_FOUND`
+late (offline when the SSE push fired, polling `/status` minutes later)
+would get back an *already-expired* `ConnectClaims` if that were the only
+token carried — relocating the marker's own staleness problem one level up
+rather than fixing it. Both `MATCH_FOUND` and the "matched" status payload
+therefore carry **two tokens side by side**: `connectToken` (fresh,
+directly dialable) and `playerToken` (24h, the fallback for `/resolve` if
+`connectToken` is ever rejected as stale). This is why `/resolve` is not
+removed from the system anywhere — it remains the correct, necessary
+fallback for exactly the case it already covered.
+
+**Naming consequence, load-bearing, not cosmetic:** once `MATCH_FOUND`'s
+`connectToken` became a genuinely different credential *type* than the 409
+response's same-named field (dialable vs. not), they could no longer share
+one field name across both shapes — that is precisely the "same JSON
+shape, different actual meaning" trap that caused this ADR's originating
+bug, just at a different pair of endpoints. The marker/409 field is renamed
+`playerToken` throughout (it always held a `PlayerClaims`; the prior name
+was simply wrong, not a new decision).
+
+**Consequences:**
+- `proto/matchmakingv1/matchmaking.proto`: `MatchCreatedRequest`'s
+  `white_token`/`black_token` renamed `white_player_token`/`black_player_token`;
+  `white_connect_token`/`black_connect_token` added.
+- `internal/auth/token.go`: `DefaultConnectClaimsTTL` 10s→30s (person's
+  explicit request — "10s is too short, network blip or reopen, 20-30s
+  won't cause issues"), `DefaultMatchmakingClaimsTTL` 10s→60s (same bug
+  shape found independently during this pass — a player queued past 10s
+  polling `/status` or calling `DELETE` would find their own token already
+  expired for a completely ordinary wait; sized to safely exceed
+  `MATCHMAKING_QUEUE_TIMEOUT_SECONDS` + one sweep interval + margin, not
+  tuned independently). Both are only fallback defaults now — the enforced
+  values live on `internal/game.Manager`/`internal/mmsvc.Handler` as
+  injected constructor fields (`CODING_GUIDELINES.md` §5: no package-level
+  mutable state), consistent with PHASE_3.md Step 5's existing pattern for
+  these same two constants.
+- `internal/game/manager.go`: new `MatchedGameTokens` struct (both token
+  pairs); new `signConnectToken` helper, extracted from `ResolveGame`'s
+  original inline minting code so both call sites share one source of
+  truth; `CreateMatchedGame` mints both pairs and returns `MatchedGameTokens`
+  instead of two bare strings.
+- `internal/game/directory.go`: `ActiveGameMarker.ConnectToken`→`PlayerToken`.
+  `internal/game/heartbeat.go`'s marker-renewal writes updated to match.
+- `internal/matchmaking/pairing.go`, `reporter.go`: `MatchReporter`
+  interface and the gRPC request both carry `MatchedGameTokens`.
+- `internal/mmsvc/queue.go` (`activeGameMarker`, `matchmakingResult`),
+  `response.go` (`existingGame`), `hub.go` (`matchFoundData` — no longer a
+  type alias of `existingGame`, since the two shapes have genuinely
+  diverged), `reportserver.go`, `handler.go`: all updated to the renamed/
+  dual-token shapes.
+- `cmd/matchmaking-service/main.go`: new startup validation —
+  `MatchmakingClaimsTTL >= QueueTimeout + 15s` — fails fast (same
+  panic-on-bad-config treatment every other required check in that
+  function gets) rather than allowing the two independently-configured env
+  vars to drift out of the safe relationship silently.
+- `e2e-phase3.sh`, `phase3_step7_e2e_walkthrough.md`: Scenario 1 dials
+  directly using `connectToken` (no `/resolve` detour); a new
+  `mm_ws_reconnect_via_resolve` function/doc section demonstrates the
+  `playerToken` + `/resolve` fallback path independently — added, not
+  removed, since that path remains real and needed its own coverage.
+- Verified: `go build`/`vet`/`test -race`/`test -tags integration -race -p 1`/
+  `gofmt -l` all clean, including fixes to 3 integration-tagged test files
+  (`internal/mmsvc/reportserver_test.go`, `queue_test.go`, `handler_test.go`)
+  referencing the old field/proto-getter names — caught by manual review,
+  not `gopls` (blind to `//go:build integration` files, a known limitation
+  already on record).
+
+---
